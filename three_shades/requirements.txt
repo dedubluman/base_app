@@ -1,0 +1,15 @@
+# Core (render): any machine
+numpy>=1.26,<2
+opencv-contrib-python-headless>=4.9   # DIS is in core OpenCV; DeepFlow / calcOpticalFlowSF need contrib
+pillow>=10
+# FFmpeg 6+ must be on PATH (apt install ffmpeg / brew install ffmpeg / winget install ffmpeg)
+
+# Segmentation
+torch>=2.7            # with CUDA for SAM 3.1 (see README for the right index URL)
+torchvision>=0.22     # also provides the CPU preview segmenter
+huggingface_hub
+einops
+scipy
+pycocotools
+psutil
+# SAM 3.1 itself: pip install -e sam3   (git clone https://github.com/facebookresearch/sam3)

@@ -2,3 +2,8 @@
 checkpoints/
 # Upstream SAM 3 source clone (downloaded by scripts/download_sam3.sh)
 sam3/
+# Pipeline outputs and Python caches
+__pycache__/
+*.masks.npz
+*.mp4
+*.mov
