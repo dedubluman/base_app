@@ -1,0 +1,8 @@
+# three_shades pipeline (install torch + `pip install -e sam3/` first; see README_three_shades.md)
+numpy<2
+opencv-python-headless>=4.9
+scikit-image>=0.22
+psutil>=5.9
+pycocotools>=2.0.7
+scipy>=1.11
+pyyaml>=6.0

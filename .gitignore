@@ -7,3 +7,10 @@ __pycache__/
 *.masks.npz
 *.mp4
 *.mov
+
+# Local venv, media and pipeline outputs (three_shades.py / shades/)
+.venv/
+inputs/
+output/
+masks/
+.cache/
