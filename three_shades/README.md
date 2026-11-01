@@ -79,8 +79,8 @@ Copy `config.example.json`, change what you need, and pass it with `--config my.
 
 | Field | Default | Effect |
 |---|---|---|
-| `title_in` / `title_out` / `title_fade` | 0.2 / 1.45 / 0.35 | Title fade window. Set `layout.title` to `""` to remove the title. |
-| `cards_in_start` | 1.2 | When card 1 starts to drop. |
+| `title_in` / `title_out` / `title_fade` | 0.2 / 1.1 / 0.35 | Title fade window. Set `layout.title` to `""` to remove the title. |
+| `cards_in_start` | 1.5 | When card 1 starts to drop. Keep it after `title_out + title_fade` so the title is gone first. |
 | `card_stagger` | 0.2 | Delay between cards 1, 2 and 3. |
 | `card_in_dur` | 0.8 | Length of one drop. The ease is "out-back", so the card overshoots slightly and settles. |
 | `label_delay` / `label_dur` | 0.3 / 0.45 | The name and hex fade in shortly after each card starts. |
@@ -97,7 +97,9 @@ Card geometry is set in `layout`: `cards_top_frac` (keep it at 0.08 or more to s
 - `levels_strength`: how far the black/white points are stretched to the clip's percentiles.
 - `contrast`, `pivot`, `highlight_knee`: the filmic S-curve and the highlight roll-off.
 - `shadow_tint`, `shadow_lift`: the deep-teal shadows. Raise `shadow_lift` for a more lifted, matte look.
-- `sand_boost`, `midtone_tint`: warmth of the sand and skin. Lower these if the sand goes orange.
+- `sand_boost`: how strongly sand and skin are pulled toward the Golden Sand hue.
+- `sand_chroma`: how saturated that target is. Raise it for more golden sand; lower it if skin looks too warm. Because it's a bounded pull rather than an additive tint, skin can't go orange.
+- `midtone_tint`: a gentle Golden Sand tint across all midtones.
 - `water_teal`: pushes the water midtones toward teal.
 - `highlight_tint`, `highlight_mix`, `bloom`: the crystal highlights and the glow on sun rays.
 - Depth separation (SAM 3.1 mask):

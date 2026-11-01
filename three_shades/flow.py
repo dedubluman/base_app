@@ -131,9 +131,10 @@ def _smooth(x: np.ndarray, k: int) -> np.ndarray:
 def detect_ascent(masks: np.ndarray, fps: float, p: RampParams) -> Optional[tuple[float, float]]:
     """Find the upward swim from the SAM mask; returns (start, end) source seconds.
 
-    Uses the vertical velocity of the mask centroid in frame heights / second.
-    While the diver exits through the top the centroid keeps rising, and an
-    empty mask (diver gone) ends the ascent.
+    Velocity is the net rise of the mask centroid over ``velocity_window``
+    (frame heights / second); short dips are bridged. If the diver is still
+    rising when the mask disappears, they swam out of frame, and the ascent
+    runs to the end of the clip.
     """
     n, h, _ = masks.shape
     cy = np.full(n, np.nan, dtype=np.float64)
@@ -146,24 +147,38 @@ def detect_ascent(masks: np.ndarray, fps: float, p: RampParams) -> Optional[tupl
     if valid.sum() < 3:
         return None
     cy = np.interp(np.arange(n), np.nonzero(valid)[0], cy[valid])
-    up = -np.gradient(_smooth(cy, p.smooth_window)) * fps / h
-    up = _smooth(up, p.smooth_window)
-    rising = (up > p.min_up_velocity) & valid
+    cy = _smooth(cy, p.smooth_window)
+    # Net rise over a window (robust to limb jitter and noisy mask frames).
+    k = max(1, int(round(p.velocity_window * fps / 2)))
+    ahead = np.concatenate([cy[k:], np.full(k, cy[-1])])
+    behind = np.concatenate([np.full(k, cy[0]), cy[:-k]])
+    up = (behind - ahead) / h * fps / (2 * k)
+    rising = up > p.min_up_velocity
 
-    best, cur_start = None, None
+    # Bridge short dips, then take the longest rising run.
+    gap = int(round(p.max_gap * fps))
+    runs, cur_start = [], None
     for i in range(n + 1):
         if i < n and rising[i]:
             cur_start = i if cur_start is None else cur_start
         elif cur_start is not None:
-            if best is None or (i - cur_start) > (best[1] - best[0]):
-                best = (cur_start, i - 1)
+            runs.append([cur_start, i - 1])
             cur_start = None
+    merged: list[list[int]] = []
+    for r in runs:
+        if merged and r[0] - merged[-1][1] - 1 <= gap:
+            merged[-1][1] = r[1]
+        else:
+            merged.append(r)
+    best = max(merged, key=lambda r: r[1] - r[0]) if merged else None
     if best is None or (best[1] - best[0] + 1) / fps < p.min_duration:
         return None
     start, end = best
     last_visible = int(np.nonzero(valid)[0].max())
-    if end >= last_visible - p.smooth_window:  # rose until leaving the frame
-        end = last_visible
+    if end >= last_visible - p.smooth_window:
+        # Still rising when the mask ends: the diver swam out through the
+        # top of the frame, so keep the slow motion through the exit.
+        end = n - 1
     return start / fps, end / fps
 
 

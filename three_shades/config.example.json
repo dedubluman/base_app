@@ -5,7 +5,7 @@
     "highlight": {"name": "Crystal Highlight", "hex": "#E3F6F3"}
   },
   "intro": {
-    "cards_in_start": 1.2,
+    "cards_in_start": 1.5,
     "card_stagger": 0.2,
     "cards_out_start": 4.4,
     "grade_wipe_start": 4.5,

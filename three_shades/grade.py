@@ -99,10 +99,14 @@ def grade_global(img: np.ndarray, stats: GradeStats, p: GradeParams, pal: Palett
     x = x + (w_hi ** 2) * p.highlight_mix * (crystal - x)
 
     # 5. Warm/cool separation: red > blue means sand or skin, otherwise water.
-    #    Highlights (bokeh, surface glints) are excluded so they stay crystal.
-    warm = smoothstep(-0.015, 0.06, x[..., 0:1] - x[..., 2:3]) * smoothstep(0.12, 0.5, y)
-    warm = warm * (1.0 - smoothstep(0.50, 0.72, y))
-    x = x + warm * p.sand_boost * _chroma(sand) * (0.4 + w_mid)
+    #    Warm pixels are PULLED toward the Golden Sand hue at a bounded
+    #    saturation (never pushed past it), so skin can't turn orange.
+    #    Shaded sand and highlights (bokeh, glints) are excluded.
+    warm = smoothstep(-0.015, 0.06, x[..., 0:1] - x[..., 2:3]) * smoothstep(0.25, 0.55, y)
+    warm = warm * (1.0 - smoothstep(0.55, 0.80, y))
+    sand_c = _chroma(sand) * (p.sand_chroma / max(float(np.abs(_chroma(sand)).max()), 1e-4))
+    target = y + sand_c * np.clip(y / max(float(sand @ LUMA), 1e-4), 0.0, 1.2)
+    x = x + warm * p.sand_boost * (target - x)
     x = x + (1.0 - warm) * w_mid * p.water_teal * _chroma(abyss)
 
     # 6. Saturation + vibrance (boosts muted colors more than saturated ones).

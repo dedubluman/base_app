@@ -49,11 +49,11 @@ class Palette:
 class IntroTimings:
     # Title ("3 SHADES METHOD"). Set Layout.title to "" to disable it.
     title_in: float = 0.20
-    title_out: float = 1.45
+    title_out: float = 1.10
     title_fade: float = 0.35
 
     # Cards drop in one after another.
-    cards_in_start: float = 1.20
+    cards_in_start: float = 1.50
     card_stagger: float = 0.20  # delay between card 1, 2 and 3
     card_in_dur: float = 0.80  # fade-in + slide-down duration of one card
     label_delay: float = 0.30  # label fades in this long after its card starts
@@ -123,7 +123,8 @@ class GradeParams:
     highlight_mix: float = 0.10
 
     # Warm/cool separation: sand and skin toward Golden Sand, water toward teal.
-    sand_boost: float = 0.28
+    sand_boost: float = 0.45  # how strongly sand/skin are pulled to the Golden Sand hue
+    sand_chroma: float = 0.12  # saturation of that target (caps how orange it can get)
     water_teal: float = 0.22
     saturation: float = 1.04
     vibrance: float = 0.22
@@ -136,7 +137,7 @@ class GradeParams:
     # Subject (SAM 3.1 mask) vs background: depth separation.
     mask_feather_frac: float = 0.006  # of frame width
     subject_exposure: float = 1.07
-    subject_warmth: float = 0.30  # keep skin warm against the teal water
+    subject_warmth: float = 0.15  # keep skin warm against the teal water
     subject_detail: float = 0.25  # local-contrast boost on the diver
     bg_exposure: float = 0.93
     bg_desaturate: float = 0.08
@@ -176,8 +177,10 @@ class RampParams:
     pre_roll: float = 0.25  # start slowing this long before the ascent begins
 
     # Automatic ascent detection from the subject mask.
-    min_up_velocity: float = 0.10  # frame heights / second
-    min_duration: float = 0.40  # seconds
+    min_up_velocity: float = 0.05  # frame heights / second
+    velocity_window: float = 0.50  # seconds; velocity = net rise over this window
+    max_gap: float = 0.40  # seconds; dips shorter than this don't split the ascent
+    min_duration: float = 0.60  # seconds
     smooth_window: int = 9  # frames
 
     # Manual override (source seconds). Set both to bypass auto-detection.
