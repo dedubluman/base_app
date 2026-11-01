@@ -39,6 +39,9 @@ _RULES: list[tuple[str, str]] = [
     (r"torch\.cuda\.get_device_properties\(0\)\.major", "0"),
     (r"torch\.cuda\.current_device\(\)", "0"),
     (r"torch\.cuda\.empty_cache\(\)", "None"),
+    # close_session() reports GPU memory; upstream catches RuntimeError but a
+    # CPU-only torch build raises AssertionError there.
+    (r"torch\.cuda\.mem_get_info\(\)", "(0, 0)"),
     (r"assert data\.is_cuda", "pass"),
 ]
 
