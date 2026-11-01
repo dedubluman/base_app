@@ -100,6 +100,7 @@ Card geometry is set in `layout`: `cards_top_frac` (keep it at 0.08 or more to s
 - `sand_boost`: how strongly sand and skin are pulled toward the Golden Sand hue.
 - `sand_chroma`: how saturated that target is. Raise it for more golden sand; lower it if skin looks too warm. Because it's a bounded pull rather than an additive tint, skin can't go orange.
 - `midtone_tint`: a gentle Golden Sand tint across all midtones.
+- `skin_tone`, `skin_restore`, `skin_saturation`: skin color of the diver, applied only inside the SAM 3.1 mask. `skin_tone` defaults to `#8B584C`, the warm peach-tan measured on the reference video's graded diver. `skin_restore` sets how strongly the diver's midtones are pulled to it.
 - `water_teal`: pushes the water midtones toward teal.
 - `highlight_tint`, `highlight_mix`, `bloom`: the crystal highlights and the glow on sun rays.
 - Depth separation (SAM 3.1 mask):

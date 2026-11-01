@@ -173,16 +173,18 @@ def grade_frame(img: np.ndarray, mask: np.ndarray, stats: GradeStats,
     mids = 1.0 - np.abs(y - 0.5) * 2.0
     subj = subj + p.subject_warmth * 0.25 * mids * _chroma(sand)
 
-    # Skin restore: inside the mask, midtones are pulled toward a skin tone on
-    # the Golden Sand hue (luma kept). Water strips red from skin, and no
-    # white balance can put it back without also turning the water red, so
-    # this is done only where SAM says the diver is. Very dark parts (dive
-    # mask, snorkel, hair) and bright parts (light swim shorts) are left alone.
+    # Skin restore: inside the mask, midtones are pulled toward skin_tone
+    # (a warm peach-tan measured on the reference grade), keeping their own
+    # brightness. Water strips red from skin and no white balance can put it
+    # back without turning the water red too, so this happens only where SAM
+    # says the diver is. Very dark parts (dive mask, snorkel, hair) and bright
+    # parts (light swim shorts) are left alone.
     if p.skin_restore > 0:
-        gate = smoothstep(0.10, 0.26, y) * (1.0 - smoothstep(0.60, 0.80, y))
-        sc = _chroma(sand)
-        sc = sc * (p.skin_chroma / max(float(np.abs(sc).max()), 1e-4))
-        target = y + sc * np.clip(y / max(float(sand @ LUMA), 1e-4), 0.0, 1.2)
+        gate = smoothstep(0.08, 0.24, y) * (1.0 - smoothstep(0.56, 0.76, y))
+        hx = p.skin_tone.lstrip("#")
+        tone = np.array([int(hx[i:i + 2], 16) / 255.0 for i in (0, 2, 4)], np.float32)
+        sc = _chroma(tone) * p.skin_saturation
+        target = y + sc * np.clip(y / max(float(tone @ LUMA), 1e-4), 0.0, 1.3)
         subj = subj + p.skin_restore * gate * (target - subj)
     if p.subject_detail > 0:
         base = cv2.GaussianBlur(subj, (0, 0), w * 0.006)

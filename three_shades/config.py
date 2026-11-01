@@ -138,8 +138,9 @@ class GradeParams:
     mask_feather_frac: float = 0.006  # of frame width
     subject_wb_strength: float = 0.85  # diver-only white balance (needs the mask)
     subject_teal_reduction: float = 0.65  # how much less teal toning the diver gets
-    skin_restore: float = 0.55  # pull of the diver's midtones toward a Golden Sand skin tone
-    skin_chroma: float = 0.11  # saturation of that skin tone
+    skin_restore: float = 0.75  # how strongly the diver's midtones are pulled to skin_tone
+    skin_tone: str = "#8B584C"  # target skin color (measured on the reference grade)
+    skin_saturation: float = 1.0  # scales the saturation of skin_tone
     subject_exposure: float = 1.07
     subject_warmth: float = 0.15  # keep skin warm against the teal water
     subject_detail: float = 0.25  # local-contrast boost on the diver
