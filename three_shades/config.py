@@ -205,6 +205,9 @@ class SegParams:
     # Optional positive click (x, y in output pixels) on frame 0 that selects
     # the diver; otherwise the largest tracked person is chosen.
     subject_point: Optional[list[float]] = None
+    # Which tracked person gets the mask: "ascending" = the one who rises
+    # toward the surface (the freediver); "largest" = biggest on screen.
+    subject_select: str = "ascending"
     prompt_frame: int = 0
     jpeg_quality: int = 95
 

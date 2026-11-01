@@ -78,24 +78,87 @@ def _patch_init_state(predictor) -> None:
     model.init_state = init_state
 
 
-def _select_subject(per_frame: dict[int, dict], point: Optional[tuple[float, float]],
-                    prompt_frame: int) -> Optional[int]:
-    """Pick the diver among all tracked objects.
+def _track_stats(per_frame: dict[int, dict]) -> dict[int, list[tuple[int, float, float, int]]]:
+    """obj_id -> time-sorted (frame, centroid_y, centroid_x, area_px); centroids in 0-1."""
+    stats: dict[int, list] = {}
+    for fi, objs in per_frame.items():
+        for obj_id, m in objs.items():
+            a = int(m.sum())
+            if a == 0:
+                continue
+            ys, xs = np.nonzero(m)
+            stats.setdefault(obj_id, []).append(
+                (fi, float(ys.mean()) / m.shape[0], float(xs.mean()) / m.shape[1], a))
+    for track in stats.values():
+        track.sort()
+    return stats
 
-    With a click point: the object whose mask contains it on the prompt frame.
-    Otherwise: the object with the largest total mask area over the clip
-    (the hero is close to camera; background swimmers are small).
+
+def _rise(track) -> float:
+    """Net upward travel (frame heights): first fifth of the track vs last fifth."""
+    cy = np.array([t[1] for t in track])
+    k = max(1, len(cy) // 5)
+    return float(cy[:k].mean() - cy[-k:].mean())
+
+
+def _select_subject(per_frame: dict[int, dict], point: Optional[tuple[float, float]],
+                    prompt_frame: int, mode: str = "ascending") -> Optional[int]:
+    """Pick the diver among all tracked people.
+
+    - With a click point: the person whose mask contains it on the prompt frame.
+    - mode "ascending" (default): the person who rises toward the surface the
+      most (among people with a substantial on-screen presence). Swimmers in
+      the background or at the frame edge never get the mask.
+    - mode "largest", or if nobody rises: the largest person over the clip.
     """
     if point is not None and prompt_frame in per_frame:
         x, y = int(point[0]), int(point[1])
         for obj_id, mask in per_frame[prompt_frame].items():
             if mask[y, x]:
                 return obj_id
-    area: dict[int, int] = {}
-    for objs in per_frame.values():
-        for obj_id, mask in objs.items():
-            area[obj_id] = area.get(obj_id, 0) + int(mask.sum())
-    return max(area, key=area.get) if area else None
+    stats = _track_stats(per_frame)
+    if not stats:
+        return None
+    total = {o: sum(t[3] for t in tr) for o, tr in stats.items()}
+    largest = max(total, key=total.get)
+    if mode == "ascending":
+        rises = {o: _rise(tr) for o, tr in stats.items()
+                 if total[o] >= 0.2 * total[largest] and len(tr) >= 5}
+        if rises:
+            best = max(rises, key=rises.get)
+            print(f"[sam3.1] rise per person (frame heights): "
+                  f"{ {o: round(r, 3) for o, r in rises.items()} }")
+            if rises[best] >= 0.08:
+                return best
+    return largest
+
+
+def _stitch_identity(per_frame: dict[int, dict], subject: int,
+                     max_gap: int = 12, max_jump: float = 0.15) -> list[int]:
+    """Follow the diver across identity switches.
+
+    If SAM 3.1 loses the diver (e.g. half out of frame) and re-detects them
+    as a new object, the new track starts right after the old one ends, close
+    to where it ended. Those tracks are chained so the mask doesn't drop out.
+    """
+    stats = _track_stats(per_frame)
+    chain, used, cur = [subject], {subject}, subject
+    while cur in stats:
+        end_f, end_y, end_x, _ = stats[cur][-1]
+        nxt = None
+        for o, tr in stats.items():
+            if o in used:
+                continue
+            f0, y0, x0, _ = tr[0]
+            if 0 < f0 - end_f <= max_gap and np.hypot(y0 - end_y, x0 - end_x) <= max_jump:
+                if nxt is None or f0 < stats[nxt][0][0]:
+                    nxt = o
+        if nxt is None:
+            break
+        chain.append(nxt)
+        used.add(nxt)
+        cur = nxt
+    return chain
 
 
 def run_sam31(video: str, width: int, height: int, p: SegParams) -> np.ndarray:
@@ -149,16 +212,20 @@ def run_sam31(video: str, width: int, height: int, p: SegParams) -> np.ndarray:
         print(f"[sam3.1] propagated {len(per_frame)} frames in {time.time() - t0:.1f}s")
         predictor.handle_request(dict(type="close_session", session_id=session_id))
 
-    subject = _select_subject(per_frame, p.subject_point, p.prompt_frame)
-    print(f"[sam3.1] objects: {sorted({i for o in per_frame.values() for i in o})}, "
-          f"subject: {subject}")
+    subject = _select_subject(per_frame, p.subject_point, p.prompt_frame, p.subject_select)
+    chain = _stitch_identity(per_frame, subject) if subject is not None else []
+    print(f"[sam3.1] people tracked: {sorted({i for o in per_frame.values() for i in o})}, "
+          f"diver: {chain} (only the diver is masked)")
     result = np.zeros((n_frames, height, width), dtype=bool)
     for idx, objs in per_frame.items():
-        if subject in objs and idx < n_frames:
-            m = objs[subject]
-            if m.shape != (height, width):
-                m = cv2.resize(m.astype(np.uint8), (width, height), cv2.INTER_NEAREST) > 0
-            result[idx] = m
+        if idx >= n_frames:
+            continue
+        for obj_id in chain:
+            if obj_id in objs:
+                m = objs[obj_id]
+                if m.shape != (height, width):
+                    m = cv2.resize(m.astype(np.uint8), (width, height), cv2.INTER_NEAREST) > 0
+                result[idx] |= m
     return result
 
 

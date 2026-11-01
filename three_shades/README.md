@@ -65,7 +65,7 @@ Each render writes:
 - `reel.cube`: the global grade as a 33³ LUT for Resolve, Premiere or Final Cut.
 - `reel.json`: a report with the detected ascent window, frame counts and palette.
 
-**Choosing the diver.** SAM 3.1 is prompted with the concept `person`, so it tracks every swimmer in the clip. The pipeline keeps the object with the largest total area. If a background swimmer gets picked instead, click on the diver in frame 0 (pixel coordinates in the 1080×1920 output frame):
+**Choosing the diver.** SAM 3.1 is prompted with the concept `person`, so it tracks every swimmer in the clip. Only one person gets the mask: by default (`seg.subject_select = "ascending"`) it's the person who rises toward the surface the most. Background swimmers and people at the frame edge are never masked, so they get the water's grade. If SAM 3.1 loses the diver near the surface and re-detects them under a new ID, the two tracks are joined, so the mask lasts through the exit. Set `subject_select` to `"largest"` to pick the biggest person instead. To force a specific person, click on them in frame 0 (pixel coordinates in the 1080×1920 output frame):
 
 ```bash
 python -m three_shades segment video_2.mov -o reel.mp4 --subject-point 540,900
