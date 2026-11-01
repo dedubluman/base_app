@@ -1,0 +1,4 @@
+# Large model weights (downloaded by scripts/download_sam3.sh)
+checkpoints/
+# Upstream SAM 3 source clone (downloaded by scripts/download_sam3.sh)
+sam3/
