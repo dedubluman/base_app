@@ -123,27 +123,24 @@ def run_sam31(video: str, width: int, height: int, p: SegParams) -> np.ndarray:
             dict(type="start_session", resource_path=str(frames_dir))
         )["session_id"]
 
-        if p.subject_point is not None:
-            # A single positive click on the diver: tracks exactly one object.
-            x, y = p.subject_point
-            predictor.handle_request(dict(
-                type="add_prompt", session_id=session_id, frame_index=p.prompt_frame,
-                points=torch.tensor([[x / width, y / height]], dtype=torch.float32),
-                point_labels=torch.tensor([1], dtype=torch.int32), obj_id=1,
-            ))
-        else:
-            # Open-vocabulary concept prompt: every person in the clip is
-            # detected and tracked; the hero is selected afterwards.
-            predictor.handle_request(dict(
-                type="add_prompt", session_id=session_id,
-                frame_index=p.prompt_frame, text=p.text_prompt,
-            ))
+        # Open-vocabulary concept prompt: every person in the clip is detected
+        # and tracked (detector + tracker on every frame), and the diver is
+        # selected afterwards; subject_point only picks among the tracked people.
+        # Point-only prompts are NOT used: in the current sam3 code the
+        # multiplex model's point (tracker-only) propagation drops its masks
+        # on frames without a prior text/box propagation (_build_sam2_output
+        # returns {}), so a points-only session yields empty masks.
+        predictor.handle_request(dict(
+            type="add_prompt", session_id=session_id,
+            frame_index=p.prompt_frame, text=p.text_prompt,
+        ))
 
         per_frame: dict[int, dict[int, np.ndarray]] = {}
         t0 = time.time()
-        for resp in predictor.handle_stream_request(
-            dict(type="propagate_in_video", session_id=session_id)
-        ):
+        for resp in predictor.handle_stream_request(dict(
+            type="propagate_in_video", session_id=session_id,
+            start_frame_index=p.prompt_frame, propagation_direction="both",
+        )):
             out = resp["outputs"]
             ids = out["out_obj_ids"].tolist()
             masks = out["out_binary_masks"]

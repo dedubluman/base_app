@@ -12,7 +12,9 @@ sun rays and a vignette.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -43,9 +45,22 @@ class GradeStats:
     wb_gains: np.ndarray
     black: float
     white: float
+    # White balance measured on the diver only (from the SAM 3.1 mask). Water
+    # tints skin cyan-green far more than the global balance can fix without
+    # wrecking the water, so the subject gets its own correction.
+    subject_wb_gains: Optional[np.ndarray] = None
 
 
-def analyze(frames: list[np.ndarray], p: GradeParams) -> GradeStats:
+def _gray_world(px: np.ndarray, strength: float) -> np.ndarray:
+    y = luma(px)
+    mid = px[(y > 0.10) & (y < 0.90)]
+    mean = (mid if len(mid) else px).mean(axis=0)
+    gains = (mean.mean() / np.maximum(mean, 1e-4)) ** strength
+    return (gains / float(gains @ LUMA)).astype(np.float32)  # keep exposure
+
+
+def analyze(frames: list[np.ndarray], p: GradeParams,
+            masks: Optional[list[np.ndarray]] = None) -> GradeStats:
     px = np.concatenate([f.reshape(-1, 3) for f in frames])
     y = luma(px)
     mid = px[(y > 0.15) & (y < 0.85)]
@@ -53,10 +68,16 @@ def analyze(frames: list[np.ndarray], p: GradeParams) -> GradeStats:
     gains = (mean.mean() / np.maximum(mean, 1e-4)) ** p.wb_strength
     gains = gains / float(gains @ LUMA)  # white balance must not change exposure
     balanced = luma(px * gains)
+    subject_gains = None
+    if masks is not None:
+        subj = [f[m] for f, m in zip(frames, masks) if m.any()]
+        if subj and sum(len(s) for s in subj) > 500:
+            subject_gains = _gray_world(np.concatenate(subj), p.subject_wb_strength)
     return GradeStats(
         wb_gains=gains.astype(np.float32),
         black=float(np.percentile(balanced, p.black_percentile)),
         white=float(np.percentile(balanced, p.white_percentile)),
+        subject_wb_gains=subject_gains,
     )
 
 
@@ -131,11 +152,38 @@ def grade_frame(img: np.ndarray, mask: np.ndarray, stats: GradeStats,
     m = soft_mask(mask, p)
     sand = np.array(pal.midtone.rgb, np.float32)
 
-    # Subject: brighter, warmer skin, a touch of local contrast (clarity).
-    subj = g * p.subject_exposure
-    y = luma(g)[..., None]
+    # Subject: graded with its OWN white balance and much less of the water's
+    # teal toning, so skin separates from the water (computed only inside the
+    # mask's bounding box).
+    gs = g
+    if stats.subject_wb_gains is not None and m.max() > 0.01:
+        ys, xs = np.nonzero(m[..., 0] > 0.005)
+        y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+        r = p.subject_teal_reduction
+        sp = dataclasses.replace(p, shadow_tint=p.shadow_tint * (1 - r),
+                                 shadow_lift=p.shadow_lift * (1 - r),
+                                 water_teal=p.water_teal * (1 - r))
+        sst = dataclasses.replace(stats, wb_gains=stats.subject_wb_gains)
+        gs = g.copy()
+        gs[y0:y1, x0:x1] = grade_global(img[y0:y1, x0:x1], sst, sp, pal)
+
+    # Then brighter, warmer skin and a touch of local contrast (clarity).
+    subj = gs * p.subject_exposure
+    y = luma(subj)[..., None]
     mids = 1.0 - np.abs(y - 0.5) * 2.0
     subj = subj + p.subject_warmth * 0.25 * mids * _chroma(sand)
+
+    # Skin restore: inside the mask, midtones are pulled toward a skin tone on
+    # the Golden Sand hue (luma kept). Water strips red from skin, and no
+    # white balance can put it back without also turning the water red, so
+    # this is done only where SAM says the diver is. Very dark parts (dive
+    # mask, snorkel, hair) and bright parts (light swim shorts) are left alone.
+    if p.skin_restore > 0:
+        gate = smoothstep(0.10, 0.26, y) * (1.0 - smoothstep(0.60, 0.80, y))
+        sc = _chroma(sand)
+        sc = sc * (p.skin_chroma / max(float(np.abs(sc).max()), 1e-4))
+        target = y + sc * np.clip(y / max(float(sand @ LUMA), 1e-4), 0.0, 1.2)
+        subj = subj + p.skin_restore * gate * (target - subj)
     if p.subject_detail > 0:
         base = cv2.GaussianBlur(subj, (0, 0), w * 0.006)
         subj = subj + p.subject_detail * (subj - base)

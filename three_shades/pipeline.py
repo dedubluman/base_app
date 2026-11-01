@@ -15,6 +15,7 @@ import sys
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from . import flow as flowmod
@@ -56,9 +57,15 @@ def render(args, cfg: Config) -> None:
     fps = ex.fps
 
     # Clip-wide grade measurements (sampled, small) so the look never flickers.
+    sample_idx = [i for i in range(0, n, 8)]
     sample = [f for i, f in enumerate(read_frames(args.input, 270, 480)) if i % 8 == 0]
-    stats = analyze(sample, cfg.grade)
-    print(f"[grade] wb gains {np.round(stats.wb_gains, 3)}, "
+    kernel = np.ones((3, 3), np.uint8)  # erode so edge pixels (water) don't leak in
+    sample_masks = [cv2.erode(cv2.resize(full_masks[i].astype(np.uint8), (270, 480),
+                                         interpolation=cv2.INTER_NEAREST), kernel) > 0
+                    for i in sample_idx[:len(sample)]]
+    stats = analyze(sample, cfg.grade, sample_masks)
+    print(f"[grade] wb gains {np.round(stats.wb_gains, 3)}, subject wb gains "
+          f"{None if stats.subject_wb_gains is None else np.round(stats.subject_wb_gains, 3)}, "
           f"levels {stats.black:.3f}..{stats.white:.3f}")
 
     # Speed ramp on the ascent.
