@@ -123,14 +123,15 @@ LUMA = np.array([0.2126, 0.7152, 0.0722], np.float32)
 
 def subject_reference_gains(img: np.ndarray, mask_u8: np.ndarray,
                             cfg: Separation) -> np.ndarray | None:
-    """Per-frame RGB gains (luminance-preserving) from the subject's
-    brightest unclipped pixels. None if there are too few."""
-    core = cv2.erode(mask_u8, np.ones((5, 5), np.uint8)) > 127
+    """Per-frame RGB gains (luminance-preserving) from the brightest
+    unclipped pixels of `mask_u8` (the SAM 3.1 shorts mask when available:
+    white fabric is the white reference). None if there are too few."""
+    core = cv2.erode(mask_u8, np.ones((3, 3), np.uint8)) > 127
     px = img[core]
-    if len(px) < 200:
+    if len(px) < 60:
         return None
     px = px[px.max(1) < cfg.skin_clip]
-    if len(px) < 100:
+    if len(px) < 40:
         return None
     lum = px @ LUMA
     ref = px[lum >= np.percentile(lum, cfg.skin_ref_percentile)].mean(0)
@@ -174,7 +175,11 @@ def apply_skin_tone(img: np.ndarray, alpha: np.ndarray, gains: np.ndarray,
     w = weight * cfg.skin_strength
     if w <= 1e-4:
         return img
-    g = 1.0 + (gains - 1.0) * w
+    # dark gear (fins, mask, hair) keeps its own colour: the correction
+    # fades out below `skin_dark_lum`
+    lum0 = (img * LUMA).sum(-1, keepdims=True)
+    dark = np.clip((lum0 - cfg.skin_dark_lum * 0.4) / (cfg.skin_dark_lum * 0.6), 0, 1)
+    g = 1.0 + (gains - 1.0) * w * dark
     wb = img * g
     lum = (wb * LUMA).sum(-1, keepdims=True)
     # near-clipped highlights (blown-out white fabric) stay neutral, not pink
@@ -186,3 +191,27 @@ def apply_skin_tone(img: np.ndarray, alpha: np.ndarray, gains: np.ndarray,
                                                        np.float32) * lum
     wb = wb * (2.0 ** (cfg.skin_exposure * w))
     return np.clip(img + alpha * (wb - img), 0.0, 1.0)
+
+
+def part_alpha(mask_u8: np.ndarray, feather_px: float, width: int) -> np.ndarray:
+    a = cv2.GaussianBlur(mask_u8.astype(np.float32) / 255.0, (0, 0),
+                         max(feather_px * width / 1080.0, 0.5))
+    return a[..., None]
+
+
+def apply_shorts_color(img: np.ndarray, alpha: np.ndarray, gains: np.ndarray,
+                       weight: float, cfg: Separation) -> np.ndarray:
+    """Colour the SAM 3.1 shorts on their own: neutralise the cyan cast with
+    the subject gains, then pull the fabric toward `shorts_hex` while keeping
+    its own luminance (folds, shading) and a little of its chroma."""
+    w = weight * cfg.shorts_strength
+    if w <= 1e-4:
+        return img
+    wb = img * gains
+    lum = (wb * LUMA).sum(-1, keepdims=True)
+    h = cfg.shorts_hex.lstrip("#")
+    tgt = np.array([int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)], np.float32)
+    t_l = float((tgt * LUMA).sum())
+    lum2 = lum * (2.0 ** cfg.shorts_exposure)
+    target = tgt * (lum2 / t_l) + cfg.shorts_saturation * (wb - lum)
+    return np.clip(img + alpha * w * (target - img), 0.0, 1.0)

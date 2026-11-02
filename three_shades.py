@@ -24,7 +24,8 @@ from shades.config import load_config
 from shades.grade import SourceStats, apply_lut, bake_lut, hex_to_rgb, write_cube
 from shades.io import Encoder, probe, read_frames_at, iter_frames
 from shades.masking import load_subject_masks, mask_dir_for, masks_cached, run_sam31
-from shades.separation import (apply_separation, apply_skin_tone, feather,
+from shades.separation import (apply_separation, apply_shorts_color,
+                               apply_skin_tone, feather, part_alpha,
                                find_lost_frames, skin_alpha, smooth_gains,
                                subject_reference_gains,
                                lost_spans, separation_weights)
@@ -38,27 +39,50 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def get_masks(args, cfg, info):
-    """Return (masks, meta, status). SAM 3.1 is mandatory: every diver
-    operation (separation, skin tone) runs only inside its masks, so there is
-    no mask-less fallback. Without CUDA, SAM 3.1 runs through the CPU port."""
+def _part_dir(args, part: str | None) -> Path:
+    base = mask_dir_for(Path(args.masks_dir), args.input.stem)
+    return base if part is None else base.parent / f"{base.name}__{part}"
+
+
+def _ensure_masks(args, cfg, info, part: str | None, prompt: str):
+    """Load (or create with SAM 3.1) the mask cache for one concept."""
+    import dataclasses
+
     import torch
 
-    mdir = mask_dir_for(Path(args.masks_dir), args.input.stem)
+    mdir = _part_dir(args, part)
+    label = part or "diver"
     if masks_cached(mdir, info.n_frames) and not args.resegment:
         masks, meta = load_subject_masks(mdir)
-        return masks, meta, f"cached SAM 3.1 masks ({meta['device']})"
+        return masks, meta, f"cached SAM 3.1 '{prompt}' masks ({meta['device']})"
     if not torch.cuda.is_available():
-        log("[sam] No CUDA GPU: running SAM 3.1 through the CPU port "
-            "(~10-15 s/frame). Tip: run --masks-only on a GPU machine and copy "
-            "masks/ here to skip this.")
-    run_sam31(args.input, mdir, cfg.masking, REPO, REPO / ".cache", log=log,
+        log(f"[sam] {label}: no CUDA GPU, running SAM 3.1 through the CPU port "
+            "(~10-15 s/frame). Tip: run --masks-only on a GPU machine.")
+    mcfg = dataclasses.replace(cfg.masking, text_prompt=prompt,
+                               point_prompts=cfg.masking.point_prompts if part is None else [])
+    run_sam31(args.input, mdir, mcfg, REPO, REPO / ".cache", log=log,
               resume=not args.resegment)
     masks, meta = load_subject_masks(mdir)
     if not (masks > 0).any():
-        raise SystemExit("[sam] SAM 3.1 found no subject; refine "
-                         "masking.text_prompt or add masking.point_prompts.")
-    return masks, meta, f"SAM 3.1 ({meta['device']})"
+        raise SystemExit(f"[sam] SAM 3.1 found no '{prompt}'; refine the prompt.")
+    return masks, meta, f"SAM 3.1 '{prompt}' ({meta['device']})"
+
+
+def get_masks(args, cfg, info):
+    """SAM 3.1 is mandatory: the diver and every extra part (e.g. shorts) are
+    segmented by SAM 3.1, and all subject colour work runs inside its masks.
+    Returns (diver masks, diver meta, {part: masks}, status)."""
+    masks, meta, status = _ensure_masks(args, cfg, info, None, cfg.masking.text_prompt)
+    parts = {}
+    for name, prompt in cfg.masking.parts.items():
+        pm, _, pstatus = _ensure_masks(args, cfg, info, name, prompt)
+        # a part belongs to the diver: keep it inside his (slightly grown) mask
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        for i in range(len(pm)):
+            pm[i] = np.minimum(pm[i], cv2.dilate(masks[i], k))
+        parts[name] = pm
+        status += f"; {pstatus}"
+    return masks, meta, parts, status
 
 
 def main() -> int:
@@ -80,8 +104,7 @@ def main() -> int:
         f"audio={info.has_audio}")
 
     if args.masks_only:
-        mdir = mask_dir_for(Path(args.masks_dir), args.input.stem)
-        (mdir / "meta.json").unlink(missing_ok=True)  # force a (resumable) run
+        # computes only what is missing; --resegment redoes everything
         get_masks(args, cfg, info)
         return 0
 
@@ -90,7 +113,7 @@ def main() -> int:
     stem = args.input.stem
     t_start = time.time()
 
-    masks, mmeta, mask_status = get_masks(args, cfg, info)
+    masks, mmeta, part_masks, mask_status = get_masks(args, cfg, info)
     log(f"[mask] {mask_status}")
 
     # --- Grade: clip black/white points -> LUT -> .cube --------------------
@@ -125,7 +148,13 @@ def main() -> int:
         per = []
         for i, f in enumerate(iter_frames(args.input, info, scale_w=sw)):
             m = cv2.resize(masks[i], (sw, sh), interpolation=cv2.INTER_NEAREST)
-            per.append(subject_reference_gains(apply_lut(f, lut), m, cfg.separation))
+            # white reference = the SAM 3.1 shorts mask (falls back to diver)
+            ref_m = m
+            if "shorts" in part_masks:
+                ref_m = cv2.resize(part_masks["shorts"][i], (sw, sh),
+                                   interpolation=cv2.INTER_NEAREST)
+            per.append(subject_reference_gains(apply_lut(f, lut), ref_m,
+                                               cfg.separation))
         skin_gains = smooth_gains(per, cfg.separation.skin_smooth_frames)
         log(f"[skin] subject WB gains: R {skin_gains[:, 0].min():.2f}-"
             f"{skin_gains[:, 0].max():.2f}, B {skin_gains[:, 2].min():.2f}-"
@@ -156,10 +185,21 @@ def main() -> int:
                 pad = 24
                 y0, y1 = max(ys.min() - pad, 0), min(ys.max() + pad + 1, info.height)
                 x0, x1 = max(xs.min() - pad, 0), min(xs.max() + pad + 1, info.width)
-                graded[y0:y1, x0:x1] = apply_skin_tone(
-                    graded[y0:y1, x0:x1],
-                    skin_alpha(masks[i][y0:y1, x0:x1], cfg.separation, info.width),
-                    skin_gains[i], float(weights[i]), cfg.separation)
+                crop = graded[y0:y1, x0:x1]
+                body_a = skin_alpha(masks[i][y0:y1, x0:x1], cfg.separation,
+                                    info.width)
+                sh_m = part_masks.get("shorts")
+                if sh_m is not None:
+                    sh_a = part_alpha(sh_m[i][y0:y1, x0:x1],
+                                      cfg.separation.shorts_feather_px, info.width)
+                    # diver body = diver mask minus the shorts: coloured apart
+                    body_a = body_a * (1.0 - sh_a)
+                crop = apply_skin_tone(crop, body_a, skin_gains[i],
+                                       float(weights[i]), cfg.separation)
+                if sh_m is not None:
+                    crop = apply_shorts_color(crop, sh_a, skin_gains[i],
+                                              float(weights[i]), cfg.separation)
+                graded[y0:y1, x0:x1] = crop
         if i in measure_idx:
             measured_frames.append(graded[::2, ::2].copy())
         enc.write(frame + (graded - frame) * mix if mix < 1.0 else graded)

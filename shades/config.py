@@ -113,7 +113,15 @@ class Separation:
     skin_gain_max: float = 1.9
     skin_smooth_frames: int = 15      # temporal smoothing of the gains
     skin_erode_px: int = 2            # keeps the correction off the water
+    skin_dark_lum: float = 0.26       # below this (fins, mask) correction fades
     skin_feather_px: float = 2.5
+    # Shorts (SAM 3.1 "shorts" mask), coloured separately from the diver:
+    # white-balanced to neutral, then pulled toward `shorts_hex`.
+    shorts_hex: str = "#F4F1EA"       # clean warm white
+    shorts_strength: float = 0.85     # 0 = untouched, 1 = full shorts colour
+    shorts_saturation: float = 0.08   # chroma kept from the white-balanced fabric
+    shorts_exposure: float = 0.06     # small lift so the fabric reads bright
+    shorts_feather_px: float = 2.0
 
 
 @dataclass
@@ -121,6 +129,9 @@ class Masking:
     sam_root: str = "sam3"
     checkpoint: str = "checkpoints/sam3.1/sam3.1_multiplex.pt"
     text_prompt: str = "person"
+    # Extra SAM 3.1 parts, each masked in its own run: {name: text prompt}.
+    # Each part is coloured on its own and excluded from the diver's body.
+    parts: dict[str, str] = field(default_factory=lambda: {"shorts": "shorts"})
     prompt_frame: int = 0
     # Optional corrective point prompts: [frame, x_px, y_px, label(1/0), obj_id]
     point_prompts: list[list[float]] = field(default_factory=list)
