@@ -208,9 +208,15 @@ def zone_masks(rock_soft: np.ndarray, line: np.ndarray, feather_px: float):
     h, w = rock_soft.shape
     xs = np.arange(w, dtype=np.float32)[None, :]
     # signed distance to the line -> soft side split
-    side = 1.0 / (1.0 + np.exp(-(xs - line[:, None]) / (feather_px * 0.6)))
+    # the sea/sea split is wide and gentle (it crosses open sand below the
+    # rock); the rock edge itself stays tighter
+    side = 1.0 / (1.0 + np.exp(-(xs - line[:, None]) / (feather_px * 1.6)))
     r = cv2.GaussianBlur(rock_soft, (0, 0), feather_px * 0.5)
-    r = np.clip(r, 0, 1)
+    # atmospheric perspective: the far (upper) rock is seen through more
+    # water, so it takes less of the warm grade and more of each sea's
+    ys = np.linspace(0, 1, h, dtype=np.float32)[:, None]
+    t = np.clip(ys / 0.55, 0, 1)
+    r = np.clip(r, 0, 1) * (0.35 + 0.65 * t * t * (3 - 2 * t))
     left = (1 - r) * (1 - side)
     right = (1 - r) * side
     return left, r, right
@@ -256,32 +262,35 @@ def grade_left(x):
              gain=(0.86, 1.04, 1.08))
     y = _split_tone(y, shadow_rgb=(0.05, 0.35, 0.36), high_rgb=(0.70, 1.0, 0.98),
                     s_amt=0.35, h_amt=0.18)
-    return _sat(y, 1.18)
+    return np.clip(_sat(y, 1.12), 0, 1)
 
 
 def grade_rock(x):
-    # warm amber/copper, umber shadows, crisp texture
-    y = _lgg(x, lift=(0.012, 0.0, -0.01), gamma=(1.10, 1.0, 0.88),
-             gain=(1.20, 1.04, 0.80))
-    y = _split_tone(y, shadow_rgb=(0.35, 0.20, 0.10), high_rgb=(1.0, 0.75, 0.42),
-                    s_amt=0.40, h_amt=0.25)
-    y = _local_contrast(y, 0.35, 6)
-    return _sat(y, 1.12)
+    # warm amber/copper concentrated in the highlights, umber shadows,
+    # crisp texture; dark/blue pixels (water seen through gaps) stay quieter
+    y = _lgg(x, lift=(0.008, 0.0, -0.006), gamma=(1.05, 1.0, 0.94),
+             gain=(1.10, 1.02, 0.88))
+    y = _split_tone(np.clip(y, 0, 1), shadow_rgb=(0.30, 0.20, 0.13),
+                    high_rgb=(1.0, 0.80, 0.52), s_amt=0.18, h_amt=0.20)
+    y = _local_contrast(y, 0.22, 6)
+    return np.clip(_sat(y, 1.04), 0, 1)
 
 
 def grade_right(x, haze):
     # deep ink-navy, cooler, slightly desaturated, with depth haze
-    y = _lgg(x, lift=(-0.01, 0.0, 0.03), gamma=(0.86, 0.92, 1.04),
-             gain=(0.62, 0.80, 1.02))
-    y = _sat(y, 0.80)
+    y = _lgg(x, lift=(-0.005, 0.005, 0.03), gamma=(0.90, 0.96, 1.06),
+             gain=(0.70, 0.86, 1.04))
+    y = _sat(y, 0.85)
     y = _split_tone(y, shadow_rgb=(0.02, 0.06, 0.22), high_rgb=(0.55, 0.72, 0.95),
                     s_amt=0.45, h_amt=0.15)
     fog = np.asarray((0.06, 0.14, 0.26), np.float32)
+    y = np.clip(y, 0, 1)
     return y * (1 - haze[..., None]) + fog * haze[..., None]
 
 
 def global_finish(x):
     # gentle S-curve around mid grey + soft highlight roll-off
+    x = np.clip(x, 0, 1)
     p = 0.42
     c = 1.10
     y = np.where(x < p, p * (x / p) ** c, 1 - (1 - p) * ((1 - x) / (1 - p)) ** c)
