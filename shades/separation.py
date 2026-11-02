@@ -105,3 +105,84 @@ def apply_separation(graded: np.ndarray, alpha: np.ndarray, weight: float,
 
     out = g + w * (alpha * (subj - g) + (1 - alpha) * (bg - g))
     return np.clip(out, 0.0, 1.0)
+
+
+
+# ---------------------------------------------------------------------------
+# Skin tone: white-balance the diver against his own white clothing
+# ---------------------------------------------------------------------------
+# Water absorbs red long before blue, so the diver is lit by cyan light and
+# his skin blends into the water. Inside the SAM mask we measure what should
+# be white (the brightest unclipped subject pixels, here the white shorts) and
+# apply the gains that make it neutral. Skin then shows its own warm colour,
+# white stays white and dark fins stay dark, without guessing which pixel is
+# skin.
+
+LUMA = np.array([0.2126, 0.7152, 0.0722], np.float32)
+
+
+def subject_reference_gains(img: np.ndarray, mask_u8: np.ndarray,
+                            cfg: Separation) -> np.ndarray | None:
+    """Per-frame RGB gains (luminance-preserving) from the subject's
+    brightest unclipped pixels. None if there are too few."""
+    core = cv2.erode(mask_u8, np.ones((5, 5), np.uint8)) > 127
+    px = img[core]
+    if len(px) < 200:
+        return None
+    px = px[px.max(1) < cfg.skin_clip]
+    if len(px) < 100:
+        return None
+    lum = px @ LUMA
+    ref = px[lum >= np.percentile(lum, cfg.skin_ref_percentile)].mean(0)
+    gains = ref.mean() / np.maximum(ref, 1e-3)
+    gains = gains / float(gains @ LUMA)
+    return np.clip(gains, cfg.skin_gain_min, cfg.skin_gain_max).astype(np.float32)
+
+
+def smooth_gains(per_frame: list, window: int) -> np.ndarray:
+    """Fill missing frames by interpolation, then a centred moving average,
+    so the subject colour never flickers."""
+    n = len(per_frame)
+    have = [i for i, g in enumerate(per_frame) if g is not None]
+    if not have:
+        return np.ones((n, 3), np.float32)
+    arr = np.array([per_frame[i] for i in have], np.float32)
+    full = np.stack([np.interp(np.arange(n), have, arr[:, c]) for c in range(3)], 1)
+    k = max(1, window | 1)
+    pad = np.pad(full, ((k // 2, k // 2), (0, 0)), mode="edge")
+    ker = np.ones(k, np.float32) / k
+    return np.stack([np.convolve(pad[:, c], ker, mode="valid") for c in range(3)],
+                    1).astype(np.float32)
+
+
+def skin_alpha(mask_u8: np.ndarray, cfg: Separation, width: int) -> np.ndarray:
+    """Slightly eroded, lightly feathered alpha: keeps the correction off the
+    surrounding water."""
+    k = width / 1080.0
+    m = mask_u8
+    e = int(round(cfg.skin_erode_px * k))
+    if e > 0:
+        m = cv2.erode(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                                   (2 * e + 1, 2 * e + 1)))
+    a = cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0),
+                         max(cfg.skin_feather_px * k, 0.5))
+    return a[..., None]
+
+
+def apply_skin_tone(img: np.ndarray, alpha: np.ndarray, gains: np.ndarray,
+                    weight: float, cfg: Separation) -> np.ndarray:
+    w = weight * cfg.skin_strength
+    if w <= 1e-4:
+        return img
+    g = 1.0 + (gains - 1.0) * w
+    wb = img * g
+    lum = (wb * LUMA).sum(-1, keepdims=True)
+    # near-clipped highlights (blown-out white fabric) stay neutral, not pink
+    hp = np.clip((img.max(-1, keepdims=True) - 0.85) / 0.12, 0, 1)
+    wb = wb + (lum - wb) * hp
+    # gentle golden warmth on mid-tones = skin; fades in shadows/highlights
+    mid = np.clip((lum - 0.15) / 0.2, 0, 1) * np.clip((0.85 - lum) / 0.2, 0, 1)
+    wb = wb + mid * (cfg.skin_warmth * w) * np.array([1.0, 0.35, -0.8],
+                                                       np.float32) * lum
+    wb = wb * (2.0 ** (cfg.skin_exposure * w))
+    return np.clip(img + alpha * (wb - img), 0.0, 1.0)

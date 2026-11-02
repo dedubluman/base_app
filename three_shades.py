@@ -17,13 +17,16 @@ import sys
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from shades.config import load_config
 from shades.grade import SourceStats, apply_lut, bake_lut, hex_to_rgb, write_cube
 from shades.io import Encoder, probe, read_frames_at, iter_frames
 from shades.masking import load_subject_masks, mask_dir_for, masks_cached, run_sam31
-from shades.separation import (apply_separation, feather, find_lost_frames,
+from shades.separation import (apply_separation, apply_skin_tone, feather,
+                               find_lost_frames, skin_alpha, smooth_gains,
+                               subject_reference_gains,
                                lost_spans, separation_weights)
 from shades.transition import grade_mix
 from shades import verify
@@ -116,6 +119,21 @@ def main() -> int:
             f"lost spans: {spans or 'none'}")
     haze = hex_to_rgb(next(s.hex for s in cfg.palette if s.role == "shadow"))
 
+    # --- Skin: per-frame subject white balance, smoothed over time ----------
+    skin_gains = None
+    if masks is not None:
+        sw = 360
+        sh = int(round(info.height * sw / info.width / 2)) * 2
+        per = []
+        for i, f in enumerate(iter_frames(args.input, info, scale_w=sw)):
+            m = cv2.resize(masks[i], (sw, sh), interpolation=cv2.INTER_NEAREST)
+            per.append(subject_reference_gains(apply_lut(f, lut), m, cfg.separation))
+        skin_gains = smooth_gains(per, cfg.separation.skin_smooth_frames)
+        log(f"[skin] subject WB gains: R {skin_gains[:, 0].min():.2f}-"
+            f"{skin_gains[:, 0].max():.2f}, B {skin_gains[:, 2].min():.2f}-"
+            f"{skin_gains[:, 2].max():.2f} ({sum(p is None for p in per)} frames "
+            f"without a white reference, interpolated)")
+
     # --- Render -------------------------------------------------------------
     full_from = int(np.ceil((cfg.transition.raw_hold_end + cfg.transition.xfade_dur)
                             * float(info.fps)))
@@ -134,6 +152,16 @@ def main() -> int:
             alpha = feather(masks[i], cfg.separation, info.width)
             graded = apply_separation(graded, alpha, float(weights[i]),
                                       cfg.separation, haze)
+            # skin step only touches the diver: work on his bounding box
+            ys, xs = np.nonzero(masks[i] > 0)
+            if len(ys):
+                pad = 24
+                y0, y1 = max(ys.min() - pad, 0), min(ys.max() + pad + 1, info.height)
+                x0, x1 = max(xs.min() - pad, 0), min(xs.max() + pad + 1, info.width)
+                graded[y0:y1, x0:x1] = apply_skin_tone(
+                    graded[y0:y1, x0:x1],
+                    skin_alpha(masks[i][y0:y1, x0:x1], cfg.separation, info.width),
+                    skin_gains[i], float(weights[i]), cfg.separation)
         if i in measure_idx:
             measured_frames.append(graded[::2, ::2].copy())
         enc.write(frame + (graded - frame) * mix if mix < 1.0 else graded)
@@ -168,9 +196,11 @@ def main() -> int:
                                       - float(out_p["format"]["duration"])), 4),
     }
     checks["duration_ok"] = checks["duration_delta_s"] <= 1.0 / float(info.fps) + 1e-3
-    raw_t = min(1.0, cfg.transition.raw_hold_end / 2)
-    checks["raw_section_mad_8bit"] = round(verify.raw_frame_diff(args.input, out, raw_t), 3)
-    checks["raw_section_ok"] = checks["raw_section_mad_8bit"] < 2.0
+    if cfg.transition.raw_hold_end > 0:  # only when there is a raw intro
+        raw_t = min(1.0, cfg.transition.raw_hold_end / 2)
+        checks["raw_section_mad_8bit"] = round(
+            verify.raw_frame_diff(args.input, out, raw_t), 3)
+        checks["raw_section_ok"] = checks["raw_section_mad_8bit"] < 2.0
     sheet = out.parent / f"{stem}_contact_sheet.jpg"
     verify.contact_sheet(out, [0.5, 1.5, 2.3, 2.7, 3.5, 8.0, 14.0], sheet)
     for k, v in checks.items():

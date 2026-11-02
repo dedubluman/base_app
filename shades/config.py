@@ -15,9 +15,9 @@ from pathlib import Path
 @dataclass
 class Transition:
     # Seconds of untouched source at the start (grade + separation fully off).
-    raw_hold_end: float = 2.0
+    raw_hold_end: float = 0.0
     # Length of the raw -> graded blend that follows.
-    xfade_dur: float = 1.0
+    xfade_dur: float = 0.0
     # "smoothstep" | "cubic_in_out" | "linear"
     easing: str = "smoothstep"
 
@@ -102,6 +102,18 @@ class Separation:
     # versus the median of its neighbours, or is (nearly) empty.
     lost_area_jump: float = 2.2
     lost_min_area_frac: float = 0.0008
+    # Skin tone: the diver is white-balanced against his own brightest
+    # unclipped pixels (white shorts), so skin shows its real warm colour.
+    skin_strength: float = 0.9        # 0 = off, 1 = full subject white balance
+    skin_warmth: float = 0.22         # extra golden warmth on skin mid-tones
+    skin_exposure: float = 0.04       # small lift so skin glows against water
+    skin_ref_percentile: float = 88   # brightest % of subject pixels = white ref
+    skin_clip: float = 0.96           # ignore clipped pixels in the reference
+    skin_gain_min: float = 0.6
+    skin_gain_max: float = 1.9
+    skin_smooth_frames: int = 15      # temporal smoothing of the gains
+    skin_erode_px: int = 2            # keeps the correction off the water
+    skin_feather_px: float = 2.5
 
 
 @dataclass
