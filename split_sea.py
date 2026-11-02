@@ -47,20 +47,95 @@ def make_proxy(src: Path, dst: Path, stride: int) -> None:
          "-pix_fmt", "yuv420p", str(dst)], check=True)
 
 
+# Seed clicks on the rock ridge in the first frame (source pixels):
+# positives along the ridge, negatives in the open water on each side.
+# SAM 3.1's text detector does not find this rock ("rock", "reef", "stone"
+# all return nothing), but its point-prompted tracker head segments it cleanly.
+SEED_POINTS = [[616, 731, 1], [578, 540, 1], [640, 930, 1], [640, 250, 1],
+               [193, 290, 0], [1080, 580, 0]]
+
+
+def points_from_mask(m: np.ndarray, n_pos: int = 5):
+    """Positive clicks along the mask's spine, negatives in the water on
+    both sides (far from the mask)."""
+    h, w = m.shape
+    er = cv2.erode(m.astype(np.uint8), np.ones((25, 25), np.uint8))
+    src = er if er.sum() > 500 else m.astype(np.uint8)
+    rows = np.where(src.any(1))[0]
+    pts = []
+    for y in np.linspace(rows.min(), rows.max(), n_pos + 2)[1:-1].astype(int):
+        xs = np.where(src[y])[0]
+        if len(xs):
+            pts.append([float(xs[len(xs) // 2]), float(y), 1])
+    dist = cv2.distanceTransform((1 - m.astype(np.uint8)), cv2.DIST_L2, 5)
+    for side in (slice(0, w // 3), slice(2 * w // 3, w)):
+        d = dist[h // 6: 5 * h // 6, side]
+        if d.max() > 60:
+            y, x = np.unravel_index(np.argmax(d), d.shape)
+            pts.append([float(x + side.start), float(y + h // 6), 0])
+    return pts
+
+
 def run_rock_masks(src: Path, mask_root: Path, stride: int, prompt: str) -> Path:
-    from shades.masking import masks_cached, run_sam31
+    """SAM 3.1 (multiplex predictor, local checkpoint) on every `stride`-th
+    frame. Each frame is segmented on its own from point prompts derived
+    from the previous frame's mask, so there is no tracker drift to manage."""
+    import shutil
+    import time
+
+    import torch
+
+    from shades.masking import _build_predictor, extract_jpeg_frames
 
     proxy = REPO / ".cache" / f"{src.stem}_stride{stride}.mp4"
     if not proxy.exists():
         make_proxy(src, proxy, stride)
     mdir = mask_root / f"{src.stem}__rock_s{stride}"
-    n_proxy = probe(proxy).n_frames
-    if masks_cached(mdir, n_proxy):
+    sub = mdir / "subject"
+    sub.mkdir(parents=True, exist_ok=True)
+    frames = REPO / ".cache" / f"sam_frames_{proxy.stem}"
+    n = extract_jpeg_frames(proxy, frames, 2)
+    if len(list(sub.glob("*.png"))) == n:
         log(f"[sam] cached rock masks: {mdir}")
         return mdir
-    cfg = dataclasses.replace(Masking(), text_prompt=prompt, parts={},
-                              max_num_objects=4)
-    run_sam31(proxy, mdir, cfg, REPO, REPO / ".cache", log=log)
+    h, w = cv2.imread(str(frames / "00000.jpg")).shape[:2]
+    pred, on_gpu = _build_predictor(Masking(), REPO, REPO / ".cache")
+    log(f"[sam] SAM 3.1 loaded on {'CUDA' if on_gpu else 'CPU'}; {n} frames")
+    one = REPO / ".cache" / "sam_one"
+    prev = None
+    for i in range(n):
+        out_png = sub / f"{i:05d}.png"
+        if out_png.exists():
+            prev = cv2.imread(str(out_png), cv2.IMREAD_GRAYSCALE) > 127
+            continue
+        t0 = time.time()
+        pts = SEED_POINTS if prev is None or prev.sum() < 2000 else points_from_mask(prev)
+        shutil.rmtree(one, ignore_errors=True)
+        one.mkdir(parents=True)
+        (one / "00000.jpg").symlink_to(frames / f"{i:05d}.jpg")
+        sid = pred.handle_request({"type": "start_session",
+                                   "resource_path": str(one)})["session_id"]
+        # a text prompt makes the wrapper process (and cache) this frame;
+        # without it the point-prompt result is dropped in post-processing
+        pred.handle_request({"type": "add_prompt", "session_id": sid,
+                             "frame_index": 0, "text": prompt})
+        r = pred.handle_request({
+            "type": "add_prompt", "session_id": sid, "frame_index": 0, "obj_id": 1,
+            "points": torch.tensor([[x / w, y / h] for x, y, _ in pts], dtype=torch.float32),
+            "point_labels": torch.tensor([int(l) for *_, l in pts], dtype=torch.int32)})
+        pred.handle_request({"type": "close_session", "session_id": sid})
+        o = r["outputs"]
+        ids = list(o["out_obj_ids"])
+        m = (np.asarray(o["out_binary_masks"][ids.index(1)]) > 0) if 1 in ids \
+            else (prev if prev is not None else np.zeros((h, w), bool))
+        cv2.imwrite(str(out_png), m.astype(np.uint8) * 255)
+        prev = m
+        log(f"[sam] frame {i + 1}/{n}: area {int(m.sum())}, "
+            f"{len(pts)} pts, {time.time() - t0:.0f}s")
+    (mdir / "meta.json").write_text(json.dumps(
+        {"num_frames": n, "stride": stride, "model": "SAM 3.1 multiplex",
+         "prompt": "points (auto from previous mask)"}, indent=1))
+    log("[sam] done")
     return mdir
 
 
