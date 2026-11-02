@@ -39,23 +39,25 @@ def log(msg: str) -> None:
 
 
 def get_masks(args, cfg, info):
-    """Return (masks or None, meta or None, status string)."""
+    """Return (masks, meta, status). SAM 3.1 is mandatory: every diver
+    operation (separation, skin tone) runs only inside its masks, so there is
+    no mask-less fallback. Without CUDA, SAM 3.1 runs through the CPU port."""
     import torch
 
     mdir = mask_dir_for(Path(args.masks_dir), args.input.stem)
     if masks_cached(mdir, info.n_frames) and not args.resegment:
         masks, meta = load_subject_masks(mdir)
         return masks, meta, f"cached SAM 3.1 masks ({meta['device']})"
-    if args.no_sam:
-        return None, None, "disabled (--no-sam)"
-    if not torch.cuda.is_available() and not args.sam_cpu:
-        log("[warn] No CUDA GPU and no cached masks: rendering WITHOUT subject "
-            "separation. Run with --sam-cpu (slow) or run --masks-only on a "
-            "GPU machine and copy the masks/ folder here.")
-        return None, None, "skipped (no GPU, no cache)"
+    if not torch.cuda.is_available():
+        log("[sam] No CUDA GPU: running SAM 3.1 through the CPU port "
+            "(~10-15 s/frame). Tip: run --masks-only on a GPU machine and copy "
+            "masks/ here to skip this.")
     run_sam31(args.input, mdir, cfg.masking, REPO, REPO / ".cache", log=log,
               resume=not args.resegment)
     masks, meta = load_subject_masks(mdir)
+    if not (masks > 0).any():
+        raise SystemExit("[sam] SAM 3.1 found no subject; refine "
+                         "masking.text_prompt or add masking.point_prompts.")
     return masks, meta, f"SAM 3.1 ({meta['device']})"
 
 
@@ -69,9 +71,6 @@ def main() -> int:
     ap.add_argument("--masks-only", action="store_true",
                     help="run SAM 3.1 segmentation, write the mask cache, exit")
     ap.add_argument("--resegment", action="store_true", help="ignore mask cache")
-    ap.add_argument("--sam-cpu", action="store_true",
-                    help="allow SAM 3.1 on CPU (CPU port; ~10 s/frame)")
-    ap.add_argument("--no-sam", action="store_true", help="skip separation")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -81,7 +80,6 @@ def main() -> int:
         f"audio={info.has_audio}")
 
     if args.masks_only:
-        args.sam_cpu = True
         mdir = mask_dir_for(Path(args.masks_dir), args.input.stem)
         (mdir / "meta.json").unlink(missing_ok=True)  # force a (resumable) run
         get_masks(args, cfg, info)

@@ -46,11 +46,9 @@ The SAM 3.1 checkpoint is expected at `checkpoints/sam3.1/sam3.1_multiplex.pt`
 Flags:
 
 - `--masks-only`: run SAM 3.1 only, e.g. on a GPU machine, then copy `masks/` back.
-- `--sam-cpu`: allow SAM 3.1 on CPU (about 10 s per frame on 4 cores).
 - `--resegment`: ignore the mask cache.
-- `--no-sam`: grade only.
 
-With no GPU and no cache (and without `--sam-cpu`), the script warns and renders without separation.
+SAM 3.1 is mandatory: every diver operation (separation, skin tone) runs only inside its masks. Without a GPU and without cached masks, SAM 3.1 runs through the CPU port (about 10–15 s per frame on 4 cores).
 
 ### Outputs (in `output/`)
 
