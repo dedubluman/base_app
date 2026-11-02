@@ -14,3 +14,4 @@ inputs/
 output/
 masks/
 .cache/
+*.log
