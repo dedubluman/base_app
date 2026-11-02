@@ -55,15 +55,19 @@ SEED_POINTS = [[616, 731, 1], [578, 540, 1], [640, 930, 1], [640, 250, 1],
                [193, 290, 0], [1080, 580, 0]]
 
 
-def points_from_mask(m: np.ndarray, n_pos: int = 5):
-    """Positive clicks along the mask's spine, negatives in the water on
-    both sides (far from the mask)."""
+def points_from_mask(m: np.ndarray, n_pos: int = 8):
+    """Positive clicks along the mask's spine from its very top to its
+    bottom (thin necks included), negatives in the water on both sides."""
     h, w = m.shape
-    er = cv2.erode(m.astype(np.uint8), np.ones((25, 25), np.uint8))
+    # light erosion only, so thin parts of the ridge still get clicks
+    er = cv2.erode(m.astype(np.uint8), np.ones((7, 7), np.uint8))
     src = er if er.sum() > 500 else m.astype(np.uint8)
-    rows = np.where(src.any(1))[0]
+    rows = np.where(src.sum(1) >= 6)[0]
+    if len(rows) == 0:
+        rows = np.where(src.any(1))[0]
     pts = []
-    for y in np.linspace(rows.min(), rows.max(), n_pos + 2)[1:-1].astype(int):
+    lo, hi = rows.min(), rows.max()
+    for y in np.linspace(lo + 0.03 * (hi - lo), hi - 0.03 * (hi - lo), n_pos).astype(int):
         xs = np.where(src[y])[0]
         if len(xs):
             pts.append([float(xs[len(xs) // 2]), float(y), 1])
