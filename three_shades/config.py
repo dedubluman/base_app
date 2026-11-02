@@ -47,6 +47,10 @@ class Palette:
 
 @dataclass
 class IntroTimings:
+    # The palette-card intro (title, cards, flat->graded wipe). Off by default:
+    # the grade is applied from the first frame.
+    enabled: bool = False
+
     # Title ("3 SHADES METHOD"). Set Layout.title to "" to disable it.
     title_in: float = 0.20
     title_out: float = 1.10
@@ -70,7 +74,7 @@ class IntroTimings:
     grade_wipe_feather: float = 0.35  # soft edge, fraction of frame height
 
     # Fade to black at the very end of the reel (0 disables).
-    outro_fade: float = 0.60
+    outro_fade: float = 0.0
 
 
 @dataclass
@@ -138,8 +142,8 @@ class GradeParams:
     mask_feather_frac: float = 0.006  # of frame width
     subject_wb_strength: float = 0.85  # diver-only white balance (needs the mask)
     subject_teal_reduction: float = 0.65  # how much less teal toning the diver gets
-    skin_restore: float = 0.75  # how strongly the diver's midtones are pulled to skin_tone
-    skin_tone: str = "#8B584C"  # target skin color (measured on the reference grade)
+    skin_restore: float = 0.60  # how strongly the diver's midtones are pulled to skin_tone
+    skin_tone: str = "#A88065"  # natural tan (hue 24 deg, saturation 0.40)
     skin_saturation: float = 1.0  # scales the saturation of skin_tone
     subject_exposure: float = 1.07
     subject_warmth: float = 0.15  # keep skin warm against the teal water
@@ -148,6 +152,18 @@ class GradeParams:
     bg_desaturate: float = 0.08
     bg_blur_frac: float = 0.0016  # gentle depth-of-field on the background
     vignette: float = 0.28
+
+    # Match the background (water, sand) to the reference video's grade:
+    # Lab mean/std transfer measured on the reference's graded section.
+    # The diver (inside the SAM 3.1 mask) is not affected.
+    ref_match: float = 0.90  # blue-yellow (Lab b) strength
+    ref_match_a: float = 0.45  # green-magenta (Lab a) strength; high values turn sand mauve
+    ref_match_luma: float = 0.75  # brightness/contrast strength
+    reference_start: float = 6.5  # graded section of the reference (seconds)
+    reference_end: float = 10.0
+    # Region of the reference to measure, as fractions [x0, y0, x1, y1]; the
+    # default excludes a phone screen-recording's status bar, side icons and caption.
+    reference_crop: list[float] = field(default_factory=lambda: [0.02, 0.12, 0.85, 0.80])
 
 
 # ─── Optical flow + speed ramp ──────────────────────────────────────────────

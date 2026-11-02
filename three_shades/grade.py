@@ -49,6 +49,29 @@ class GradeStats:
     # tints skin cyan-green far more than the global balance can fix without
     # wrecking the water, so the subject gets its own correction.
     subject_wb_gains: Optional[np.ndarray] = None
+    # Lab (mean, std) of our graded background and of the reference grade.
+    src_lab: Optional[tuple[np.ndarray, np.ndarray]] = None
+    ref_lab: Optional[tuple[np.ndarray, np.ndarray]] = None
+
+
+def lab_stats(px: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    lab = cv2.cvtColor(np.clip(px, 0, 1).reshape(-1, 1, 3).astype(np.float32),
+                       cv2.COLOR_RGB2Lab).reshape(-1, 3)
+    return lab.mean(axis=0), lab.std(axis=0)
+
+
+def match_reference(img: np.ndarray, stats: "GradeStats", p: GradeParams) -> np.ndarray:
+    """Reinhard-style Lab transfer of img toward the reference grade's statistics."""
+    if stats.ref_lab is None or stats.src_lab is None:
+        return img
+    shape = img.shape
+    lab = cv2.cvtColor(np.clip(img, 0, 1).astype(np.float32), cv2.COLOR_RGB2Lab)
+    (ms, ss), (mr, sr) = stats.src_lab, stats.ref_lab
+    moved = (lab - ms) / np.maximum(ss, 1e-3) * sr + mr
+    w = np.array([p.ref_match_luma, p.ref_match_a, p.ref_match], np.float32)
+    lab = lab + (moved - lab) * w
+    out = cv2.cvtColor(lab.astype(np.float32), cv2.COLOR_Lab2RGB)
+    return np.clip(out, 0.0, 1.0).reshape(shape)
 
 
 def _gray_world(px: np.ndarray, strength: float) -> np.ndarray:
@@ -190,8 +213,8 @@ def grade_frame(img: np.ndarray, mask: np.ndarray, stats: GradeStats,
         base = cv2.GaussianBlur(subj, (0, 0), w * 0.006)
         subj = subj + p.subject_detail * (subj - base)
 
-    # Background: slightly darker, less saturated, gently defocused.
-    bg = g * p.bg_exposure
+    # Background: matched to the reference grade, slightly darker, gently defocused.
+    bg = match_reference(g, stats, p) * p.bg_exposure
     by = luma(bg)[..., None]
     bg = by + (bg - by) * (1.0 - p.bg_desaturate)
     if p.bg_blur_frac > 0:
@@ -219,7 +242,7 @@ def export_cube(path: str, stats: GradeStats, p: GradeParams, pal: Palette, size
     r = np.linspace(0, 1, size, dtype=np.float32)
     bb, gg, rr = np.meshgrid(r, r, r, indexing="ij")  # red varies fastest
     lattice = np.stack([rr, gg, bb], axis=-1).reshape(-1, 1, 3)
-    out = grade_global(lattice, stats, p, pal).reshape(-1, 3)
+    out = match_reference(grade_global(lattice, stats, p, pal), stats, p).reshape(-1, 3)
     with open(path, "w") as f:
         f.write('TITLE "3 Shades underwater grade"\n')
         f.write(f"LUT_3D_SIZE {size}\nDOMAIN_MIN 0 0 0\nDOMAIN_MAX 1 1 1\n")

@@ -2,8 +2,8 @@
 
 Automates a palette-intro edit for vertical (9:16) underwater footage:
 
-1. **Palette intro.** A title, then three rounded cards drop in one after another at the top of the frame (fade + slide-down with a soft landing). Each card shows a palette name and its hex code.
-2. **Grade transition.** The cards lift away while the cinematic grade wipes down the frame with a soft edge.
+1. **Reference color grade from the first frame.** The water and sand are matched to the colors of a reference video (`--reference`), measured on its graded section. No graphics are added by default.
+2. **Optional palette intro** (`--intro`): a title and three palette cards, then the grade wipes in.
 3. **SAM 3.1 subject isolation.** The diver is segmented in every frame. The mask drives depth separation: the diver gets brighter, warmer skin and more detail, while the water gets slightly darker, less saturated and defocused.
 4. **Optical-flow speed ramp.** The ascent toward the surface is detected from the mask and eased into slow motion. The in-between frames are synthesized with bidirectional optical flow, using an occlusion-aware blend.
 
@@ -44,7 +44,7 @@ export HF_TOKEN=hf_...            # your token
 
 ```bash
 # Everything on a CUDA machine: SAM 3.1 masks, then the render
-python -m three_shades all video_2.mov -o reel.mp4
+python -m three_shades all video_2.mov -o reel.mp4 --reference video_1.mov
 
 # Split across machines: masks on a GPU box/Colab, render anywhere
 python -m three_shades segment video_2.mov -o reel.mp4        # writes reel.sam31.masks.npz
@@ -73,6 +73,8 @@ python -m three_shades segment video_2.mov -o reel.mp4 --subject-point 540,900
 
 ## Tuning
 
+The palette-card intro is off by default. `--intro` (or `intro.enabled: true`) turns it back on, and the `intro` timings below apply only then.
+
 Copy `config.example.json`, change what you need, and pass it with `--config my.json`. Any field from `config.py` can be overridden. `python -m three_shades dump-config` prints every field with its default. All times are in seconds.
 
 ### Animation timings (`intro`, output timeline)
@@ -86,7 +88,7 @@ Copy `config.example.json`, change what you need, and pass it with `--config my.
 | `label_delay` / `label_dur` | 0.3 / 0.45 | The name and hex fade in shortly after each card starts. |
 | `cards_out_start`, `card_out_stagger`, `card_out_dur` | 4.4, 0.1, 0.6 | Exit: the cards slide up and fade. |
 | `grade_wipe_start` / `grade_wipe_dur` / `grade_wipe_feather` | 4.5 / 1.2 / 0.35 | Flat-to-graded wipe. A bigger feather gives a softer, longer edge. |
-| `outro_fade` | 0.6 | Fade to black at the end. 0 turns it off. |
+| `outro_fade` | 0 | Fade to black at the end, in seconds. 0 turns it off. |
 
 Card geometry is set in `layout`: `cards_top_frac` (keep it at 0.08 or more to stay clear of the Reels/TikTok top UI), `card_aspect`, `corner_radius_frac`, `drop_distance_frac`, `start_scale` and font sizes. Fonts are found automatically (Inter, then Segoe UI, then DejaVu). Set `font_bold` / `font_medium` to use your own.
 
@@ -100,7 +102,8 @@ Card geometry is set in `layout`: `cards_top_frac` (keep it at 0.08 or more to s
 - `sand_boost`: how strongly sand and skin are pulled toward the Golden Sand hue.
 - `sand_chroma`: how saturated that target is. Raise it for more golden sand; lower it if skin looks too warm. Because it's a bounded pull rather than an additive tint, skin can't go orange.
 - `midtone_tint`: a gentle Golden Sand tint across all midtones.
-- `skin_tone`, `skin_restore`, `skin_saturation`: skin color of the diver, applied only inside the SAM 3.1 mask. `skin_tone` defaults to `#8B584C`, the warm peach-tan measured on the reference video's graded diver. `skin_restore` sets how strongly the diver's midtones are pulled to it.
+- Reference match (needs `--reference`): `ref_match_luma` (brightness and contrast), `ref_match` (blue-yellow) and `ref_match_a` (green-magenta; keep it low or sand turns mauve) set how far the background moves toward the reference's Lab color statistics. `reference_start`/`reference_end` select the reference's graded section and `reference_crop` the region measured. The default crop skips a phone screen recording's status bar, side icons and caption. The diver inside the mask is not changed by the match.
+- `skin_tone`, `skin_restore`, `skin_saturation`: skin color of the diver, applied only inside the SAM 3.1 mask. `skin_tone` defaults to `#A88065`, a natural tan (hue 24°, saturation 0.40). `skin_restore` sets how strongly the diver's midtones are pulled to it.
 - `water_teal`: pushes the water midtones toward teal.
 - `highlight_tint`, `highlight_mix`, `bloom`: the crystal highlights and the glow on sun rays.
 - Depth separation (SAM 3.1 mask):

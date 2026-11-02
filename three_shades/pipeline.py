@@ -20,7 +20,7 @@ import numpy as np
 
 from . import flow as flowmod
 from .config import Config, dump_config, load_config
-from .grade import analyze, export_cube, grade_frame
+from .grade import analyze, export_cube, grade_frame, grade_global, lab_stats
 from .palette_cards import IntroOverlay, grade_wipe_alpha
 from .segmentation import load_masks, save_masks, segment
 from .video_io import SequentialFrameSource, VideoWriter, read_frames
@@ -64,6 +64,21 @@ def render(args, cfg: Config) -> None:
                                          interpolation=cv2.INTER_NEAREST), kernel) > 0
                     for i in sample_idx[:len(sample)]]
     stats = analyze(sample, cfg.grade, sample_masks)
+    if args.reference:
+        g = cfg.grade
+        x0, y0, x1, y1 = g.reference_crop
+        ref = [f for i, f in enumerate(read_frames(args.reference, 258, 559))
+               if g.reference_start * 60 <= i <= g.reference_end * 60 and i % 6 == 0]
+        if not ref:  # reference shorter than the configured window: use all of it
+            ref = [f for i, f in enumerate(read_frames(args.reference, 258, 559)) if i % 6 == 0]
+        ref_px = np.concatenate([f[int(y0 * 559):int(y1 * 559), int(x0 * 258):int(x1 * 258)]
+                                 .reshape(-1, 3) for f in ref])
+        stats.ref_lab = lab_stats(ref_px)
+        src_px = np.concatenate([grade_global(f, stats, g, cfg.palette)[~m]
+                                 for f, m in zip(sample, sample_masks)])
+        stats.src_lab = lab_stats(src_px)
+        print(f"[grade] reference Lab mean {np.round(stats.ref_lab[0], 1)} "
+              f"(ours {np.round(stats.src_lab[0], 1)}) from {len(ref)} reference frames")
     print(f"[grade] wb gains {np.round(stats.wb_gains, 3)}, subject wb gains "
           f"{None if stats.subject_wb_gains is None else np.round(stats.subject_wb_gains, 3)}, "
           f"levels {stats.black:.3f}..{stats.white:.3f}")
@@ -99,14 +114,16 @@ def render(args, cfg: Config) -> None:
             else:
                 frame, mask = f0, masks[i].astype(np.float32)
 
-            # Flat footage during the palette presentation, then the wipe.
-            if t_out < tim.grade_wipe_start:
+            if not tim.enabled:  # graded from the very first frame, no graphics
+                out = grade_frame(frame, mask, stats, cfg.grade, cfg.palette)
+            elif t_out < tim.grade_wipe_start:  # flat during the palette cards, then the wipe
                 out = frame.copy()
             else:
                 graded = grade_frame(frame, mask, stats, cfg.grade, cfg.palette)
                 a = grade_wipe_alpha(t_out, H, tim)
                 out = graded if a is None else frame * (1 - a) + graded * a
-            out = overlay.draw(out, t_out)
+            if tim.enabled:
+                out = overlay.draw(out, t_out)
             if tim.outro_fade > 0:
                 out = out * min(1.0, (duration - t_out) / tim.outro_fade)
             writer.write(out)
@@ -123,6 +140,7 @@ def render(args, cfg: Config) -> None:
         "output": str(out), "size": [W, H], "fps": fps,
         "source_frames": n, "output_frames": len(timeline), "duration_s": round(duration, 3),
         "ascent_source_s": ascent, "segmenter": cfg.seg.backend,
+        "reference": args.reference, "intro": cfg.intro.enabled,
         "palette": {s.name: s.hex for s in cfg.palette.swatches()},
     }
     out.with_suffix(".json").write_text(json.dumps(report, indent=2))
@@ -141,6 +159,8 @@ def main(argv=None) -> None:
     ap.add_argument("--resegment", action="store_true", help="ignore an existing mask cache")
     ap.add_argument("--subject-point", help="x,y click on the diver in frame 0 (1080x1920 px)")
     ap.add_argument("--text-prompt", help="SAM 3.1 concept prompt (default: person)")
+    ap.add_argument("--reference", help="reference video whose graded colors are matched")
+    ap.add_argument("--intro", action="store_true", help="add the palette-card intro")
     ap.add_argument("--music", help="audio track to lay under the reel")
     ap.add_argument("--preview", action="store_true", help="half resolution, faster")
     args = ap.parse_args(argv)
@@ -159,6 +179,8 @@ def main(argv=None) -> None:
         cfg.seg.text_prompt = args.text_prompt
     if args.music:
         cfg.export.music = args.music
+    if args.intro:
+        cfg.intro.enabled = True
     args.segmenter_name = cfg.seg.backend.replace(".", "")
 
     if args.command == "segment":
