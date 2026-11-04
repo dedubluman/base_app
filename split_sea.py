@@ -155,7 +155,7 @@ def run_rock_masks(src: Path, mask_root: Path, stride: int, prompt: str) -> Path
         out_png = sub / f"{i:05d}.png"
         if out_png.exists():
             hist.append(cv2.imread(str(out_png), cv2.IMREAD_GRAYSCALE) > 127)
-            hist = hist[-4:]
+            hist = hist[-6:]
             continue
         t0 = time.time()
         prev = hist[-1] if hist else None
@@ -163,32 +163,37 @@ def run_rock_masks(src: Path, mask_root: Path, stride: int, prompt: str) -> Path
             m = segment(i, SEED_POINTS)
             rec = {"try": 1, "iou_prev": None}
         else:
+            # consensus of the recent frames: one bad frame cannot drag the
+            # next ones off (prompts and the QC reference both come from it)
+            basis = np.mean(np.stack(hist[-6:]), 0) >= 0.5 if len(hist) >= 3 else prev
+
             def score(c):
                 if c is None:
                     return -1.0, 0.0
-                ar = c.sum() / max(prev.sum(), 1)
-                return _iou(c, prev), ar
-            cands = [("spine", segment(i, points_from_mask(prev)))]
+                ar = c.sum() / max(basis.sum(), 1)
+                return _iou(c, basis), ar
+            cands = [("spine", segment(i, points_from_mask(basis)))]
             sc = score(cands[0][1])
             if not (sc[0] >= iou_ok and area_lo <= sc[1] <= area_hi):
                 # re-segment instead of trusting a drifting mask
-                cands.append(("dense+ring", segment(i, points_from_mask(prev, 12, True))))
-                if len(hist) >= 3:
-                    cands.append(("from_t-3", segment(i, points_from_mask(hist[-3], 10, True))))
+                cands.append(("dense+ring", segment(i, points_from_mask(basis, 12, True))))
+                cands.append(("prev", segment(i, points_from_mask(prev, 10, True))))
             best = max(cands, key=lambda c: score(c[1])[0])
             m = best[1] if best[1] is not None else prev
             sc = score(m)
-            rec = {"try": len(cands), "chosen": best[0], "iou_prev": round(sc[0], 4),
+            rec = {"try": len(cands), "chosen": best[0], "iou_prev": round(_iou(m, prev), 4),
+                   "iou_consensus": round(sc[0], 4),
                    "area_ratio": round(float(sc[1]), 4),
                    "flag": not (sc[0] >= iou_ok and area_lo <= sc[1] <= area_hi)}
         rec["area"] = int(m.sum())
         qc[str(i)] = rec
         cv2.imwrite(str(out_png), m.astype(np.uint8) * 255)
         hist.append(m)
-        if len(hist) > 4:
+        if len(hist) > 6:
             hist.pop(0)
         qc_f.write_text(json.dumps(qc))
         log(f"[sam] frame {i + 1}/{n}: area {rec['area']}, iou {rec.get('iou_prev')}, "
+            f"cons {rec.get('iou_consensus')}, "
             f"tries {rec['try']}{' FLAG' if rec.get('flag') else ''}, {time.time() - t0:.0f}s")
     flagged = [k for k, v in qc.items() if v.get("flag")]
     (mdir / "meta.json").write_text(json.dumps(
