@@ -402,7 +402,7 @@ def main() -> int:
          "-map", "0:v", "-map", "1:a?", "-c:a", "copy",
          "-c:v", "libx264", "-crf", "15", "-preset", "slow", "-pix_fmt", "yuv420p",
          "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-         "-color_range", "tv", "-shortest", str(out)], stdin=subprocess.PIPE)
+         "-color_range", "tv", str(out)], stdin=subprocess.PIPE)
     for i, f in enumerate(read_all_frames(a.input, w, h)):
         g, _ = grade_frame(f, rock[min(i, n - 1)], lines[min(i, n - 1)], feather_px)
         enc.stdin.write(g.tobytes())
