@@ -55,13 +55,16 @@ SEED_POINTS = [[616, 731, 1], [578, 540, 1], [640, 930, 1], [640, 250, 1],
                [193, 290, 0], [1080, 580, 0]]
 
 
-def points_from_mask(m: np.ndarray, n_pos: int = 8):
+def points_from_mask(m: np.ndarray, n_pos: int = 8, ring_neg: bool = False):
     """Positive clicks along the mask's spine from its very top to its
-    bottom (thin necks included), negatives in the water on both sides."""
+    bottom (thin necks included), negatives in the water on both sides,
+    including the band near the surface where water and the upper rock meet.
+    With ring_neg, extra negatives sit just outside the mask edge."""
     h, w = m.shape
+    m8 = m.astype(np.uint8)
     # light erosion only, so thin parts of the ridge still get clicks
-    er = cv2.erode(m.astype(np.uint8), np.ones((7, 7), np.uint8))
-    src = er if er.sum() > 500 else m.astype(np.uint8)
+    er = cv2.erode(m8, np.ones((7, 7), np.uint8))
+    src = er if er.sum() > 500 else m8
     rows = np.where(src.sum(1) >= 6)[0]
     if len(rows) == 0:
         rows = np.where(src.any(1))[0]
@@ -71,19 +74,34 @@ def points_from_mask(m: np.ndarray, n_pos: int = 8):
         xs = np.where(src[y])[0]
         if len(xs):
             pts.append([float(xs[len(xs) // 2]), float(y), 1])
-    dist = cv2.distanceTransform((1 - m.astype(np.uint8)), cv2.DIST_L2, 5)
-    for side in (slice(0, w // 3), slice(2 * w // 3, w)):
-        d = dist[h // 6: 5 * h // 6, side]
-        if d.max() > 60:
-            y, x = np.unravel_index(np.argmax(d), d.shape)
-            pts.append([float(x + side.start), float(y + h // 6), 0])
+    dist = cv2.distanceTransform(1 - m8, cv2.DIST_L2, 5)
+    for rs in (slice(0, h // 6), slice(h // 6, 5 * h // 6)):
+        for side in (slice(0, w // 3), slice(2 * w // 3, w)):
+            d = dist[rs, side]
+            if d.max() > 60:
+                y, x = np.unravel_index(np.argmax(d), d.shape)
+                pts.append([float(x + side.start), float(y + rs.start), 0])
+    if ring_neg:
+        ring = (dist > 28) & (dist < 40)
+        ys, xs = np.nonzero(ring)
+        if len(ys):
+            for k in np.linspace(0, len(ys) - 1, 6).astype(int):
+                pts.append([float(xs[k]), float(ys[k]), 0])
     return pts
+
+
+def _iou(a: np.ndarray, b: np.ndarray) -> float:
+    u = np.logical_or(a, b).sum()
+    return float(np.logical_and(a, b).sum() / u) if u else 0.0
 
 
 def run_rock_masks(src: Path, mask_root: Path, stride: int, prompt: str) -> Path:
     """SAM 3.1 (multiplex predictor, local checkpoint) on every `stride`-th
-    frame. Each frame is segmented on its own from point prompts derived
-    from the previous frame's mask, so there is no tracker drift to manage."""
+    frame (stride 1 = every source frame). Each frame is segmented on its own
+    from point prompts derived from the previous frame's mask, then checked:
+    if it disagrees with the previous frame (IoU / area jump), the frame is
+    re-segmented with alternative prompts and the most consistent result is
+    kept. Every decision is logged to qc.json."""
     import shutil
     import time
 
@@ -91,29 +109,26 @@ def run_rock_masks(src: Path, mask_root: Path, stride: int, prompt: str) -> Path
 
     from shades.masking import _build_predictor, extract_jpeg_frames
 
-    proxy = REPO / ".cache" / f"{src.stem}_stride{stride}.mp4"
-    if not proxy.exists():
-        make_proxy(src, proxy, stride)
+    if stride == 1:
+        proxy = src
+    else:
+        proxy = REPO / ".cache" / f"{src.stem}_stride{stride}.mp4"
+        if not proxy.exists():
+            make_proxy(src, proxy, stride)
     mdir = mask_root / f"{src.stem}__rock_s{stride}"
     sub = mdir / "subject"
     sub.mkdir(parents=True, exist_ok=True)
-    frames = REPO / ".cache" / f"sam_frames_{proxy.stem}"
+    frames = REPO / ".cache" / f"sam_frames_{proxy.stem}_s{stride}"
     n = extract_jpeg_frames(proxy, frames, 2)
-    if len(list(sub.glob("*.png"))) == n:
+    if len(list(sub.glob("*.png"))) == n and (mdir / "meta.json").exists():
         log(f"[sam] cached rock masks: {mdir}")
         return mdir
     h, w = cv2.imread(str(frames / "00000.jpg")).shape[:2]
     pred, on_gpu = _build_predictor(Masking(), REPO, REPO / ".cache")
     log(f"[sam] SAM 3.1 loaded on {'CUDA' if on_gpu else 'CPU'}; {n} frames")
     one = REPO / ".cache" / "sam_one"
-    prev = None
-    for i in range(n):
-        out_png = sub / f"{i:05d}.png"
-        if out_png.exists():
-            prev = cv2.imread(str(out_png), cv2.IMREAD_GRAYSCALE) > 127
-            continue
-        t0 = time.time()
-        pts = SEED_POINTS if prev is None or prev.sum() < 2000 else points_from_mask(prev)
+
+    def segment(i, pts):
         shutil.rmtree(one, ignore_errors=True)
         one.mkdir(parents=True)
         (one / "00000.jpg").symlink_to(frames / f"{i:05d}.jpg")
@@ -130,16 +145,57 @@ def run_rock_masks(src: Path, mask_root: Path, stride: int, prompt: str) -> Path
         pred.handle_request({"type": "close_session", "session_id": sid})
         o = r["outputs"]
         ids = list(o["out_obj_ids"])
-        m = (np.asarray(o["out_binary_masks"][ids.index(1)]) > 0) if 1 in ids \
-            else (prev if prev is not None else np.zeros((h, w), bool))
+        return (np.asarray(o["out_binary_masks"][ids.index(1)]) > 0) if 1 in ids else None
+
+    qc_f = mdir / "qc.json"
+    qc = json.loads(qc_f.read_text()) if qc_f.exists() else {}
+    hist: list[np.ndarray] = []
+    iou_ok, area_lo, area_hi = (0.86, 0.85, 1.18) if stride == 1 else (0.78, 0.75, 1.3)
+    for i in range(n):
+        out_png = sub / f"{i:05d}.png"
+        if out_png.exists():
+            hist.append(cv2.imread(str(out_png), cv2.IMREAD_GRAYSCALE) > 127)
+            hist = hist[-4:]
+            continue
+        t0 = time.time()
+        prev = hist[-1] if hist else None
+        if prev is None or prev.sum() < 2000:
+            m = segment(i, SEED_POINTS)
+            rec = {"try": 1, "iou_prev": None}
+        else:
+            def score(c):
+                if c is None:
+                    return -1.0, 0.0
+                ar = c.sum() / max(prev.sum(), 1)
+                return _iou(c, prev), ar
+            cands = [("spine", segment(i, points_from_mask(prev)))]
+            sc = score(cands[0][1])
+            if not (sc[0] >= iou_ok and area_lo <= sc[1] <= area_hi):
+                # re-segment instead of trusting a drifting mask
+                cands.append(("dense+ring", segment(i, points_from_mask(prev, 12, True))))
+                if len(hist) >= 3:
+                    cands.append(("from_t-3", segment(i, points_from_mask(hist[-3], 10, True))))
+            best = max(cands, key=lambda c: score(c[1])[0])
+            m = best[1] if best[1] is not None else prev
+            sc = score(m)
+            rec = {"try": len(cands), "chosen": best[0], "iou_prev": round(sc[0], 4),
+                   "area_ratio": round(float(sc[1]), 4),
+                   "flag": not (sc[0] >= iou_ok and area_lo <= sc[1] <= area_hi)}
+        rec["area"] = int(m.sum())
+        qc[str(i)] = rec
         cv2.imwrite(str(out_png), m.astype(np.uint8) * 255)
-        prev = m
-        log(f"[sam] frame {i + 1}/{n}: area {int(m.sum())}, "
-            f"{len(pts)} pts, {time.time() - t0:.0f}s")
+        hist.append(m)
+        if len(hist) > 4:
+            hist.pop(0)
+        qc_f.write_text(json.dumps(qc))
+        log(f"[sam] frame {i + 1}/{n}: area {rec['area']}, iou {rec.get('iou_prev')}, "
+            f"tries {rec['try']}{' FLAG' if rec.get('flag') else ''}, {time.time() - t0:.0f}s")
+    flagged = [k for k, v in qc.items() if v.get("flag")]
     (mdir / "meta.json").write_text(json.dumps(
-        {"num_frames": n, "stride": stride, "model": "SAM 3.1 multiplex",
-         "prompt": "points (auto from previous mask)"}, indent=1))
-    log("[sam] done")
+        {"num_frames": n, "stride": stride, "model": "SAM 3.1 multiplex (local)",
+         "prompt": "points (auto from previous mask, QC re-segmentation)",
+         "flagged_frames": flagged}, indent=1))
+    log(f"[sam] done; flagged frames: {flagged}")
     return mdir
 
 
@@ -203,20 +259,59 @@ def divide_line(rock: np.ndarray) -> np.ndarray:
     return cx
 
 
-def zone_masks(rock_soft: np.ndarray, line: np.ndarray, feather_px: float):
+def guided_filter(I: np.ndarray, p: np.ndarray, r: int, eps: float) -> np.ndarray:
+    """He et al. guided filter (grey guide): edge-aware refinement of a soft
+    mask so its transition snaps to the real rock/water edge of this frame."""
+    k = (2 * r + 1, 2 * r + 1)
+    mI = cv2.boxFilter(I, -1, k)
+    mp = cv2.boxFilter(p, -1, k)
+    cov = cv2.boxFilter(I * p, -1, k) - mI * mp
+    var = cv2.boxFilter(I * I, -1, k) - mI * mI
+    a = cov / (var + eps)
+    b = mp - a * mI
+    return cv2.boxFilter(a, -1, k) * I + cv2.boxFilter(b, -1, k)
+
+
+def refine_rock(rock_soft: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """Sub-pixel, edge-aware rock alpha for this exact frame (no halo, no
+    spill): guided filter on the frame's luma, then a tiny anti-alias."""
+    I = _luma(x).astype(np.float32)
+    a = guided_filter(I, rock_soft.astype(np.float32), 6, 2e-3)
+    a = cv2.GaussianBlur(np.clip(a, 0, 1), (0, 0), 1.2)
+    return np.clip(a, 0, 1)
+
+
+def side_field(x: np.ndarray, line: np.ndarray, rock: np.ndarray, w_px: float) -> np.ndarray:
+    """0 = left sea, 1 = right sea. Not a straight cut: the split follows the
+    rock line but bends with the scene's own large-scale light — sunlit water
+    leans turquoise, naturally shadowed water leans navy — so the two seas
+    meet the way light falls off underwater."""
+    h, w = rock.shape
+    xs = np.arange(w, dtype=np.float32)[None, :]
+    geo = (xs - line[:, None]) / w_px
+    # large-scale illumination of the water only (rock excluded)
+    small = cv2.resize(_luma(x), (w // 8, h // 8), interpolation=cv2.INTER_AREA)
+    wt = cv2.resize(1 - rock, (w // 8, h // 8), interpolation=cv2.INTER_AREA) + 1e-3
+    lum = cv2.GaussianBlur(small * wt, (0, 0), 7) / cv2.GaussianBlur(wt, (0, 0), 7)
+    lum = cv2.resize(lum, (w, h), interpolation=cv2.INTER_CUBIC)
+    med = float(np.median(lum))
+    spread = float(np.percentile(lum, 90) - np.percentile(lum, 10)) + 1e-3
+    z = (med - lum) / spread          # >0 where the water is darker
+    t = geo + 1.1 * z
+    return (1.0 / (1.0 + np.exp(-t))).astype(np.float32)
+
+
+def zone_masks(rock_soft: np.ndarray, line: np.ndarray, feather_px: float, x=None):
     """Feathered (left, rock, right) weights that sum to 1."""
     h, w = rock_soft.shape
-    xs = np.arange(w, dtype=np.float32)[None, :]
-    # signed distance to the line -> soft side split
-    # the sea/sea split is wide and gentle (it crosses open sand below the
-    # rock); the rock edge itself stays tighter
-    side = 1.0 / (1.0 + np.exp(-(xs - line[:, None]) / (feather_px * 1.6)))
-    r = cv2.GaussianBlur(rock_soft, (0, 0), feather_px * 0.5)
+    r = refine_rock(rock_soft, x) if x is not None else np.clip(rock_soft, 0, 1)
+    side = side_field(x, line, r, 0.075 * w) if x is not None else \
+        1.0 / (1.0 + np.exp(-(np.arange(w)[None, :] - line[:, None]) / (feather_px * 1.6)))
     # atmospheric perspective: the far (upper) rock is seen through more
     # water, so it takes less of the warm grade and more of each sea's
     ys = np.linspace(0, 1, h, dtype=np.float32)[:, None]
     t = np.clip(ys / 0.55, 0, 1)
-    r = np.clip(r, 0, 1) * (0.35 + 0.65 * t * t * (3 - 2 * t))
+    r = r * (0.40 + 0.60 * t * t * (3 - 2 * t))
     left = (1 - r) * (1 - side)
     right = (1 - r) * side
     return left, r, right
@@ -251,50 +346,79 @@ def _split_tone(x, shadow_rgb, high_rgb, s_amt, h_amt):
     return x
 
 
-def _local_contrast(x, amount, sigma):
-    blur = cv2.GaussianBlur(x, (0, 0), sigma)
-    return x + (x - blur) * amount
+def _soft_knee(x, knee=0.78):
+    """Highlight roll-off: compresses values above the knee toward 1."""
+    over = np.maximum(x - knee, 0)
+    return np.where(x > knee, knee + (1 - knee) * (1 - np.exp(-over / (1 - knee) * 1.6)) / (1 - np.exp(-1.6)), x)
+
+
+def _hue_tame(x, center, width, target, shift, desat, v_lo, v_hi):
+    """Pull a hue band toward `target` and desaturate it, weighted by
+    brightness (used for yellow-green contamination in bright water and
+    yellow patches on the rock)."""
+    hsv = cv2.cvtColor(np.clip(x, 0, 1).astype(np.float32), cv2.COLOR_RGB2HSV)
+    H, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    d = (H - center + 180) % 360 - 180
+    band = np.exp(-0.5 * (d / width) ** 2)
+    vt = np.clip((V - v_lo) / max(v_hi - v_lo, 1e-3), 0, 1)
+    wgt = band * vt * vt * (3 - 2 * vt) * np.clip(S * 3, 0, 1)
+    dt = (target - H + 180) % 360 - 180
+    hsv[..., 0] = (H + np.clip(dt, -shift, shift) * wgt) % 360
+    hsv[..., 1] = S * (1 - desat * wgt)
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
 
 
 def grade_left(x):
-    # luminous turquoise glass
-    y = _lgg(x, lift=(0.0, 0.025, 0.03), gamma=(0.95, 1.06, 1.08),
-             gain=(0.86, 1.04, 1.08))
-    y = _split_tone(y, shadow_rgb=(0.05, 0.35, 0.36), high_rgb=(0.70, 1.0, 0.98),
-                    s_amt=0.35, h_amt=0.18)
-    return np.clip(_sat(y, 1.12), 0, 1)
+    # luminous turquoise / emerald glass
+    y = _lgg(x, lift=(0.0, 0.02, 0.025), gamma=(0.96, 1.05, 1.07),
+             gain=(0.88, 1.03, 1.07))
+    y = _split_tone(y, shadow_rgb=(0.05, 0.34, 0.33), high_rgb=(0.72, 1.0, 0.97),
+                    s_amt=0.30, h_amt=0.14)
+    # bright yellow-green contamination -> cleaner cyan, a little calmer
+    y = _hue_tame(y, center=75, width=28, target=165, shift=22, desat=0.22,
+                  v_lo=0.45, v_hi=0.9)
+    return np.clip(_sat(y, 1.08), 0, 1)
 
 
 def grade_rock(x):
-    # warm amber/copper concentrated in the highlights, umber shadows,
-    # crisp texture; dark/blue pixels (water seen through gaps) stay quieter
-    y = _lgg(x, lift=(0.008, 0.0, -0.006), gamma=(1.05, 1.0, 0.94),
-             gain=(1.10, 1.02, 0.88))
-    y = _split_tone(np.clip(y, 0, 1), shadow_rgb=(0.30, 0.20, 0.13),
-                    high_rgb=(1.0, 0.80, 0.52), s_amt=0.18, h_amt=0.20)
-    y = _local_contrast(y, 0.22, 6)
-    return np.clip(_sat(y, 1.04), 0, 1)
+    # natural bronze / earthy brown base, copper-gold only in the highlights;
+    # no sharpening — only a gentle large-radius tonal contrast
+    y = _lgg(x, lift=(0.006, 0.002, -0.002), gamma=(1.02, 1.0, 0.98),
+             gain=(1.05, 1.0, 0.93))
+    y = _split_tone(np.clip(y, 0, 1), shadow_rgb=(0.27, 0.22, 0.14),
+                    high_rgb=(1.0, 0.74, 0.48), s_amt=0.14, h_amt=0.17)
+    # yellow patches -> copper/bronze, and calmer
+    y = _hue_tame(y, center=55, width=14, target=36, shift=12, desat=0.16,
+                  v_lo=0.35, v_hi=0.85)
+    base = cv2.GaussianBlur(y, (0, 0), 28)
+    y = y + (y - base) * 0.10
+    y = _soft_knee(np.clip(y, 0, None), 0.74)
+    return np.clip(_sat(y, 1.05), 0, 1)
 
 
 def grade_right(x, haze):
-    # deep ink-navy, cooler, slightly desaturated, with depth haze
-    y = _lgg(x, lift=(-0.005, 0.005, 0.03), gamma=(0.90, 0.96, 1.06),
-             gain=(0.70, 0.86, 1.04))
-    y = _sat(y, 0.85)
-    y = _split_tone(y, shadow_rgb=(0.02, 0.06, 0.22), high_rgb=(0.55, 0.72, 0.95),
-                    s_amt=0.45, h_amt=0.15)
-    fog = np.asarray((0.06, 0.14, 0.26), np.float32)
+    # deep cobalt / navy, detailed shadows (no crush), light depth haze
+    y = _lgg(x, lift=(0.0, 0.012, 0.035), gamma=(0.95, 0.99, 1.06),
+             gain=(0.78, 0.90, 1.04))
+    y = _sat(y, 0.88)
+    y = _split_tone(y, shadow_rgb=(0.03, 0.08, 0.24), high_rgb=(0.58, 0.74, 0.95),
+                    s_amt=0.30, h_amt=0.12)
+    y = _hue_tame(y, center=75, width=28, target=200, shift=22, desat=0.25,
+                  v_lo=0.40, v_hi=0.85)
+    fog = np.asarray((0.08, 0.17, 0.30), np.float32)
     y = np.clip(y, 0, 1)
     return y * (1 - haze[..., None]) + fog * haze[..., None]
 
 
 def global_finish(x):
-    # gentle S-curve around mid grey + soft highlight roll-off
+    # gentle S-curve around mid grey, a soft toe (no crushed blacks) and a
+    # natural highlight roll-off
     x = np.clip(x, 0, 1)
     p = 0.42
-    c = 1.10
+    c = 1.06
     y = np.where(x < p, p * (x / p) ** c, 1 - (1 - p) * ((1 - x) / (1 - p)) ** c)
-    y = np.where(y > 0.85, 0.85 + (1 - np.exp(-(y - 0.85) * 4)) * 0.15 / (1 - np.exp(-0.6)), y)
+    y = 0.012 + (1 - 0.012) * y
+    y = _soft_knee(y, 0.86)
     return np.clip(y, 0, 1)
 
 
@@ -305,17 +429,22 @@ def haze_map(h, w, line):
     span = np.maximum(w - line[:, None], 1)
     t = np.clip((xs - line[:, None]) / span, 0, 1)
     depth = 1 - ys / h
-    return np.clip(0.10 + 0.22 * t ** 1.3 + 0.14 * depth, 0, 0.42).astype(np.float32)
+    return np.clip(0.06 + 0.16 * t ** 1.3 + 0.10 * depth, 0, 0.30).astype(np.float32)
 
 
 def grade_frame(rgb8: np.ndarray, rock_soft: np.ndarray, line: np.ndarray,
-                feather_px: float):
+                feather_px: float, bits: int = 8):
     x = rgb8.astype(np.float32) / 255.0
     h, w = rock_soft.shape
-    L, R, Rt = zone_masks(rock_soft, line, feather_px)
+    L, R, Rt = zone_masks(rock_soft, line, feather_px, x)
     out = (grade_left(x) * L[..., None] + grade_rock(x) * R[..., None]
            + grade_right(x, haze_map(h, w, line)) * Rt[..., None])
-    return (global_finish(out) * 255 + np.random.uniform(-0.5, 0.5, out.shape)).clip(0, 255).astype(np.uint8), (L, R, Rt)
+    out = global_finish(out)
+    if bits == 16:
+        q = (out * 65535 + np.random.uniform(-0.5, 0.5, out.shape)).clip(0, 65535).astype(np.uint16)
+    else:
+        q = (out * 255 + np.random.uniform(-0.5, 0.5, out.shape)).clip(0, 255).astype(np.uint8)
+    return q, (L, R, Rt)
 
 
 # ------------------------------------------------------------------ video --
@@ -335,16 +464,14 @@ def read_all_frames(src: Path, w: int, h: int):
 
 def prepare_masks(rock_raw: np.ndarray, feather_px: float):
     rock = np.stack([clean_rock(m) for m in rock_raw])
-    # temporal smoothing (centred moving average, 5 frames)
-    k = 5
-    pad = np.concatenate([rock[:1].repeat(k // 2, 0), rock, rock[-1:].repeat(k // 2, 0)])
-    cs = np.cumsum(pad, 0, dtype=np.float32)
-    cs = np.concatenate([np.zeros_like(cs[:1]), cs])
-    rock = (cs[k:] - cs[:-k]) / k
+    # light temporal smoothing (weights 1-2-1) against edge flicker; kept
+    # short so the mask never lags behind the camera move (no ghost edges)
+    pad = np.concatenate([rock[:1], rock, rock[-1:]])
+    rock = 0.25 * pad[:-2] + 0.5 * pad[1:-1] + 0.25 * pad[2:]
     lines = np.stack([divide_line((m > 0.5).astype(np.float32)) for m in rock])
-    # temporal smoothing of the line
-    lines = cv2.GaussianBlur(lines, (1, 0), sigmaX=0, sigmaY=2.0)
-    return rock, lines
+    # temporal smoothing of the split line
+    lines = cv2.GaussianBlur(lines, (1, 0), sigmaX=0, sigmaY=2.5)
+    return rock.astype(np.float32), lines
 
 
 def main() -> int:
@@ -359,6 +486,8 @@ def main() -> int:
     ap.add_argument("--feather", type=float, default=0.018,
                     help="feather as a fraction of frame width")
     ap.add_argument("--masks-only", action="store_true")
+    ap.add_argument("--codec", choices=["prores", "h264"], default="prores",
+                    help="prores = ProRes 422 HQ 10-bit (default), h264 = preview")
     ap.add_argument("--stills", type=Path, default=None,
                     help="write QC stills (overlay + graded) to this folder and exit")
     a = ap.parse_args()
@@ -394,17 +523,24 @@ def main() -> int:
 
     out = a.output or REPO / "output" / f"{a.input.stem}_split-sea_grade.mov"
     out.parent.mkdir(parents=True, exist_ok=True)
+    rate = f"{info.fps.numerator}/{info.fps.denominator}"
+    tags = ["-colorspace", "bt709", "-color_primaries", "bt709",
+            "-color_trc", "bt709", "-color_range", "tv"]
+    if a.codec == "prores":
+        venc = ["-c:v", "prores_ks", "-profile:v", "3", "-vendor", "apl0",
+                "-pix_fmt", "yuv422p10le", "-bits_per_mb", "8000"]
+        bits, pix = 16, "rgb48le"
+    else:
+        venc = ["-c:v", "libx264", "-crf", "15", "-preset", "slow", "-pix_fmt", "yuv420p"]
+        bits, pix = 8, "rgb24"
     enc = subprocess.Popen(
         ["ffmpeg", "-v", "error", "-y",
-         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
-         "-r", f"{info.fps.numerator}/{info.fps.denominator}" if hasattr(info.fps, "numerator") else str(info.fps),
+         "-f", "rawvideo", "-pix_fmt", pix, "-s", f"{w}x{h}", "-r", rate,
          "-i", "-", "-i", str(a.input),
-         "-map", "0:v", "-map", "1:a?", "-c:a", "copy",
-         "-c:v", "libx264", "-crf", "15", "-preset", "slow", "-pix_fmt", "yuv420p",
-         "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-         "-color_range", "tv", str(out)], stdin=subprocess.PIPE)
+         "-map", "0:v", "-map", "1:a?", "-c:a", "copy", *venc, *tags, str(out)],
+        stdin=subprocess.PIPE)
     for i, f in enumerate(read_all_frames(a.input, w, h)):
-        g, _ = grade_frame(f, rock[min(i, n - 1)], lines[min(i, n - 1)], feather_px)
+        g, _ = grade_frame(f, rock[min(i, n - 1)], lines[min(i, n - 1)], feather_px, bits)
         enc.stdin.write(g.tobytes())
         if i % 50 == 0:
             log(f"[render] frame {i}/{n}")
