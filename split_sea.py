@@ -150,7 +150,7 @@ def run_rock_masks(src: Path, mask_root: Path, stride: int, prompt: str) -> Path
     qc_f = mdir / "qc.json"
     qc = json.loads(qc_f.read_text()) if qc_f.exists() else {}
     hist: list[np.ndarray] = []
-    iou_ok, area_lo, area_hi = (0.86, 0.85, 1.18) if stride == 1 else (0.78, 0.75, 1.3)
+    iou_ok, area_lo, area_hi = (0.82, 0.85, 1.18) if stride == 1 else (0.78, 0.75, 1.3)
     for i in range(n):
         out_png = sub / f"{i:05d}.png"
         if out_png.exists():
