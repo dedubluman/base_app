@@ -122,9 +122,9 @@ def refine(alpha_u8: np.ndarray, y: np.ndarray, feather: float) -> np.ndarray:
     p = alpha_u8.astype(np.float32) / 255.0
     if p.max() == 0:
         return p
-    # pull the edge ~2 px inward so the feather sits on the body, not on the
-    # bright water around it (otherwise the skin grade paints a light rim)
-    p = cv2.erode(p, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    # pull the edge ~1 px inward; the transition band itself is colour-
+    # decontaminated in decontaminate() so it shows neither a light nor a dark rim
+    p = cv2.erode(p, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
     a = guided_filter(y, p, 5, 1e-3)
     a = cv2.GaussianBlur(np.clip(a, 0, 1), (0, 0), feather)
     return np.clip(a, 0, 1)
@@ -210,34 +210,98 @@ def skin_gains(stats_lin: np.ndarray, target_lin: np.ndarray, max_gain: float, s
     return g.astype(np.float32)
 
 
-def grade_diver(x, gain, vig, cfg):
+def skin_ramp(y, cfg):
+    """Three-point skin colour from luma: red-leaning warm undertone in the
+    shadows, natural skin in the mids, lighter warm skin in the highlights.
+    All three sit on the vectorscope skin-tone line (~123 deg)."""
+    sh, md, hi = (np.array(cfg[k], np.float32) for k in ("skin_shadow", "skin_target", "skin_high"))
+    sh, md, hi = sh / (sh @ LUMA), md / (md @ LUMA), hi / (hi @ LUMA)
+    t = y[..., None]
+    w_sh = np.clip(1 - t / 0.35, 0, 1)
+    w_hi = np.clip((t - 0.45) / 0.45, 0, 1)
+    w_md = 1 - w_sh - w_hi
+    tone = w_sh * sh + w_md * md + w_hi * hi
+    return t * (1 + cfg["fg_sat"] * (tone - 1))
+
+
+def skin_hue(rgb: np.ndarray) -> float:
+    """Mean vectorscope hue angle (deg, BT.709 Cb/Cr, 0 = +Cb axis, CCW);
+    the skin-tone line sits at ~123 deg."""
+    y = rgb @ LUMA
+    cb = (rgb[:, 2] - y) / 1.8556
+    cr = (rgb[:, 0] - y) / 1.5748
+    return float(np.degrees(np.arctan2(cr.mean(), cb.mean())) % 360)
+
+
+def temporal_luma(ymean, sigma, clip):
+    """Skin luma per frame -> Gaussian-smoothed over time; the per-frame
+    gain pulls each frame onto the smooth curve (no pumping / caustic
+    flicker), while slow real changes in light are kept."""
+    valid = ymean > 0
+    sm = ymean.copy()
+    if valid.sum() > 1:
+        idx = np.arange(len(ymean))
+        filled = np.interp(idx, idx[valid], ymean[valid])
+        k = int(3 * sigma)
+        ker = np.exp(-0.5 * (np.arange(-k, k + 1) / sigma) ** 2)
+        ker /= ker.sum()
+        sm = np.convolve(np.pad(filled, k, mode="edge"), ker, "valid")
+    g = np.where(valid, sm / np.maximum(ymean, 1e-4), 1.0)
+    return sm.astype(np.float32), np.clip(g, *clip).astype(np.float32)
+
+
+def grade_diver(x, gain, vig, cfg, alpha=None, frame_mean=None, lum_gain=1.0):
     """Natural, land-like skin. Backlit underwater skin has almost no red
     left (red ~1/10 of green in linear light), so channel gains alone only
-    amplify noise. Keep the diver's own light and shadow (luma), lift it, and
-    rebuild the colour from a skin ramp: warm brown in the shadows, skin tone
-    in the mids, lighter and less saturated toward the highlights. A little
-    of the white-balanced original chroma is kept for local variation."""
-    y = x @ LUMA
+    amplify noise. Keep the diver's own light and shadow (luma), even out the
+    large-scale patchiness from water depth and caustics, gently lift the
+    mids, then rebuild the colour from a three-point skin ramp. A little of
+    the white-balanced original chroma is kept for local variation."""
+    y = (x @ LUMA) * lum_gain                      # temporal luminance match
+    if alpha is not None and alpha.max() > 0:
+        # large-scale luma inside the body only (normalised masked blur),
+        # compressed toward the frame's skin mean: smooths patchy torso /
+        # shoulder / face shading, keeps fine detail and edges
+        a = alpha.astype(np.float32)
+        r = cfg["patch_sigma"]
+        low = cv2.GaussianBlur(y * a, (0, 0), r) / np.maximum(cv2.GaussianBlur(a, (0, 0), r), 1e-3)
+        low = guided_filter(y, low.astype(np.float32), 8, 4e-3)
+        m = frame_mean if frame_mean is not None else float((y * a).sum() / max(a.sum(), 1))
+        detail = y - low
+        y = m + (low - m) * cfg["patch_keep"] + detail
+    y = np.clip(y, 0, None)
     y = to_disp(to_lin(y) * 2.0 ** cfg["fg_stops"])
-    # open the shadows so the body has form, not a flat silhouette
-    y = y + cfg["fg_lift"] * (1 - y) ** 3 * y
+    y = y ** cfg["mid_gamma"]                      # gentle midtone lift
+    y = y + cfg["fg_lift"] * (1 - y) ** 3 * y      # open deep shadows
     y = soft_knee(y, cfg["fg_knee"], cfg["fg_ceil"])
-    t = np.array(cfg["skin_target"], np.float32)
-    tone = t / (t @ LUMA)
-    s = np.clip(cfg["fg_sat"] * (1 - 0.4 * y), 0, 1)[..., None]
-    d = y[..., None] * (1 + s * (tone - 1))
+    d = skin_ramp(y, cfg)
     wb = to_disp(to_lin(x) * gain)
     c = wb - (wb @ LUMA)[..., None]
     c = cv2.GaussianBlur(c, (0, 0), 2.0)
     d = np.clip(d + cfg["fg_resid"] * c, 0, 1)
-    # bring back some of the water's coolness so the skin sits in the scene
-    # instead of looking composited from a dry shoot
+    # a touch of the water's coolness so the skin sits in the scene
     cool = np.array(cfg["cool_tone"], np.float32)
     cool = cool / (cool @ LUMA)
     d = (1 - cfg["fg_cool"]) * d + cfg["fg_cool"] * (d @ LUMA)[..., None] * cool
     # part of the vignette so the diver sits in the same space
     v = 1 - cfg["fg_vig"] * (1 - vig)
     return to_disp(to_lin(d) * v[..., None])
+
+
+def decontaminate(fg, alpha, sigma=3.0, solid=0.9):
+    """Edge colour decontamination: inside the matte's transition band, take
+    the foreground colour from the solid body just inside it (normalised
+    masked blur) instead of from the band pixel itself, which is half water.
+    Prevents both the light rim (bright water recoloured as skin) and the dark
+    rim (body edge left in the water grade)."""
+    core = (alpha >= solid).astype(np.float32)
+    if core.sum() < 50:
+        return fg
+    num = cv2.GaussianBlur(fg * core[..., None], (0, 0), sigma)
+    den = cv2.GaussianBlur(core, (0, 0), sigma)[..., None]
+    inner = num / np.maximum(den, 1e-4)
+    w = np.clip((solid - alpha) / solid, 0, 1)[..., None] * (den > 0.02)
+    return fg * (1 - w) + inner * w
 
 
 def grade_stick(x, cfg):
@@ -248,11 +312,13 @@ def grade_stick(x, cfg):
 
 CFG = dict(bg_stops=1.3, tint=0.62, chroma_keep=0.55, hl_knee=0.45, hl_ceil=0.74,
            black=0.025, toe=1.35, vig_strength=0.78, vig_inner=0.30, vig_outer=1.30,
-           fg_stops=0.8, fg_lift=0.9, fg_sat=0.72, fg_resid=0.15,
-           fg_cool=0.15, cool_tone=[0.62, 1.0, 1.06], fg_knee=0.58, fg_ceil=0.80,
+           fg_stops=0.75, fg_lift=0.45, mid_gamma=0.88, fg_sat=0.88, fg_resid=0.10,
+           fg_cool=0.05, cool_tone=[0.62, 1.0, 1.06], fg_knee=0.60, fg_ceil=0.84,
+           skin_shadow=[0.70, 0.44, 0.36], skin_high=[0.90, 0.76, 0.66],
+           patch_sigma=18.0, patch_keep=0.65, lum_sigma=6.0, lum_clip=[0.85, 1.18],
            sun_tint=0.88, sun_vig_spare=0.8, fg_vig=0.45, stick_gain=0.85,
            skin_target=[0.80, 0.62, 0.52], max_gain=6.0, wb_sigma=10.0,
-           feather=1.3, min_blob=1500, hole=6000)
+           feather=1.6, min_blob=1500, hole=6000)
 
 
 # -------------------------------------------------------------------- main --
@@ -305,6 +371,7 @@ def main():
     # pass 2: diver colour stats (linear mean inside the eroded body core)
     target = to_lin(np.array(CFG["skin_target"], np.float32))
     stats = np.zeros((info.n_frames, 3), np.float32)
+    ymean = np.zeros(info.n_frames, np.float32)
     ker = np.ones((9, 9), np.uint8)
     for i, f in enumerate(iter_frames(a.input, info)):
         if i >= end:
@@ -316,7 +383,9 @@ def main():
             y = lin @ LUMA
             sel = y > np.percentile(y, 35)
             stats[i] = lin[sel].mean(0)
+            ymean[i] = float((f[core > 0] @ LUMA).mean())
     gains = skin_gains(stats, target, CFG["max_gain"], CFG["wb_sigma"])
+    ysm, lum_gain = temporal_luma(ymean, CFG["lum_sigma"], CFG["lum_clip"])
 
     vig = vignette(h, w, CFG["vig_strength"], CFG["vig_inner"], CFG["vig_outer"])
     a.output.parent.mkdir(parents=True, exist_ok=True)
@@ -339,7 +408,10 @@ def main():
             ap_ = as_ = np.zeros((h, w), np.float32)
         out = bg
         if ap_.max() > 0 or as_.max() > 0:
-            dv = grade_diver(x, gains[i], vig, CFG)
+            dv = grade_diver(x, gains[i], vig, CFG, alpha=ap_,
+                             frame_mean=float(ysm[i]) if ymean[i] > 0 else None,
+                             lum_gain=float(lum_gain[i]))
+            dv = decontaminate(dv, ap_)
             st = grade_stick(x, CFG) * (vig[..., None] * 0.5 + 0.5)
             out = bg * (1 - ap_ - as_)[..., None] + dv * ap_[..., None] + st * as_[..., None]
         enc.write(out)
@@ -352,9 +424,16 @@ def main():
                         [cv2.IMWRITE_JPEG_QUALITY, 92])
             cv2.imwrite(str(a.checks / f"f{i:04d}_matte.png"), (matte * 255).astype(np.uint8))
         if i < end:
-            report["frames"][i] = {"person_area": int((ap_ > 0.5).sum()),
-                                   "stick_area": int((as_ > 0.5).sum()),
-                                   "gain": [round(float(v), 3) for v in gains[i]]}
+            rec = {"person_area": int((ap_ > 0.5).sum()),
+                   "stick_area": int((as_ > 0.5).sum()),
+                   "gain": [round(float(v), 3) for v in gains[i]],
+                   "lum_gain": round(float(lum_gain[i]), 4)}
+            core = (ap_ > 0.97) & (as_ < 0.03)
+            if core.sum() > 3000:
+                rec["skin_in_y"] = round(float((x[core] @ LUMA).mean()), 4)
+                rec["skin_out_y"] = round(float((out[core] @ LUMA).mean()), 4)
+                rec["skin_out_hue"] = round(skin_hue(out[core]), 1)
+            report["frames"][i] = rec
         if i % 60 == 0:
             log(f"[render] {i}/{info.n_frames}")
         if a.limit and i + 1 >= a.limit:
