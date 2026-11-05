@@ -46,6 +46,10 @@ def main() -> int:
                          "'person' mask leaves them out); kept if near the diver")
     ap.add_argument("--start", type=int, default=0, help="first frame (re-run a gap)")
     ap.add_argument("--end", type=int, default=None, help="last frame + 1")
+    ap.add_argument("--seed-prev", action="store_true",
+                    help="if a class's text prompt finds nothing in a chunk, seed the "
+                         "tracker from that class's existing mask on the chunk's first "
+                         "frame (written by the previous chunk / the full run)")
     a = ap.parse_args()
     parts = dict(p.split("=", 1) for p in a.parts)
     ids = {name: k + 1 for k, name in enumerate(parts)}
@@ -120,6 +124,14 @@ def main() -> int:
                 if best is not None:
                     seeds[name] = (f, best)
                     break
+        if a.seed_prev:
+            for name in parts:
+                if name in seeds:
+                    continue
+                pm = cv2.imread(str(outs[name] / f"{cs:05d}.png"), 0)
+                if pm is not None and (pm > 127).sum() >= 60:
+                    seeds[name] = (cs, pm > 127)
+                    print(f"[parts] {name}: seeded from existing mask on frame {cs}", flush=True)
         # 2) the detected masks become tracker objects; propagate all together
         for name, (f, m) in seeds.items():
             pts, lab = prompts_from_mask(m, n_pos=4, n_neg=4)
