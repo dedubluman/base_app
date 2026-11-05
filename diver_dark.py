@@ -221,15 +221,20 @@ def grade_diver(x, gain, vig, cfg):
     y = to_disp(to_lin(y) * 2.0 ** cfg["fg_stops"])
     # open the shadows so the body has form, not a flat silhouette
     y = y + cfg["fg_lift"] * (1 - y) ** 3 * y
-    y = soft_knee(y, 0.80, 0.95)
+    y = soft_knee(y, cfg["fg_knee"], cfg["fg_ceil"])
     t = np.array(cfg["skin_target"], np.float32)
     tone = t / (t @ LUMA)
-    s = np.clip(cfg["fg_sat"] * (1 - 0.6 * y), 0, 1)[..., None]
+    s = np.clip(cfg["fg_sat"] * (1 - 0.4 * y), 0, 1)[..., None]
     d = y[..., None] * (1 + s * (tone - 1))
     wb = to_disp(to_lin(x) * gain)
     c = wb - (wb @ LUMA)[..., None]
     c = cv2.GaussianBlur(c, (0, 0), 2.0)
     d = np.clip(d + cfg["fg_resid"] * c, 0, 1)
+    # bring back some of the water's coolness so the skin sits in the scene
+    # instead of looking composited from a dry shoot
+    cool = np.array(cfg["cool_tone"], np.float32)
+    cool = cool / (cool @ LUMA)
+    d = (1 - cfg["fg_cool"]) * d + cfg["fg_cool"] * (d @ LUMA)[..., None] * cool
     # part of the vignette so the diver sits in the same space
     v = 1 - cfg["fg_vig"] * (1 - vig)
     return to_disp(to_lin(d) * v[..., None])
@@ -243,7 +248,8 @@ def grade_stick(x, cfg):
 
 CFG = dict(bg_stops=1.3, tint=0.62, chroma_keep=0.55, hl_knee=0.45, hl_ceil=0.74,
            black=0.025, toe=1.35, vig_strength=0.78, vig_inner=0.30, vig_outer=1.30,
-           fg_stops=0.8, fg_lift=0.9, fg_sat=0.80, fg_resid=0.15,
+           fg_stops=0.8, fg_lift=0.9, fg_sat=0.72, fg_resid=0.15,
+           fg_cool=0.15, cool_tone=[0.62, 1.0, 1.06], fg_knee=0.58, fg_ceil=0.80,
            sun_tint=0.88, sun_vig_spare=0.8, fg_vig=0.45, stick_gain=0.85,
            skin_target=[0.80, 0.62, 0.52], max_gain=6.0, wb_sigma=10.0,
            feather=1.3, min_blob=1500, hole=6000)
