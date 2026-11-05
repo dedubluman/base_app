@@ -402,16 +402,21 @@ def _split_tone(x, shadow_rgb, high_rgb, s_amt, h_amt):
 
 
 def _soft_knee(x, knee=0.78):
-    """Highlight roll-off: compresses values above the knee toward 1."""
-    over = np.maximum(x - knee, 0)
-    return np.where(x > knee, knee + (1 - knee) * (1 - np.exp(-over / (1 - knee) * 1.6)) / (1 - np.exp(-1.6)), x)
+    """Hue-preserving highlight roll-off: the max channel is compressed
+    above the knee along an asymptote that never reaches 1, and all three
+    channels are scaled by the same ratio (no clipping, no hue shift)."""
+    x = np.clip(x, 0, None)
+    m = x.max(-1, keepdims=True)
+    over = np.maximum(m - knee, 0)
+    m2 = np.where(m > knee, knee + (1 - knee) * (1 - np.exp(-over / (1 - knee))), m)
+    return x * (m2 / np.maximum(m, 1e-6))
 
 
 def _hue_tame(x, center, width, target, shift, desat, v_lo, v_hi):
     """Pull a hue band toward `target` and desaturate it, weighted by
     brightness (used for yellow-green contamination in bright water and
     yellow patches on the rock)."""
-    hsv = cv2.cvtColor(np.clip(x, 0, 1).astype(np.float32), cv2.COLOR_RGB2HSV)
+    hsv = cv2.cvtColor(np.clip(x, 0, None).astype(np.float32), cv2.COLOR_RGB2HSV)
     H, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
     d = (H - center + 180) % 360 - 180
     band = np.exp(-0.5 * (d / width) ** 2)
@@ -432,7 +437,7 @@ def grade_left(x):
     # bright yellow-green contamination -> cleaner cyan, a little calmer
     y = _hue_tame(y, center=75, width=28, target=165, shift=22, desat=0.22,
                   v_lo=0.45, v_hi=0.9)
-    return np.clip(_sat(y, 1.08), 0, 1)
+    return np.clip(_sat(y, 1.08), 0, None)
 
 
 def grade_rock(x):
@@ -441,14 +446,15 @@ def grade_rock(x):
     y = _lgg(x, lift=(0.006, 0.002, -0.002), gamma=(1.02, 1.0, 0.98),
              gain=(1.05, 1.0, 0.93))
     y = _split_tone(np.clip(y, 0, 1), shadow_rgb=(0.27, 0.22, 0.14),
-                    high_rgb=(1.0, 0.74, 0.48), s_amt=0.14, h_amt=0.17)
+                    high_rgb=(1.0, 0.80, 0.56), s_amt=0.14, h_amt=0.12)
+    y = _soft_knee(y, 0.72)
     # yellow patches -> copper/bronze, and calmer
-    y = _hue_tame(y, center=55, width=14, target=36, shift=12, desat=0.16,
+    y = _hue_tame(y, center=55, width=14, target=43, shift=8, desat=0.14,
                   v_lo=0.35, v_hi=0.85)
     base = cv2.GaussianBlur(y, (0, 0), 28)
     y = y + (y - base) * 0.10
-    y = _soft_knee(np.clip(y, 0, None), 0.74)
-    return np.clip(_sat(y, 1.05), 0, 1)
+    y = _soft_knee(_sat(y, 1.0), 0.74)
+    return np.clip(y, 0, 1)
 
 
 def grade_right(x, haze):
@@ -461,19 +467,18 @@ def grade_right(x, haze):
     y = _hue_tame(y, center=75, width=28, target=200, shift=22, desat=0.25,
                   v_lo=0.40, v_hi=0.85)
     fog = np.asarray((0.08, 0.17, 0.30), np.float32)
-    y = np.clip(y, 0, 1)
+    y = np.clip(y, 0, None)
     return y * (1 - haze[..., None]) + fog * haze[..., None]
 
 
 def global_finish(x):
     # gentle S-curve around mid grey, a soft toe (no crushed blacks) and a
     # natural highlight roll-off
-    x = np.clip(x, 0, 1)
+    x = _soft_knee(x, 0.84)
     p = 0.42
     c = 1.06
     y = np.where(x < p, p * (x / p) ** c, 1 - (1 - p) * ((1 - x) / (1 - p)) ** c)
     y = 0.012 + (1 - 0.012) * y
-    y = _soft_knee(y, 0.86)
     return np.clip(y, 0, 1)
 
 
