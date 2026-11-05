@@ -36,10 +36,10 @@ REPO = Path(__file__).resolve().parent
 LUMA = np.array([0.2126, 0.7152, 0.0722], np.float32)
 
 SKIN_HEX = "#C68B59"          # Mediterranean tan
-LIFT_TARGET = 0.30            # "balanced": median diver luma after the lift
+LIFT_TARGET = 0.27            # "balanced": median diver luma after the lift
 LIFT_MAX = 2.6
-SKIN_CHROMA = 0.85            # how far skin a*/b* move to the target
-SKIN_L_NUDGE = 0.35           # how far the skin's mean L moves to the target
+SKIN_CHROMA = 0.55            # share of the (target - frame median) a*/b* shift
+SKIN_L_NUDGE = 0.20           # how far the skin's mean L moves to the target
 
 # a. curves (same points as the approved ffmpeg preview)
 _MASTER = PchipInterpolator([0, .06, .30, .70, 1], [0, .02, .30, .76, 1])
@@ -64,6 +64,10 @@ def global_grade(x):
     y[..., 2] = _BLUE(y[..., 2])                         # a. curves: blue, then master
     y = _MASTER(y).astype(np.float32)
     y = np.clip(sat(y, 1.08), 0, 1) ** (1 / 1.12)        # light saturation + gamma
+    # sun core: fade the channel mix back to neutral so it stays white, not pink
+    yl = luma(y)[..., None]
+    w = np.clip((yl - 0.82) / 0.15, 0, 1)
+    y = y * (1 - w) + yl * w
     return y.astype(np.float32)
 
 
@@ -98,16 +102,15 @@ def gsmooth(v, sigma):
     return np.convolve(np.pad(v, r, mode="edge"), k / k.sum(), "valid").astype(np.float32)
 
 
-def grade(x, a_div, a_skin, g, l_off):
+def grade(x, a_div, a_skin, g, l_off, ab_off=(0.0, 0.0)):
     y = global_grade(x)
     d = a_div[..., None]
     yl = lift(y, g)                                       # c. lift inside the diver
     lab = to_lab(yl)
     s = a_skin[..., None]
     hi = np.clip((lab[..., :1] - 80) / 15, 0, 1)          # keep speculars
-    k = SKIN_CHROMA * (1 - hi)
     lab_s = lab.copy()
-    lab_s[..., 1:] = lab[..., 1:] + (TARGET[1:] - lab[..., 1:]) * k   # d. skin chroma
+    lab_s[..., 1:] = lab[..., 1:] + np.asarray(ab_off, np.float32) * (1 - hi)   # d. skin chroma shift
     lab_s[..., :1] = lab[..., :1] + l_off * (1 - hi)                   #    L nudge
     ys = to_rgb(lab_s)
     yd = ys * s + yl * (1 - s)
@@ -141,6 +144,7 @@ def main() -> int:
     # pass 1: per-frame lift gain and skin L offset, smoothed over time
     gains = np.full(n, np.nan, np.float32)
     loffs = np.full(n, np.nan, np.float32)
+    aoffs = np.full((n, 2), np.nan, np.float32)
     for i, x in enumerate(iter_frames(a.input, info)):
         core = al[i] > 200
         if core.sum() < 500:
@@ -152,11 +156,13 @@ def main() -> int:
         gains[i] = g
         sk = skin_alpha(i)[::2, ::2] > 0.8
         if sk.sum() > 200:
-            L = to_lab(lift(y, g))[..., 0][sk]
-            loffs[i] = SKIN_L_NUDGE * (TARGET[0] - float(np.median(L)))
+            lab = to_lab(lift(y, g))[sk]
+            loffs[i] = SKIN_L_NUDGE * (TARGET[0] - float(np.median(lab[:, 0])))
+            aoffs[i] = SKIN_CHROMA * (TARGET[1:] - np.median(lab[:, 1:], 0))
     gains, loffs = gsmooth(gains, 8.0), gsmooth(loffs, 8.0)
+    aoffs = np.stack([gsmooth(aoffs[:, c], 8.0) for c in range(2)], 1)
     print(f"[lift] gain {gains.min():.2f}-{gains.max():.2f}; skin L offset "
-          f"{loffs.min():.1f}-{loffs.max():.1f}; target Lab {np.round(TARGET, 1).tolist()}", flush=True)
+          f"{loffs.min():.1f}-{loffs.max():.1f}; a*b* offset {np.round(aoffs.mean(0), 1).tolist()}; target Lab {np.round(TARGET, 1).tolist()}", flush=True)
 
     a.output.parent.mkdir(parents=True, exist_ok=True)
     enc = Encoder(a.input, a.output, info, Encode(crf=16, preset="slow", profile="high", dither=True))
@@ -164,7 +170,7 @@ def main() -> int:
     skin_means, tiles = [], []
     for i, x in enumerate(iter_frames(a.input, info)):
         s = skin_alpha(i)
-        y = grade(x, al[i].astype(np.float32) / 255, s, float(gains[i]), float(loffs[i]))
+        y = grade(x, al[i].astype(np.float32) / 255, s, float(gains[i]), float(loffs[i]), aoffs[i])
         enc.write(y)
         m = s > 0.8
         if m.sum() > 200:
