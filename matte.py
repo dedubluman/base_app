@@ -154,13 +154,19 @@ def refine_parts(x: np.ndarray, diver: np.ndarray, parts: dict) -> tuple[dict, d
         ll_own = _loglik(f, own)
         ll_other = np.max(np.stack([_loglik(f, md) for md in rivals.values()]), 0)
         keep = np.zeros_like(m)
-        keep[idx] = ll_own >= ll_other - 1.0      # ties stay with the part
-        if name in ("hair", "fins") and "bubbles" in rivals:
-            names = list(rivals)
-            win = np.argmax(np.stack([_loglik(f, rivals[k]) for k in names]), 0)
+        if name in ("hair", "fins"):
+            # hair/fins only give up bubbles (graded neutral); never pixels
+            # to the skin (lighter hair strands would turn into skin spots)
+            if "bubbles" not in rivals:
+                out[name], removed[name] = m, 0.0
+                continue
+            ll_bub = _loglik(f, rivals["bubbles"])
+            keep[idx] = ~(ll_bub > ll_own + 1.0)
             bub = np.zeros_like(m)
-            bub[idx] = (~keep[idx]) & (win == names.index("bubbles"))
+            bub[idx] = ~keep[idx]
             bubbles |= bub
+        else:
+            keep[idx] = ll_own >= ll_other - 1.0      # ties stay with the part
         keep = cv2.morphologyEx(keep.astype(np.uint8), cv2.MORPH_OPEN, _ellipse(1))
         # keep only the pieces that hold the part's confident core, then
         # close small holes inside the original SAM 3.1 mask
@@ -168,8 +174,9 @@ def refine_parts(x: np.ndarray, diver: np.ndarray, parts: dict) -> tuple[dict, d
         good = np.unique(lab_cc[core & (lab_cc > 0)])
         keep = np.isin(lab_cc, good[good > 0])
         keep = (cv2.morphologyEx(keep.astype(np.uint8), cv2.MORPH_CLOSE, _ellipse(2)) > 0) & m
-        keep = _fill_holes(keep) & m   # fabric folds/highlights stay fabric
+        keep = _fill_holes(keep) & m   # fabric folds, hair highlights stay put
         out[name] = keep
+        bubbles &= ~keep
         removed[name] = round(1.0 - keep.sum() / max(1, area), 3)
     bubbles = cv2.morphologyEx(bubbles.astype(np.uint8), cv2.MORPH_OPEN, np.ones((2, 2), np.uint8)) > 0
     if bubbles.any():

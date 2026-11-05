@@ -115,8 +115,11 @@ DV = dict(
     # ... and relative to this frame's skin luminance (black fins look grey
     # in the water, so an absolute threshold lets them into the skin key)
     dark_rel=(0.50, 0.68),
-    # hair: natural dark brown (R:G:B), how far it is pulled there
-    hair_rgb=np.array([1.0, 0.86, 0.76], np.float32), hair_pull=0.7,
+    # hair: dark brown (R:G:B), how far it is pulled there, and how much
+    # darker than its own luminance (underwater it reads as light as the
+    # skin otherwise)
+    hair_rgb=np.array([1.0, 0.80, 0.66], np.float32), hair_pull=0.85,
+    hair_luma=0.55,
     hi_lo=0.84, hi_hi=0.97,        # specular highlights stay neutral
     # fallback shorts key when there is no shorts mask (luminance)
     shorts_lo=0.56, shorts_hi=0.80,
@@ -235,9 +238,11 @@ def grade_diver(x, grad, gains=None, depth=0.0, parts=None, skin_luma=None):
     xs = x + (skin - x) * p["skin_pull"]
     xs = sat(xs, p["skin_vibrance"])
     xs = skin_line_lock(xs, depth)
-    # hair: natural dark brown, contrast intact, never the skin's warmth
-    xh = y * (p["hair_rgb"] / float(p["hair_rgb"] @ LUMA))
-    xh = x + (xh - x) * p["hair_pull"]
+    # hair: dark brown, darkened but with its own shading (contrast intact),
+    # never the skin's warmth
+    yh = y * p["hair_luma"]
+    xh = yh * (p["hair_rgb"] / float(p["hair_rgb"] @ LUMA))
+    xh = x * p["hair_luma"] + (xh - x * p["hair_luma"]) * p["hair_pull"]
     # shorts and speculars: their true white, luminance contrast intact
     xw = y * np.array([1.0, 0.985, 0.955], np.float32)
     # fins and dive mask: neutral black rubber / glass
