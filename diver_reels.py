@@ -8,11 +8,8 @@ Inputs (made beforehand, see prompts/sam31-diver-underwater-grade.md):
     python diver_reels.py --input inputs/diver.mov --output output/diver_graded.mp4
     python diver_reels.py --input inputs/diver.mov --qc   # QC sheets only
 
-Mask merge per frame:
-  both passes agree (IoU >= 0.6) -> pixels in both = 1, in only one = 0.5,
-                                    so a spill in a single pass is halved
-  they disagree                  -> the pass closer to the previous frame wins
-  only one pass has the diver    -> that pass
+Mask merge per frame: the forward pass is the mask; the backward pass fills
+frames where it is missing or collapses (see merge_masks).
 Then: drop specks, erode 1-2 px, feather (scaled to the diver's size),
 temporal median over 3 frames (symmetric, so no lag).
 """
@@ -58,32 +55,35 @@ def drop_specks(m: np.ndarray) -> np.ndarray:
 
 
 def merge_masks(stem: str, n: int, shape):
+    """Forward pass (SAM 3.1 detector + tracker on every frame) is the
+    primary mask. The backward pass (tracker only) proved weaker on this
+    clip - it drops limbs/torso on fast motion - so it is used only to fill
+    a frame where the forward mask is missing or collapses (area < 60% of
+    its neighbours' median), and to report agreement."""
     fd, bd = REPO / "masks" / f"{stem}__fwd" / "subject", REPO / "masks" / f"{stem}__bwd" / "subject"
-    out, report, prev = [], [], None
+    fw = [drop_specks(read_mask(fd, i, shape)) for i in range(n)]
+    areas = np.array([m.sum() for m in fw], np.float64)
+    out, report = [], []
     for i in range(n):
-        a, b = read_mask(fd, i, shape), read_mask(bd, i, shape)
-        a, b = drop_specks(a), drop_specks(b)
-        sa, sb = a.sum(), b.sum()
-        rec = {"frame": i, "fwd": int(sa), "bwd": int(sb)}
+        a = fw[i]
+        b = drop_specks(read_mask(bd, i, shape))
+        sa, sb = int(a.sum()), int(b.sum())
+        rec = {"frame": i, "fwd": sa, "bwd": sb}
         if sa and sb:
-            j = iou(a, b)
-            rec["iou"] = round(j, 3)
-            if j >= 0.6:
-                soft = 0.5 * a + 0.5 * b
-                rec["mode"] = "consensus"
-            else:
-                pick = a if prev is None or iou(a, prev) >= iou(b, prev) else b
-                soft = pick.astype(np.float32)
-                rec["mode"] = "fwd" if pick is a else "bwd"
-        elif sa or sb:
-            soft = (a if sa else b).astype(np.float32)
-            rec["mode"] = "fwd-only" if sa else "bwd-only"
+            rec["iou"] = round(iou(a, b), 3)
+        nb = [areas[j] for j in range(max(0, i - 3), min(n, i + 4)) if j != i and areas[j] > 0]
+        collapsed = sa == 0 or (nb and sa < 0.6 * float(np.median(nb)))
+        if collapsed and sb > sa:
+            m = a | b
+            rec["mode"] = "fwd+bwd fill"
+        elif sa:
+            m = a
+            rec["mode"] = "fwd"
         else:
-            soft = np.zeros(shape, np.float32)
+            m = a
             rec["mode"] = "lost"
-        prev = soft >= 0.5
         # refine right away and keep 8 bit: 508 float frames would be ~2.7 GB
-        out.append(np.clip(refine(soft) * 255 + 0.5, 0, 255).astype(np.uint8))
+        out.append(np.clip(refine(m.astype(np.float32)) * 255 + 0.5, 0, 255).astype(np.uint8))
         report.append(rec)
     return out, report
 
@@ -96,8 +96,7 @@ def refine(soft: np.ndarray) -> np.ndarray:
     r = 1 if area < 4000 else 2
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
     core = cv2.erode(hard.astype(np.uint8), k).astype(np.float32)
-    # keep the half-weight (one-pass-only) band, but only next to the core
-    a = np.maximum(core, cv2.erode((soft > 0).astype(np.uint8), k) * 0.5 * (soft < 0.75))
+    a = core
     sigma = float(np.clip(np.sqrt(area) / 70.0, 1.2, 3.0))
     return cv2.GaussianBlur(a, (0, 0), sigma)
 
