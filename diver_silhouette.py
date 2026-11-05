@@ -37,13 +37,15 @@ REPO = Path(__file__).resolve().parent
 LUMA = np.array([0.2126, 0.7152, 0.0722], np.float32)
 
 SKIN_HEX = "#E8B896"          # light-warm skin, as it would look at the surface
-LIFT_TARGET = 0.27            # "balanced": median diver luma after the lift
+LIFT_TARGET = 0.30            # "balanced": median diver luma after the lift
 LIFT_MAX = 2.6
-SKIN_CHROMA = 0.6             # share of the (depth target - frame median) a*/b* shift
-SKIN_L_NUDGE = 0.15           # share of the L difference
-# physical absorption: per-metre attenuation R, G, B and veiling-light share
-K_ABS = np.array([0.40, 0.075, 0.035], np.float32)
-VEIL = 0.45
+SKIN_CHROMA = 0.8             # share of the (depth target - frame median) a*/b* shift
+SKIN_L_NUDGE = 0.30           # share of the L difference
+# Deep end of the skin in the *corrected* image (relative to the surface skin):
+# red/warmth go first (a* and b* shrink, b* faster), and it darkens. A raw
+# physical model (exp(-k d) + water veil) lands on green-cyan once the global
+# white balance has already taken the water out, so it double-counts the water.
+DEEP_L, DEEP_A, DEEP_B = -14.0, 0.45, 0.35
 # water path from the red loss on the diver (source R/G), calibrated on the
 # clip itself: the 95th-percentile R/G frame is D_MIN, the 5th is D_MAX
 D_MIN, D_MAX = 1.0, 5.0
@@ -106,10 +108,14 @@ def depth_m(rg, rg_shallow, rg_deep):
     return D_MIN + (D_MAX - D_MIN) * t
 
 
-def skin_at_depth(d, water):
-    """Surface skin colour seen through d metres of water (RGB 0..1)."""
-    t = np.exp(-K_ABS * d)
-    return np.clip(SKIN_RGB * t + np.asarray(water, np.float32) * (1 - t) * VEIL, 0, 1)
+def skin_at_depth(d):
+    """Lab target for surface skin seen d metres deep, in the corrected image."""
+    t = float(np.clip((d - D_MIN) / (D_MAX - D_MIN), 0, 1))
+    t = 1 - np.exp(-2.2 * t)                 # most of the change in the first metres
+    t /= 1 - np.exp(-2.2)
+    L, a, b = TARGET
+    return np.array([L + DEEP_L * t, a * (1 - (1 - DEEP_A) * t),
+                     b * (1 - (1 - DEEP_B) * t)], np.float32)
 
 
 def goggles(x, dm):
@@ -214,7 +220,7 @@ def main() -> int:
     aoffs = np.full((n, 2), np.nan, np.float32)
     targets = np.zeros((n, 3), np.float32)
     for i, x in enumerate(iter_frames(a.input, info)):
-        targets[i] = to_lab(skin_at_depth(float(depth[i]), water[i])[None, None])[0, 0]
+        targets[i] = skin_at_depth(float(depth[i]))
         sk = skin_alpha(i, x)[::2, ::2] > 0.8
         if sk.sum() > 200:
             lab = to_lab(lift(global_grade(x[::2, ::2]), float(gains[i])))[sk]
@@ -257,7 +263,7 @@ def main() -> int:
     corr_b = float(np.corrcoef(ds, labs[:, 2])[0, 1]) if ds.std() > 1e-3 else float("nan")
     jumps = np.abs(np.diff(labs, axis=0)).max(0)
     o = probe(a.output)
-    rep = {"skin_surface_hex": SKIN_HEX, "k_abs_per_m": K_ABS.tolist(), "veil": VEIL,
+    rep = {"skin_surface_hex": SKIN_HEX, "deep_end_L_a_b": [DEEP_L, DEEP_A, DEEP_B],
            "water_path_m": [round(float(depth.min()), 2), round(float(depth.max()), 2)],
            "skin_lab_shallow": np.round(labs[lo].mean(0), 1).tolist(),
            "skin_lab_deep": np.round(labs[hi_].mean(0), 1).tolist(),
