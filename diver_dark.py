@@ -304,6 +304,26 @@ def decontaminate(fg, alpha, sigma=3.0, solid=0.9):
     return fg * (1 - w) + inner * w
 
 
+PARTS = ("watch", "mask", "hair", "shorts")  # priority order where they overlap
+
+
+def grade_part(x, color, ymean, vig, cfg):
+    """Recolour one accessory (hair, shorts, watch, diving mask) to `color`
+    (display RGB) while keeping its own light, shading and texture: the
+    part's luma relative to its (temporally smoothed) mean scales the target
+    colour in linear light, and the brightest glints roll toward white so
+    specular highlights on fabric, strap and lens survive."""
+    c = to_lin(np.asarray(color, np.float32))
+    yl = to_lin(x @ LUMA)
+    r = np.clip(yl / max(to_lin(np.float32(ymean)), 1e-4), 0, 4) ** cfg["part_contrast"]
+    lin = c[None, None, :] * r[..., None]
+    spec = np.clip((x @ LUMA - 0.55) / 0.40, 0, 1)[..., None] * cfg["part_spec"]
+    lin = lin + (to_lin(np.float32(0.9)) - lin).clip(0) * spec
+    d = soft_knee(to_disp(lin), 0.85, 0.97)
+    v = 1 - cfg["fg_vig"] * (1 - vig)
+    return to_disp(to_lin(d) * v[..., None])
+
+
 def grade_stick(x, cfg):
     y = (x @ LUMA)[..., None]
     d = y * cfg["stick_gain"] + (x - y) * 0.15
@@ -318,7 +338,9 @@ CFG = dict(bg_stops=1.3, tint=0.62, chroma_keep=0.55, hl_knee=0.45, hl_ceil=0.74
            patch_sigma=18.0, patch_keep=0.65, lum_sigma=6.0, lum_clip=[0.85, 1.18],
            sun_tint=0.88, sun_vig_spare=0.8, fg_vig=0.45, stick_gain=0.85,
            skin_target=[0.80, 0.62, 0.52], max_gain=6.0, wb_sigma=10.0,
-           feather=1.6, min_blob=1500, hole=6000)
+           feather=1.6, min_blob=1500, hole=6000,
+           part_contrast=0.85, part_spec=0.5,
+           color_hair=None, color_shorts=None, color_watch=None, color_mask=None)
 
 
 # -------------------------------------------------------------------- main --
@@ -331,6 +353,7 @@ def main():
     ap.add_argument("--stride", type=int, default=2)
     ap.add_argument("--stick-stride", type=int, default=4)
     ap.add_argument("--head-stride", type=int, default=4)
+    ap.add_argument("--part-stride", type=int, default=4)
     ap.add_argument("--end", type=int, default=579,
                     help="first frame after the cut (diver and stick gone)")
     ap.add_argument("--checks", type=Path, default=REPO / "output" / "checks")
@@ -373,20 +396,43 @@ def main():
         mattes[name] = build_mattes(greys, keys, s, end, blob, CFG["hole"])
         log(f"[matte] {name}: {len(keys)} SAM 3.1 keyframes -> {end} frames")
         del keys
+    for name in PARTS:
+        mdir = REPO / "masks" / f"{stem}__{name}_s{a.part_stride}"
+        if CFG[f"color_{name}"] is None:
+            continue
+        if not (mdir / "meta.json").exists():
+            log(f"[matte] {name}: colour set but no SAM 3.1 masks at {mdir}, skipped")
+            continue
+        keys = load_keys(mdir, a.part_stride, end, h, w)
+        mattes[name] = build_mattes(greys, keys, a.part_stride, end, 150, 2000)
+        log(f"[matte] {name}: {len(keys)} SAM 3.1 keyframes -> {end} frames")
+        del keys
     if "head" in mattes:
         # diving mask / snorkel / hair belong to the diver, not to the water
         np.maximum(mattes["person"], mattes.pop("head"), out=mattes["person"])
+    for name in PARTS:
+        if name in mattes:  # parts are part of the diver too
+            np.maximum(mattes["person"], mattes[name], out=mattes["person"])
+    parts = [n for n in PARTS if n in mattes]
     del greys
 
     # pass 2: diver colour stats (linear mean inside the eroded body core)
     target = to_lin(np.array(CFG["skin_target"], np.float32))
     stats = np.zeros((info.n_frames, 3), np.float32)
     ymean = np.zeros(info.n_frames, np.float32)
+    pmean = {n: np.zeros(info.n_frames, np.float32) for n in parts}
     ker = np.ones((9, 9), np.uint8)
     for i, f in enumerate(iter_frames(a.input, info)):
         if i >= end:
             break
-        core = cv2.erode(((mattes["person"][i] > 200) & (mattes["stick"][i] < 60)).astype(np.uint8), ker)
+        notpart = np.ones((h, w), bool)
+        for n in parts:
+            pm = mattes[n][i] > 127
+            notpart &= mattes[n][i] < 60
+            pc = cv2.erode(pm.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+            if pc.sum() > 80:
+                pmean[n][i] = float((f[pc] @ LUMA).mean())
+        core = cv2.erode(((mattes["person"][i] > 200) & (mattes["stick"][i] < 60) & notpart).astype(np.uint8), ker)
         if core.sum() > 3000:
             lin = to_lin(f[core > 0])
             # skin only: skip near-black pixels (shorts, strap, deep shadow)
@@ -396,6 +442,7 @@ def main():
             ymean[i] = float((f[core > 0] @ LUMA).mean())
     gains = skin_gains(stats, target, CFG["max_gain"], CFG["wb_sigma"])
     ysm, lum_gain = temporal_luma(ymean, CFG["lum_sigma"], CFG["lum_clip"])
+    psm = {n: temporal_luma(pmean[n], CFG["lum_sigma"], CFG["lum_clip"])[0] for n in parts}
 
     vig = vignette(h, w, CFG["vig_strength"], CFG["vig_inner"], CFG["vig_outer"])
     a.output.parent.mkdir(parents=True, exist_ok=True)
@@ -423,7 +470,19 @@ def main():
                              lum_gain=float(lum_gain[i]))
             dv = decontaminate(dv, ap_)
             st = grade_stick(x, CFG) * (vig[..., None] * 0.5 + 0.5)
-            out = bg * (1 - ap_ - as_)[..., None] + dv * ap_[..., None] + st * as_[..., None]
+            fg = dv
+            if i < end and parts:
+                used = np.zeros((h, w), np.float32)
+                for n in parts:
+                    if psm[n][i] <= 0 or mattes[n][i].max() == 0:
+                        continue
+                    a_n = np.clip(refine(mattes[n][i], y, CFG["feather"]) - used, 0, 1)
+                    if a_n.max() == 0:
+                        continue
+                    pc = decontaminate(grade_part(x, CFG[f"color_{n}"], float(psm[n][i]), vig, CFG), a_n)
+                    fg = fg * (1 - a_n[..., None]) + pc * a_n[..., None]
+                    used = np.clip(used + a_n, 0, 1)
+            out = bg * (1 - ap_ - as_)[..., None] + fg * ap_[..., None] + st * as_[..., None]
         enc.write(out)
         matte = np.clip(ap_ + as_, 0, 1)
         menc.stdin.write((np.clip(ap_ + as_, 0, 1) * 255 + 0.5).astype(np.uint8).tobytes())
