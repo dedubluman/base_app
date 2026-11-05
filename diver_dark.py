@@ -171,7 +171,7 @@ def grade_bg(x, vig, cfg):
     chroma = d - y[..., None]
     pdir = (1 - whi) * (PETROL / (PETROL @ LUMA)) + whi * (PETROL_HI / (PETROL_HI @ LUMA))
     tint = y[..., None] * pdir
-    t = cfg["tint"] + (0.97 - cfg["tint"]) * whi
+    t = cfg["tint"] + (cfg["sun_tint"] - cfg["tint"]) * whi
     d = (1 - t) * d + t * (tint + chroma * cfg["chroma_keep"])
     d = np.clip(d, 0, None)
     # hue-preserving highlight roll-off: compress luma, scale RGB with it
@@ -183,7 +183,9 @@ def grade_bg(x, vig, cfg):
     # crushed (not clipped) blacks: lowered floor + gentle toe
     d = np.clip(d - cfg["black"], 0, None) / (1 - cfg["black"])
     d = np.where(d < 0.25, 0.25 * (d / 0.25) ** cfg["toe"], d)
-    lin = to_lin(d) * vig[..., None]
+    # the sun is a distant light source: let it through most of the vignette
+    v = vig[..., None] + (1 - vig[..., None]) * cfg["sun_vig_spare"] * whi
+    lin = to_lin(d) * v
     return to_disp(lin)
 
 
@@ -209,16 +211,25 @@ def skin_gains(stats_lin: np.ndarray, target_lin: np.ndarray, max_gain: float, s
 
 
 def grade_diver(x, gain, vig, cfg):
-    lin = to_lin(x) * gain * 2.0 ** cfg["fg_stops"]
-    d = to_disp(lin)
+    """Natural, land-like skin. Backlit underwater skin has almost no red
+    left (red ~1/10 of green in linear light), so channel gains alone only
+    amplify noise. Keep the diver's own light and shadow (luma), lift it, and
+    rebuild the colour from a skin ramp: warm brown in the shadows, skin tone
+    in the mids, lighter and less saturated toward the highlights. A little
+    of the white-balanced original chroma is kept for local variation."""
+    y = x @ LUMA
+    y = to_disp(to_lin(y) * 2.0 ** cfg["fg_stops"])
     # open the shadows so the body has form, not a flat silhouette
-    d = d + cfg["fg_lift"] * (1 - d) ** 3 * d
-    # tame red-channel noise from the large gain: smooth chroma, keep luma
-    y = d @ LUMA
-    c = d - y[..., None]
-    c = cv2.GaussianBlur(c, (0, 0), 1.6)
-    d = y[..., None] + c * cfg["fg_sat"]
-    d = soft_knee(d, 0.85, 0.98)
+    y = y + cfg["fg_lift"] * (1 - y) ** 3 * y
+    y = soft_knee(y, 0.80, 0.95)
+    t = np.array(cfg["skin_target"], np.float32)
+    tone = t / (t @ LUMA)
+    s = np.clip(cfg["fg_sat"] * (1 - 0.6 * y), 0, 1)[..., None]
+    d = y[..., None] * (1 + s * (tone - 1))
+    wb = to_disp(to_lin(x) * gain)
+    c = wb - (wb @ LUMA)[..., None]
+    c = cv2.GaussianBlur(c, (0, 0), 2.0)
+    d = np.clip(d + cfg["fg_resid"] * c, 0, 1)
     # part of the vignette so the diver sits in the same space
     v = 1 - cfg["fg_vig"] * (1 - vig)
     return to_disp(to_lin(d) * v[..., None])
@@ -232,7 +243,8 @@ def grade_stick(x, cfg):
 
 CFG = dict(bg_stops=1.3, tint=0.62, chroma_keep=0.55, hl_knee=0.45, hl_ceil=0.74,
            black=0.025, toe=1.35, vig_strength=0.78, vig_inner=0.30, vig_outer=1.30,
-           fg_stops=0.55, fg_lift=0.9, fg_sat=0.85, fg_vig=0.45, stick_gain=0.85,
+           fg_stops=0.8, fg_lift=0.9, fg_sat=0.80, fg_resid=0.15,
+           sun_tint=0.88, sun_vig_spare=0.8, fg_vig=0.45, stick_gain=0.85,
            skin_target=[0.80, 0.62, 0.52], max_gain=6.0, wb_sigma=10.0,
            feather=1.3, min_blob=1500, hole=6000)
 
