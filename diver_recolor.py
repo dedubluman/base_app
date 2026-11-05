@@ -32,8 +32,24 @@ from shades.config import Encode
 from shades.io import Encoder, iter_frames, probe
 
 REPO = Path(__file__).resolve().parent
-D.PARTS = ("hair", "shorts", "fins", "goggles")
-COLOURED = ("hair", "goggles", "fins")
+# parts inside the diver ("person") matte; the fins are outside it on this
+# clip (SAM 3.1 "person" leaves them out), so they get their own matte
+D.PARTS = ("hair", "shorts", "goggles")
+
+
+def fin_mattes(stem, n, shape):
+    """Fins: SAM 3.1 "flipper" masks (diver_parts.py --free fins), small
+    specks dropped, 1 px grow + tight feather, 3-frame temporal median."""
+    d = REPO / "masks" / f"{stem}__fins" / "subject"
+    if not d.exists():
+        return None
+    k3 = np.ones((3, 3), np.uint8)
+    out = []
+    for i in range(n):
+        m = D.drop_specks(D.read_mask(d, i, shape))
+        a = cv2.GaussianBlur(cv2.dilate(m.astype(np.uint8), k3).astype(np.float32), (0, 0), 1.0)
+        out.append(np.clip(a * 255 + 0.5, 0, 255).astype(np.uint8))
+    return D.median3(out)
 
 
 def wb_and_depth(src, info, al, part_al):
@@ -72,10 +88,10 @@ def set_skin(rgb):
     R.DV["skin_hue"] = A.skin_hue_of(rgb)
 
 
-def grade_frame(x, alpha, parts, gains, depth, veil, scheme):
+def grade_frame(x, alpha, parts, gains, depth, veil, scheme, fins=None):
     """x float RGB, alpha HxW 0..1 diver, parts {name: HxW 0..1}."""
     _, hair_hex, mask_hex, fins_hex = A.PART_SCHEMES[scheme]
-    colours = {"hair": hair_hex, "goggles": mask_hex, "fins": fins_hex}
+    colours = {"hair": hair_hex, "goggles": mask_hex}
     bg = A.grade_aquarium(x, veil)
     # no navy gradient in the aquarium look: the diver follows a flat scene
     grad = np.ones((x.shape[0], x.shape[1], 1), np.float32)
@@ -102,6 +118,9 @@ def grade_frame(x, alpha, parts, gains, depth, veil, scheme):
         ring = np.clip((alpha - ab) * 2.5, 0, 1)
         lb = cv2.GaussianBlur(R.luma(bg), (0, 0), 6.0)
         comp = comp + ((lb - R.luma(comp)) * 0.25 * ring)[..., None]
+    if fins is not None and fins.max() > 0:
+        af = fins[..., None]
+        comp = comp * (1 - af) + A.colorize(xw, af, fins_hex) * af
     return np.clip(comp, 0, 1)
 
 
@@ -132,6 +151,9 @@ def main() -> int:
     raw, report = D.merge_masks(stem, n, (h, w))
     al, part_al, _ = D.build_mattes(a.input, info, stem, raw, log=print)
     del raw
+    fins = fin_mattes(stem, n, (h, w))
+    if fins is not None:
+        part_al["fins"] = fins
     print(f"[mask] parts with SAM 3.1 masks: {sorted(part_al)}", flush=True)
     cover = {k: int(sum(f.any() for f in v)) for k, v in part_al.items()}
     print(f"[mask] frames covered per part (of {n}): {cover}", flush=True)
@@ -141,20 +163,25 @@ def main() -> int:
     del sample
 
     def parts_at(i):
-        return {k: v[i].astype(np.float32) / 255 for k, v in part_al.items() if v[i].any()}
+        return {k: v[i].astype(np.float32) / 255 for k, v in part_al.items()
+                if v[i].any() and k != "fins"}
+
+    def fins_at(i):
+        return None if fins is None else fins[i].astype(np.float32) / 255
 
     if a.options:
         for fi in a.options:
             x = next(xx for i, xx in enumerate(iter_frames(a.input, info)) if i == fi)
             m = al[fi] > 127
-            ys, xs = np.nonzero(m)
+            mf = m | (fins[fi] > 127 if fins is not None else False)
+            ys, xs = np.nonzero(mf)
             pad = 60
             y0, y1 = max(0, ys.min() - pad), min(h, ys.max() + pad)
             x0, x1 = max(0, xs.min() - pad), min(w, xs.max() + pad)
 
             def tile(sk, sc, text):
                 set_skin(A.SKIN_OPTIONS[sk][1])
-                y = grade_frame(x, al[fi] / 255.0, parts_at(fi), gains[fi], float(depth[fi]), veil, sc)
+                y = grade_frame(x, al[fi] / 255.0, parts_at(fi), gains[fi], float(depth[fi]), veil, sc, fins_at(fi))
                 t = np.clip(y[y0:y1, x0:x1] * 255 + 0.5, 0, 255).astype(np.uint8)[..., ::-1].copy()
                 t = cv2.resize(t, (520, int(520 * t.shape[0] / t.shape[1])))
                 return label(t, text)
@@ -172,7 +199,10 @@ def main() -> int:
             col = {"hair": (0, 200, 255), "goggles": (255, 0, 255), "fins": (0, 255, 0),
                    "shorts": (255, 255, 0), "bubbles": (255, 255, 255)}
             ov[m] = (0.6 * ov[m] + 0.4 * np.array([0, 0, 255])).astype(np.uint8)
-            for k, v in parts_at(fi).items():
+            pa = parts_at(fi)
+            if fins is not None:
+                pa["fins"] = fins_at(fi)
+            for k, v in pa.items():
                 pm = v > 0.5
                 ov[pm] = (0.3 * ov[pm] + 0.7 * np.array(col.get(k, (128, 128, 128)))).astype(np.uint8)
             cv2.imwrite(str(qc / f"{stem}_parts_overlay_{fi}.jpg"), ov[y0:y1, x0:x1])
@@ -187,7 +217,7 @@ def main() -> int:
     for i, x in enumerate(iter_frames(a.input, info)):
         if i >= n:
             break
-        y = grade_frame(x, al[i] / 255.0, parts_at(i), gains[i], float(depth[i]), veil, a.scheme)
+        y = grade_frame(x, al[i] / 255.0, parts_at(i), gains[i], float(depth[i]), veil, a.scheme, fins_at(i))
         enc.write(y)
         lum.append(float(R.luma(y[::4, ::4]).mean()))
         if i in sheet_idx:

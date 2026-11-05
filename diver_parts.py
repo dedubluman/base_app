@@ -41,6 +41,9 @@ def main() -> int:
     ap.add_argument("--parts", nargs="+", required=True, help="name=text prompt")
     ap.add_argument("--chunk", type=int, default=32)
     ap.add_argument("--overlap", type=int, default=4)
+    ap.add_argument("--free", nargs="*", default=[],
+                    help="parts not clipped to the diver mask (e.g. fins: the "
+                         "'person' mask leaves them out); kept if near the diver")
     a = ap.parse_args()
     parts = dict(p.split("=", 1) for p in a.parts)
     ids = {name: k + 1 for k, name in enumerate(parts)}
@@ -105,7 +108,11 @@ def main() -> int:
                     m = np.asarray(mm) > 0
                     if m.sum() < 60:
                         continue
-                    if (m & dm).sum() / m.sum() > 0.8 and m.sum() > best_sc:
+                    if name in a.free:
+                        near = diver_mask(f, grow=201)
+                        if (m & near).sum() / m.sum() > 0.8 and m.sum() > best_sc:
+                            best, best_sc = m, m.sum()
+                    elif (m & dm).sum() / m.sum() > 0.8 and m.sum() > best_sc:
                         best, best_sc = m & dm, m.sum()
                 if best is not None:
                     seeds[name] = (f, best)
@@ -136,7 +143,7 @@ def main() -> int:
         pred.handle_request({"type": "close_session", "session_id": sid})
         for name, fr in got.items():
             for fi, m in fr.items():
-                dm = diver_mask(fi, grow=5)
+                dm = diver_mask(fi, grow=5 if name not in a.free else 201)
                 if dm is not None:  # a part never leaves the diver
                     m = m & dm
                 cv2.imwrite(str(outs[name] / f"{fi:05d}.png"), m.astype(np.uint8) * 255)
