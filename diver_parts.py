@@ -9,8 +9,13 @@ tracked together through the chunk in both directions by SAM 3.1's
 multiplex tracker head (one tracker pass for all classes; no detector on
 the other frames).
 
+Prompts tested on this clip: "flipper" finds the fins ("fin", "swim fin",
+"diving fin" find nothing); no prompt finds the small dive mask ("diving
+mask", "goggles", "swim goggles", "snorkel mask", "face mask", "mask",
+"eyewear"), so it is left to the dark-gear luminance fallback.
+
     python diver_parts.py --input inputs/diver.mov \
-        --parts shorts=shorts fins="swim fin" hair=hair goggles="diving mask"
+        --parts shorts=shorts fins=flipper hair=hair goggles="diving mask"
 """
 from __future__ import annotations
 
