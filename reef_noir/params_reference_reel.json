@@ -1,0 +1,6 @@
+{
+  "env": {"gamma": 1.15, "contrast": 1.25, "clarity": 0.25, "depth_darken": 0.7,
+          "depth_navy": 0.5, "vignette": 0.25},
+  "diver": {"skin_a": 8.0, "skin_b": 11.0, "chroma_scale": 0.7},
+  "rays": 0.5
+}
