@@ -113,7 +113,7 @@ DV = dict(
     dark_lo=0.10, dark_hi=0.24,    # hair, mask, fins stay as they are
     # ... and relative to this frame's skin luminance (black fins look grey
     # in the water, so an absolute threshold lets them into the skin key)
-    dark_rel=(0.72, 0.90),
+    dark_rel=(0.50, 0.68),
     hi_lo=0.84, hi_hi=0.97,        # specular highlights stay neutral
     # fallback shorts key when there is no shorts mask (luminance)
     shorts_lo=0.56, shorts_hi=0.80,
