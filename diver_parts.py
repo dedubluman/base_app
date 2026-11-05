@@ -44,6 +44,8 @@ def main() -> int:
     ap.add_argument("--free", nargs="*", default=[],
                     help="parts not clipped to the diver mask (e.g. fins: the "
                          "'person' mask leaves them out); kept if near the diver")
+    ap.add_argument("--start", type=int, default=0, help="first frame (re-run a gap)")
+    ap.add_argument("--end", type=int, default=None, help="last frame + 1")
     a = ap.parse_args()
     parts = dict(p.split("=", 1) for p in a.parts)
     ids = {name: k + 1 for k, name in enumerate(parts)}
@@ -78,11 +80,12 @@ def main() -> int:
             return None
         return cv2.dilate((dm > 127).astype(np.uint8), np.ones((grow, grow), np.uint8)) > 0
 
-    chunks, s = [], 0
+    stop = n if a.end is None else min(n, a.end)
+    chunks, s = [], a.start
     while True:
-        e = min(n, s + a.chunk)
+        e = min(stop, s + a.chunk)
         chunks.append((s, e))
-        if e == n:
+        if e == stop:
             break
         s = e - a.overlap
     log = {}
@@ -146,14 +149,20 @@ def main() -> int:
                 dm = diver_mask(fi, grow=5 if name not in a.free else 201)
                 if dm is not None:  # a part never leaves the diver
                     m = m & dm
-                cv2.imwrite(str(outs[name] / f"{fi:05d}.png"), m.astype(np.uint8) * 255)
+                dst = outs[name] / f"{fi:05d}.png"
+                if (a.start or a.end is not None) and dst.exists():
+                    continue                  # gap re-run never overwrites a mask
+                cv2.imwrite(str(dst), m.astype(np.uint8) * 255)
         log[f"{cs}-{ce - 1}"] = {"seconds": round(time.time() - t0, 1),
                                  "seeds": {k: v[0] for k, v in seeds.items()},
                                  "missing": [k for k in parts if k not in seeds]}
         print(f"[parts] chunk {cs}-{ce - 1}: seeds {log[f'{cs}-{ce - 1}']['seeds']}, "
               f"missing {log[f'{cs}-{ce - 1}']['missing']}, {time.time() - t0:.0f}s", flush=True)
     for name in parts:
-        (outs[name].parent / "meta.json").write_text(json.dumps(
+        meta = outs[name].parent / "meta.json"
+        if a.start or a.end is not None:      # gap re-run: keep the full-run meta
+            meta = outs[name].parent / f"meta_{a.start}-{stop - 1}.json"
+        meta.write_text(json.dumps(
             {"num_frames": n, "text": parts[name], "chunks": log}, indent=1))
     return 0
 
