@@ -80,7 +80,8 @@ def merge_masks(stem: str, n: int, shape):
             soft = np.zeros(shape, np.float32)
             rec["mode"] = "lost"
         prev = soft >= 0.5
-        out.append(soft.astype(np.float32))
+        # refine right away and keep 8 bit: 508 float frames would be ~2.7 GB
+        out.append(np.clip(refine(soft) * 255 + 0.5, 0, 255).astype(np.uint8))
         report.append(rec)
     return out, report
 
@@ -100,13 +101,12 @@ def refine(soft: np.ndarray) -> np.ndarray:
 
 
 def alphas(stem, n, shape):
-    soft, report = merge_masks(stem, n, shape)
-    ref = [refine(s) for s in soft]
+    ref, report = merge_masks(stem, n, shape)
     out = []
     for i in range(n):
         st = np.stack([ref[max(0, i - 1)], ref[i], ref[min(n - 1, i + 1)]])
-        out.append(np.median(st, 0).astype(np.float32))
-    return out, report
+        out.append(np.median(st, 0).astype(np.uint8))
+    return out, report  # uint8 alpha, 255 = diver
 
 
 def main() -> int:
@@ -135,7 +135,7 @@ def main() -> int:
     # 10 frames) so the skin tone never flickers.
     means = np.full((n, 3), np.nan, np.float32)
     for i, x in enumerate(iter_frames(a.input, info)):
-        core = cv2.erode((al[i] > 0.9).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+        core = cv2.erode((al[i] > 230).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
         if core.sum() > 300:
             means[i] = np.median(x[core], 0)
     gains = np.full((n, 3), np.nan, np.float32)
@@ -166,13 +166,13 @@ def main() -> int:
     for i, x in enumerate(iter_frames(a.input, info)):
         if a.qc and i not in sheet_idx:
             continue
-        y = R.grade_frame(x, al[i], grad, gains[i])
+        y = R.grade_frame(x, al[i].astype(np.float32) / 255, grad, gains[i])
         if enc is not None:
             enc.write(y)  # TPDF-dithered, BT.709 H.264
         if i in sheet_idx:
             y8 = np.clip(y * 255 + 0.5, 0, 255).astype(np.uint8)
             bgr = np.clip(x * 255 + 0.5, 0, 255).astype(np.uint8)[..., ::-1].copy()
-            m = al[i] > 0.5
+            m = al[i] > 127
             ov = bgr.copy()
             ov[m] = (0.5 * ov[m] + 0.5 * np.array([0, 0, 255])).astype(np.uint8)
             cs, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
