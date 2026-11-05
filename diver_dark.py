@@ -37,13 +37,13 @@ def log(m):
 def load_keys(mdir: Path, stride: int, end: int, h: int, w: int) -> np.ndarray:
     """Keyframe masks (SAM 3.1 at every stride-th frame) -> float [K,H,W]."""
     meta = json.loads((mdir / "meta.json").read_text())
-    k = meta["num_frames"]
+    # keys past the cut are not needed (and may hold junk on the seagrass)
+    k = min(meta["num_frames"], (end - 1) // stride + 2)
     keys = np.zeros((k, h, w), np.float32)
     for i in range(k):
         p = mdir / "subject" / f"{i:05d}.png"
         if p.exists():
             keys[i] = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE) > 127
-    assert (k - 1) * stride < end + stride, (k, stride, end)
     return keys
 
 
