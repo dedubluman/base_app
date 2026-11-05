@@ -336,7 +336,17 @@ def main():
     ap.add_argument("--checks", type=Path, default=REPO / "output" / "checks")
     ap.add_argument("--check-frames", default="60,270,480,576,660")
     ap.add_argument("--limit", type=int, default=0, help="debug: stop after N frames")
+    ap.add_argument("--params", type=Path, default=None,
+                    help="JSON with CFG overrides (e.g. skin_shadow/skin_target/"
+                         "skin_high/fg_sat/fg_cool/fg_stops from the ChatGPT picker)")
     a = ap.parse_args()
+    if a.params:
+        over = json.loads(a.params.read_text())
+        unknown = set(over) - set(CFG)
+        if unknown:
+            raise SystemExit(f"unknown parameters: {sorted(unknown)}")
+        CFG.update(over)
+        log(f"[params] {over}")
 
     info = probe(a.input)
     h, w = info.height, info.width
