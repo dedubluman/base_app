@@ -111,6 +111,9 @@ DV = dict(
     skin_pull=0.72,          # 0 = WB only, 1 = flat skin colour
     skin_vibrance=1.0,
     dark_lo=0.10, dark_hi=0.24,    # hair, mask, fins stay as they are
+    # ... and relative to this frame's skin luminance (black fins look grey
+    # in the water, so an absolute threshold lets them into the skin key)
+    dark_rel=(0.72, 0.90),
     hi_lo=0.84, hi_hi=0.97,        # specular highlights stay neutral
     # fallback shorts key when there is no shorts mask (luminance)
     shorts_lo=0.56, shorts_hi=0.80,
@@ -126,6 +129,13 @@ DV = dict(
     depth_ambient=0.20,      # extra ambient mix at depth 1
     depth_follow=0.20,       # extra scene_follow at depth 1
     depth_wrap=0.25,         # extra light wrap at depth 1
+    # Vectorscope lock (BT.709 Cb/Cr plane, angle from +Cb): the skin's hue
+    # is held on the skin-tone line, so no water cyan/blue can reach it.
+    # The reference stills sit at 128-132 deg (classic line ~123 deg).
+    skin_hue=126.0, skin_hue_tol=5.0,
+    # chroma/luma kept inside the references' spread (median 0.14,
+    # IQR 0.09-0.19); depth lowers it (the only depth cooling on the skin)
+    skin_chroma=(0.045, 0.20), depth_chroma=0.25,
 )
 
 # Average colour the diver should have after white balance (skin + white
@@ -151,7 +161,28 @@ def diver_depth(mean_rgb):
     return float(np.clip((0.85 - m[0] / m[1]) / 0.30, 0, 1))
 
 
-def grade_diver(x, grad, gains=None, depth=0.0, shorts=None):
+def skin_line_lock(x, depth=0.0):
+    """Rotate every pixel's chroma onto the skin-tone line (within
+    +-skin_hue_tol) and keep its chroma/luma inside the reference range,
+    reduced with depth. Luma is untouched."""
+    p = DV
+    y = luma(x)
+    cb = (x[..., 2] - y) / 1.8556
+    cr = (x[..., 0] - y) / 1.5748
+    ang = np.degrees(np.arctan2(cr, cb))
+    d = (ang - p["skin_hue"] + 180.0) % 360.0 - 180.0
+    ang = np.radians(p["skin_hue"] + np.clip(d, -p["skin_hue_tol"], p["skin_hue_tol"]))
+    lo, hi = p["skin_chroma"]
+    f = 1 - p["depth_chroma"] * depth
+    mag = np.clip(np.hypot(cb, cr) / np.maximum(y, 1e-4), lo * f, hi * f) * y
+    cb, cr = mag * np.cos(ang), mag * np.sin(ang)
+    r = y + 1.5748 * cr
+    b = y + 1.8556 * cb
+    g = (y - 0.2126 * r - 0.0722 * b) / 0.7152
+    return np.stack([r, g, b], -1).astype(np.float32)
+
+
+def grade_diver(x, grad, gains=None, depth=0.0, shorts=None, skin_luma=None, gear=None):
     p = DV
     g = p["gains"] if gains is None else gains
     g = 1 + (g - 1) * (1 - p["depth_wb_keep"] * depth)
@@ -163,18 +194,30 @@ def grade_diver(x, grad, gains=None, depth=0.0, shorts=None):
     else:
         k_white = np.maximum(shorts[..., None], k_hi)
     k_dark = 1 - smoothstep(p["dark_lo"], p["dark_hi"], y)
+    if gear is not None:  # fins: their own SAM 3.1 mask, always neutral
+        k_dark = np.maximum(k_dark, gear[..., None])
+    if skin_luma is not None:
+        lo, hi = p["dark_rel"]
+        k_dark = np.maximum(k_dark, 1 - smoothstep(lo * skin_luma, hi * skin_luma, y))
     k_skin = (1 - k_white) * (1 - k_dark)
     # 2. flesh tone with the pixel's own luminance
     skin = y * (p["skin_rgb"] / float(p["skin_rgb"] @ LUMA))
     x = x + (skin - x) * (p["skin_pull"] * k_skin)
-    # 3. vibrance on skin; whites (shorts) to a clean, very slightly warm white
+    # 3. vibrance on skin, then the vectorscope lock
     x = sat(x, 1 + (p["skin_vibrance"] - 1) * k_skin)
+    x = x + (skin_line_lock(x, depth) - x) * k_skin
+    #    dark gear (fins, mask) and hair: the red WB gain would turn black
+    #    rubber brown, so take them most of the way to a neutral dark
+    x = x + (y - x) * (0.85 * k_dark)
+    #    whites (shorts) to a clean, very slightly warm white
     white = y * np.array([1.0, 0.985, 0.955], np.float32)
     x = x + (white - x) * (0.85 * k_white)
     x = (x - 0.45) * p["contrast"] + 0.45
     # 4. sit in the scene: some of the cool ambient water light on the body,
     #    and a share of the scene darkening
-    amb = p["ambient_mix"] + p["depth_ambient"] * depth
+    # ambient water light only on what is not skin (shorts, fins, hair);
+    # the skin's depth falloff is the chroma reduction in skin_line_lock()
+    amb = (p["ambient_mix"] + p["depth_ambient"] * depth) * (1 - k_skin)
     x = x * (1 + (p["ambient"] - 1) * amb)
     fol = p["scene_follow"] + p["depth_follow"] * depth
     x = x * p["exposure"] * (1 - fol + fol * grad)
@@ -193,21 +236,36 @@ def finish(x):
     return np.clip(x, 0, 1)
 
 
-def grade_frame(rgb, alpha, grad, gains=None, depth=0.0, shorts=None):
+def grade_frame(rgb, alpha, grad, gains=None, depth=0.0, shorts=None, gear=None):
     """rgb float 0..1 HxWx3, alpha float 0..1 HxW (diver), grad HxWx1,
     gains: per-frame diver white balance (diver_gains), None = DV["gains"],
-    shorts: float 0..1 HxW shorts alpha (None = luminance fallback)."""
+    shorts: float 0..1 HxW shorts alpha (None = luminance fallback),
+    gear: float 0..1 HxW fins alpha (None = luminance keys only)."""
     import cv2
 
     bg = grade_background(rgb, grad)
-    dv = grade_diver(rgb, grad, gains, depth, shorts)
+    # this frame's skin luminance: body core, minus shorts and specular
+    g0 = DV["gains"] if gains is None else gains
+    yb = luma(rgb * (1 + (g0 - 1) * (1 - DV["depth_wb_keep"] * depth)))
+    body = alpha > 0.9
+    if shorts is not None:
+        body &= shorts < 0.5
+    else:
+        body &= yb < DV["shorts_lo"]
+    body &= yb > DV["dark_lo"]
+    if gear is not None:
+        body &= gear < 0.5
+    skin_luma = float(np.percentile(yb[body], 70)) if body.sum() > 300 else None
+    dv = grade_diver(rgb, grad, gains, depth, shorts, skin_luma, gear)
     a = alpha[..., None]
     comp = bg * (1 - a) + dv * a
     if alpha.max() > 0:
-        # light wrap: the blurred background light spills a little over the
-        # diver's inner edge, so the body sits in the water, not on top of it
-        ab = cv2.GaussianBlur(alpha, (0, 0), 4.0)
-        ring = np.clip((alpha - ab) * 2.5, 0, 1)[..., None]
-        bgb = cv2.GaussianBlur(bg, (0, 0), 6.0)
-        comp = comp + (bgb - comp) * ((0.35 + DV["depth_wrap"] * depth) * ring)
+        # light wrap, luminance only: the surrounding water's *light* reaches
+        # the diver's inner edge (no pasted-on look) but none of its cyan
+        # colour does, so the skin edge stays on the skin-tone line
+        ab = cv2.GaussianBlur(alpha, (0, 0), 3.0)
+        ring = np.clip((alpha - ab) * 2.5, 0, 1)
+        lb = cv2.GaussianBlur(luma(bg), (0, 0), 6.0)
+        w = (0.30 + DV["depth_wrap"] * depth) * ring
+        comp = comp + ((lb - luma(comp)) * w)[..., None]
     return finish(comp)

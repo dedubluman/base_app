@@ -138,8 +138,9 @@ def main() -> int:
 
     al, report = alphas(stem, n, (h, w))
     sh = part_alphas(stem, "shorts", n, (h, w))
-    print(f"[mask] shorts mask: {'SAM 3.1' if sh is not None else 'none (luminance fallback)'}",
-          flush=True)
+    fi = part_alphas(stem, "fins", n, (h, w))
+    print(f"[mask] shorts mask: {'SAM 3.1' if sh is not None else 'none (luminance fallback)'}; "
+          f"fins mask: {'SAM 3.1' if fi is not None else 'none'}", flush=True)
     (qc / f"{stem}_mask_report.json").write_text(json.dumps(report, indent=0))
     modes = {}
     for r in report:
@@ -194,7 +195,8 @@ def main() -> int:
         if a.qc and i not in sheet_idx:
             continue
         y = R.grade_frame(x, al[i].astype(np.float32) / 255, grad, gains[i], float(depth[i]),
-                          None if sh is None else sh[i].astype(np.float32) / 255)
+                          None if sh is None else sh[i].astype(np.float32) / 255,
+                          None if fi is None else fi[i].astype(np.float32) / 255)
         lum.append((i, float(R.luma(y[::4, ::4]).mean())))
         if enc is not None:
             enc.write(y)  # TPDF-dithered, BT.709 H.264
