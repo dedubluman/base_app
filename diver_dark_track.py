@@ -28,7 +28,9 @@ from shades.config import Masking
 from shades.masking import _build_predictor, extract_jpeg_frames
 
 REPO = Path(__file__).resolve().parent
-CHUNK, OVERLAP = 24, 2
+import os
+CHUNK, OVERLAP = int(os.environ.get('TRACK_CHUNK', 24)), 2
+MAX_FRAMES = int(os.environ.get('TRACK_MAX', 0))
 
 
 def clicks_from_mask(m: np.ndarray, n_pos: int = 5, n_neg: int = 8):
@@ -60,6 +62,8 @@ def main(part: str) -> None:
     proxy = cache / "diver__stick_s4.mp4"
     frames = cache / f"sam_frames_track_{part}"
     n = extract_jpeg_frames(proxy, frames, 2)
+    if MAX_FRAMES:
+        n = min(n, MAX_FRAMES)
     h, w = cv2.imread(str(frames / "00000.jpg")).shape[:2]
     mdir = REPO / "masks" / f"diver__{part}_s4"
     if mdir.is_symlink():
@@ -68,6 +72,18 @@ def main(part: str) -> None:
         shutil.rmtree(mdir)
     (mdir / "subject").mkdir(parents=True)
     pred, _ = _build_predictor(Masking(), REPO, cache)
+    # The text detector never matches these parts, so SAM 3.1 would treat the
+    # click-prompted object as an unconfirmed track and drop it (hotstart
+    # removal / unmatched suppression). Keep it alive: the clicks are the
+    # confirmation here.
+    mdl = pred.model
+    mdl.hotstart_delay = 0
+    mdl.suppress_unmatched_only_within_hotstart = True
+    mdl.init_trk_keep_alive = 10_000
+    mdl.max_trk_keep_alive = 10_000
+    mdl.min_trk_keep_alive = -10_000
+    if hasattr(mdl, "masklet_confirmation_enable"):
+        mdl.masklet_confirmation_enable = False
     print(f"[track] {part}: {n} keyframes, SAM 3.1 loaded", flush=True)
 
     masks = np.zeros((n, h, w), bool)
