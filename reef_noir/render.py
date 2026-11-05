@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 
-from shades.io import iter_frames, probe
+from shades.io import iter_frames, probe, read_frames_at
 
 from .grade import DiverGrade, EnvGrade, EnvGrader, grade_diver, work_luma
 from .matte import clean, soft_matte, temporal_vote
@@ -20,18 +20,34 @@ OUT_W, OUT_H = 1080, 1920
 
 
 # ---------------------------------------------------------------- light rays
-def ray_angle(rgb: np.ndarray) -> float:
-    """Dominant streak orientation (radians from vertical) in the upper third,
-    from the structure tensor of the high-passed luminance."""
-    h = rgb.shape[0]
-    Y = work_luma(rgb[: h // 3])
-    Y = Y - cv2.GaussianBlur(Y, (0, 0), 8)
-    gx = cv2.Sobel(Y, cv2.CV_32F, 1, 0, ksize=5)
-    gy = cv2.Sobel(Y, cv2.CV_32F, 0, 1, ksize=5)
-    jxx, jyy, jxy = (gx * gx).sum(), (gy * gy).sum(), (gx * gy).sum()
-    # gradient orientation; streaks run perpendicular to it
-    theta_grad = 0.5 * np.arctan2(2 * jxy, jxx - jyy)  # 0 = horizontal gradient
-    return float(theta_grad)  # gradient horizontal <=> streak vertical
+def ray_angle(frames: list[np.ndarray]) -> float:
+    """Light-shaft direction (radians from vertical; +ve leans right at the
+    bottom) in the open water above the seabed. Projection search: rotate the
+    high-passed upper region and pick the angle whose column sums vary most,
+    i.e. where the shafts line up. Median over several frames."""
+    est = []
+    for rgb in frames:
+        h, w = rgb.shape[:2]
+        Y = work_luma(rgb[: int(h * 0.22)])
+        Y = Y - cv2.GaussianBlur(Y, (0, 0), 6)
+        Y = Y - cv2.GaussianBlur(Y, (0, 0), 1.0) * 0  # keep fine shafts
+        best, best_a = -1.0, 0.0
+        for deg in np.arange(-35, 35.5, 1.0):
+            M = cv2.getRotationMatrix2D((Y.shape[1] / 2, Y.shape[0] / 2), deg, 1.0)
+            r = cv2.warpAffine(Y, M, Y.shape[::-1], flags=cv2.INTER_LINEAR,
+                               borderValue=np.nan)
+            valid = ~np.isnan(r)
+            cnt = valid.sum(0)
+            ok = cnt > 0.8 * Y.shape[0]
+            if ok.sum() < 50:
+                continue
+            prof = np.nansum(r, 0)[ok] / cnt[ok]
+            v = float(np.var(prof))
+            if v > best:
+                best, best_a = v, deg
+        est.append(best_a)
+    # rotating the image by +deg aligns shafts that lean by -deg
+    return float(-np.deg2rad(np.median(est)))
 
 
 def line_kernel(length: int, angle_from_vertical: float) -> np.ndarray:
@@ -144,9 +160,10 @@ def render(video: Path, out: Path, mask_dir: Path, env: EnvGrade, diver: DiverGr
     crop_w = int(round(h * 9 / 16))
     x0s = crop_path(cx, valid, w, crop_w)
 
-    first = next(iter_frames(video, info))
+    probe_frames = list(read_frames_at(video, info, [0, n // 3, 2 * n // 3, n - 1]).values())
     grader = EnvGrader(env, (h, w))
-    angle = ray_angle(first)
+    angle = ray_angle(probe_frames)
+    log(f"[render] light-shaft angle {np.rad2deg(angle):.1f} deg from vertical")
     rayer = RayEnhancer(angle, rays)
     enc = None if frames else IGEncoder(out, str(info.fps))
     want = set(frames or [])
