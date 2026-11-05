@@ -204,10 +204,60 @@ def run_rock_masks(src: Path, mask_root: Path, stride: int, prompt: str) -> Path
     return mdir
 
 
+def stabilize_masks(mdir: Path, frames_dir: Path, radius: int = 6,
+                    flow_scale: float = 0.5) -> Path:
+    """Motion-compensated temporal vote over the per-frame SAM 3.1 masks.
+
+    Each frame's mask is rebuilt from its own SAM 3.1 mask plus the masks of
+    the `radius` frames on either side, warped into this frame with dense
+    optical flow (Farneback) and combined with Gaussian weights. Regions SAM
+    flips in and out of between single frames (the far, blurry rock under
+    the surface) settle to the majority answer; the main body, where all
+    frames agree, is unchanged. Output: soft masks in <mdir>/stable/."""
+    out_dir = mdir / "stable"
+    files = sorted((mdir / "subject").glob("*.png"))
+    n = len(files)
+    if out_dir.exists() and len(list(out_dir.glob("*.png"))) == n:
+        return out_dir
+    out_dir.mkdir(exist_ok=True)
+    masks = [cv2.imread(str(f), cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255 for f in files]
+    h, w = masks[0].shape
+    sw, sh = int(w * flow_scale), int(h * flow_scale)
+    gray = [cv2.resize(cv2.imread(str(frames_dir / f"{i:05d}.jpg"), cv2.IMREAD_GRAYSCALE),
+                       (sw, sh), interpolation=cv2.INTER_AREA) for i in range(n)]
+    gx, gy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    wts = {d: float(np.exp(-0.5 * (d / (radius * 0.6)) ** 2)) for d in range(-radius, radius + 1)}
+    stats = {}
+    for i in range(n):
+        acc = masks[i] * wts[0]
+        tot = wts[0]
+        for d in range(-radius, radius + 1):
+            j = i + d
+            if d == 0 or not 0 <= j < n:
+                continue
+            fl = cv2.calcOpticalFlowFarneback(gray[i], gray[j], None, 0.5, 4, 21, 3, 5, 1.1, 0)
+            fl = cv2.resize(fl, (w, h), interpolation=cv2.INTER_LINEAR) / flow_scale
+            warped = cv2.remap(masks[j], gx + fl[..., 0], gy + fl[..., 1],
+                               cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            acc += warped * wts[d]
+            tot += wts[d]
+        vote = acc / tot
+        # majority with a wide soft ramp: persistent changes fade over a few
+        # frames instead of popping; agreed regions stay at 1
+        soft = np.clip((vote - 0.5) / 0.6 + 0.5, 0, 1)
+        stats[i] = round(float(np.abs((soft > 0.5).astype(np.float32) - masks[i]).mean()), 5)
+        cv2.imwrite(str(out_dir / f"{i:05d}.png"), (soft * 255).astype(np.uint8))
+        if i % 40 == 0:
+            log(f"[stable] frame {i}/{n}, changed {stats[i] * 100:.2f}% of pixels")
+    (mdir / "stable_stats.json").write_text(json.dumps(stats))
+    return out_dir
+
+
 def load_rock_soft(mdir: Path, n: int, stride: int, h: int, w: int) -> np.ndarray:
     """Per-source-frame soft rock mask (float32 0..1), interpolating the
     frames SAM skipped."""
-    files = sorted((mdir / "subject").glob("*.png"))
+    sub = mdir / "stable" if (mdir / "stable").exists() else mdir / "subject"
+    files = sorted(sub.glob("*.png"))
     keys = [cv2.imread(str(p), cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255
             for p in files]
     out = np.zeros((n, h, w), np.float32)
@@ -501,6 +551,8 @@ def main() -> int:
     w, h, n = info.width, info.height, info.n_frames
     log(f"[probe] {w}x{h} {float(info.fps):.3f} fps {n} frames audio={info.has_audio}")
     mdir = run_rock_masks(a.input, a.masks_dir, a.stride, a.prompt)
+    if a.stride == 1:
+        stabilize_masks(mdir, REPO / ".cache" / f"sam_frames_{a.input.stem}_s1")
     if a.masks_only:
         return 0
     rock_raw = load_rock_soft(mdir, n, a.stride, h, w)
