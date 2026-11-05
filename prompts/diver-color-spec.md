@@ -12,8 +12,8 @@ The user picked these from a side-by-side comparison (output/qc/ten_secenekleri.
 2. Lock the skin hue to the skin line (DV["skin_hue"]=131, DV["skin_hue_tol"]=5). Depth changes only the skin's chroma (DV["depth_chroma"]=0.20) and a little luminance. It never changes the hue, so the water's cyan never reaches the skin.
 3. Keep these values in reels_grade.DV: skin_rgb=(1.0, 0.72, 0.56), skin_pull=0.72, skin_chroma=(0.055, 0.23), hair_rgb=(1.0, 0.86, 0.76), hair_pull=0.7. Change them only if the user asks for a different look.
 4. The light wrap carries luminance only, never colour.
-6. Matte (matte.py): check the part masks against each frame's colours (tracker drift, bubbles over hair/fins), remove water/bubbles at the diver's edge, snap the edge with a guided filter and choke it into the SAM 3.1 boundary (+1 px out at most). Where a part's tracked mask drifts (area outside 0.75x-1.3x of its +-15-frame median), re-detect it with diver_parts_fix.py.
-5. Measure before claiming a match. Sample the skin key pixels of the graded frames at several depths, and report mean R:G:B, median saturation, hue p10/p90 and chroma/luma. Compare them with the approved values above.
+5. Matte (matte.py): check the part masks against each frame's colours (tracker drift, bubbles over hair/fins), remove water/bubbles at the diver's edge, snap the edge with a guided filter and choke it into the SAM 3.1 boundary (+1 px out at most). Where a part's tracked mask drifts (area outside 0.75x-1.3x of its +-15-frame median), re-detect it with diver_parts_fix.py.
+6. Measure before claiming a match. Sample the skin key pixels of the graded frames at several depths, and report mean R:G:B, median saturation, hue p10/p90 and chroma/luma. Compare them with the approved values above.
 </rules>
 
 <task>
