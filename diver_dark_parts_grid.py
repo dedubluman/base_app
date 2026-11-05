@@ -134,7 +134,7 @@ def main():
             sheet[y0:y0 + ch, x0:x0 + cw] = img
             cv2.putText(sheet, f"{pre}{k + 1}  {name}", (x0 + 4, y0 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.75, (235, 235, 235), 2, cv2.LINE_AA)
-        cv2.putText(sheet, title, (pad, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (120, 200, 255), 2, cv2.LINE_AA)
+        # (title omitted: it would overlap the first label)
         cv2.imwrite(str(a.out / f"grid_{part}.jpg"), sheet, [cv2.IMWRITE_JPEG_QUALITY, 90])
         print("wrote", part, "frame", i, flush=True)
 
