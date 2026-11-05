@@ -44,7 +44,10 @@ BG = dict(
     sand_lift=1.18,          # exposure on bright sand
     sand_tint=np.array([0.94, 1.00, 1.04], np.float32),  # clean cool white
     shadow_tint=np.array([0.70, 0.96, 1.06], np.float32),  # blue shadows
-    water_sat=0.88,
+    water_sat=0.95,
+    blue_vibrance=1.30,      # extra saturation for blue/cyan hues only
+    caustic_clarity=0.55,    # local contrast on the bright seabed
+    caustic_sigma=5.0,
 )
 
 
@@ -73,25 +76,48 @@ def grade_background(x, grad):
     tint = 1 + (p["shadow_tint"] - 1) * (1 - k_sand)
     x = x * tint
     x = sat(x, p["water_sat"])
+    # Selective colour: blues/cyans (B is the top channel) get more vibrance,
+    # scaled down where they are already saturated
+    yb = luma(x)[..., None]
+    mx, mn = x.max(-1, keepdims=True), x.min(-1, keepdims=True)
+    chroma = (mx - mn) / np.maximum(mx, 1e-4)
+    k_blue = smoothstep(0.0, 0.04, x[..., 2:3] - x[..., 0:1]) * (1 - chroma)
+    x = yb + (x - yb) * (1 + (p["blue_vibrance"] - 1) * k_blue)
+    # Caustics: local contrast on the bright seabed so the light ripples pop
+    if p["caustic_clarity"] > 0:
+        import cv2
+        yl = luma(x)
+        blur = cv2.GaussianBlur(yl, (0, 0), p["caustic_sigma"])
+        x = x + ((yl - blur) * p["caustic_clarity"])[..., None] * k_sand
     return np.clip(x, 0, 1)
 
 
 # ----------------------------------------------------------------- diver --
+# The diver is graded only inside the SAM 3.1 mask, so none of the water's
+# blue/cyan shift above reaches the skin. Steps:
+#   1. per-frame white balance (diver_gains) that undoes the red loss at depth
+#   2. skin key: mid-tones of the body (not the bright white shorts, not the
+#      dark hair / mask / fins) are pulled toward a healthy warm flesh tone,
+#      luminance preserved so the skin keeps its texture and shading
+#   3. vibrance on the skin, neutral whites on the shorts
+#   4. a gentle share of the scene darkening, so the diver sits in the light
 DV = dict(
-    # white balance that undoes the water's red absorption on the body
-    gains=np.array([1.48, 1.0, 0.98], np.float32),
-    exposure=0.92,
-    warmth=np.array([1.04, 0.98, 0.90], np.float32),   # skin warmth
-    hi_lo=0.62, hi_hi=0.90,      # whites (shorts) keep neutral, no warmth
-    sat=0.74,
-    contrast=1.08,
+    gains=np.array([1.48, 1.0, 0.98], np.float32),   # fallback white balance
+    # healthy, sun-tanned flesh as R:G:B (luminance comes from the pixel)
+    skin_rgb=np.array([1.0, 0.79, 0.67], np.float32),
+    skin_pull=0.45,          # 0 = WB only, 1 = flat skin colour
+    skin_vibrance=1.05,
+    dark_lo=0.10, dark_hi=0.24,    # hair, mask, fins stay as they are
+    hi_lo=0.56, hi_hi=0.80,        # white shorts: neutral, no warmth
+    exposure=1.0,
+    contrast=1.06,
+    scene_follow=0.30,       # how much of the background darkening it takes
 )
-
 
 # Average colour the diver should have after white balance (skin + white
 # shorts together), as R:G:B with G = 1. Measured per frame inside the mask.
-DIVER_TARGET = np.array([1.12, 1.0, 0.90], np.float32)
-GAIN_LIMITS = (np.array([1.0, 1.0, 0.80], np.float32), np.array([1.9, 1.0, 1.10], np.float32))
+DIVER_TARGET = np.array([1.20, 1.0, 0.86], np.float32)
+GAIN_LIMITS = (np.array([1.0, 1.0, 0.75], np.float32), np.array([2.1, 1.0, 1.05], np.float32))
 
 
 def diver_gains(mean_rgb):
@@ -107,13 +133,18 @@ def grade_diver(x, grad, gains=None):
     x = x * (p["gains"] if gains is None else gains)
     y = luma(x)[..., None]
     k_hi = smoothstep(p["hi_lo"], p["hi_hi"], y)
-    x = x * (1 + (p["warmth"] - 1) * (1 - k_hi))
-    # neutralise whatever cyan/green is left in the whites (shorts)
-    x = x * (1 - 0.6 * k_hi) + (y * np.array([1.0, 0.99, 0.96], np.float32)) * 0.6 * k_hi
-    x = sat(x, p["sat"])
+    k_dark = 1 - smoothstep(p["dark_lo"], p["dark_hi"], y)
+    k_skin = (1 - k_hi) * (1 - k_dark)
+    # 2. flesh tone with the pixel's own luminance
+    skin = y * (p["skin_rgb"] / float(p["skin_rgb"] @ LUMA))
+    x = x + (skin - x) * (p["skin_pull"] * k_skin)
+    # 3. vibrance on skin; whites (shorts) to a clean, very slightly warm white
+    x = sat(x, 1 + (p["skin_vibrance"] - 1) * k_skin)
+    white = y * np.array([1.0, 0.985, 0.955], np.float32)
+    x = x + (white - x) * (0.7 * k_hi)
     x = (x - 0.45) * p["contrast"] + 0.45
-    # sit in the scene: follow the darkening, but much more gently
-    x = x * p["exposure"] * (0.55 + 0.45 * grad)
+    # 4. sit in the scene without going grey
+    x = x * p["exposure"] * (1 - p["scene_follow"] + p["scene_follow"] * grad)
     return np.clip(x, 0, 1)
 
 
