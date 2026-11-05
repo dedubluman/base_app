@@ -114,6 +114,8 @@ DV = dict(
     # ... and relative to this frame's skin luminance (black fins look grey
     # in the water, so an absolute threshold lets them into the skin key)
     dark_rel=(0.50, 0.68),
+    # hair: natural dark brown (R:G:B), how far it is pulled there
+    hair_rgb=np.array([1.0, 0.86, 0.76], np.float32), hair_pull=0.7,
     hi_lo=0.84, hi_hi=0.97,        # specular highlights stay neutral
     # fallback shorts key when there is no shorts mask (luminance)
     shorts_lo=0.56, shorts_hi=0.80,
@@ -182,42 +184,68 @@ def skin_line_lock(x, depth=0.0):
     return np.stack([r, g, b], -1).astype(np.float32)
 
 
-def grade_diver(x, grad, gains=None, depth=0.0, shorts=None, skin_luma=None, gear=None):
+def class_weights(y, parts=None, skin_luma=None):
+    """Per-pixel weights of the diver's classes, summing to 1:
+    skin, hair, white (shorts + speculars), gear (fins, dive mask).
+    `parts` holds SAM 3.1 part alphas (HxW, 0..1) by name; a class without
+    a mask falls back to a luminance key (only on pixels no mask claims)."""
+    p = DV
+    parts = parts or {}
+    z = np.zeros_like(y)
+
+    def part(name):
+        return parts[name][..., None] if name in parts else z
+
+    hair, shorts = part("hair"), part("shorts")
+    gear = np.maximum(part("fins"), part("goggles"))
+    claimed = np.clip(hair + shorts + gear, 0, 1)
+    free = 1 - claimed
+    # fallbacks for whatever no mask claims (a class missing in a chunk)
+    k_hi = smoothstep(p["hi_lo"], p["hi_hi"], y)
+    k_dark = 1 - smoothstep(p["dark_lo"], p["dark_hi"], y)
+    if skin_luma is not None:
+        lo, hi = p["dark_rel"]
+        k_dark = np.maximum(k_dark, 1 - smoothstep(lo * skin_luma, hi * skin_luma, y))
+    if "shorts" not in parts:
+        k_hi = np.maximum(k_hi, smoothstep(p["shorts_lo"], p["shorts_hi"], y))
+    w_white = shorts + free * k_hi
+    w_gear = gear + free * (1 - k_hi) * k_dark
+    w_hair = hair
+    w_skin = np.clip(1 - w_white - w_gear - w_hair, 0, 1)
+    return w_skin, w_hair, w_white, w_gear
+
+
+def grade_diver(x, grad, gains=None, depth=0.0, parts=None, skin_luma=None):
+    """Multi-class diver grade. Every class gets its own treatment from the
+    same white-balanced pixel, and the results are blended with weights
+    that sum to 1, so no class's colour spills into a neighbour."""
     p = DV
     g = p["gains"] if gains is None else gains
     g = 1 + (g - 1) * (1 - p["depth_wb_keep"] * depth)
     x = x * g
     y = luma(x)[..., None]
-    k_hi = smoothstep(p["hi_lo"], p["hi_hi"], y)
-    if shorts is None:
-        k_white = smoothstep(p["shorts_lo"], p["shorts_hi"], y)
-    else:
-        k_white = np.maximum(shorts[..., None], k_hi)
-    k_dark = 1 - smoothstep(p["dark_lo"], p["dark_hi"], y)
-    if gear is not None:  # fins: their own SAM 3.1 mask, always neutral
-        k_dark = np.maximum(k_dark, gear[..., None])
-    if skin_luma is not None:
-        lo, hi = p["dark_rel"]
-        k_dark = np.maximum(k_dark, 1 - smoothstep(lo * skin_luma, hi * skin_luma, y))
-    k_skin = (1 - k_white) * (1 - k_dark)
-    # 2. flesh tone with the pixel's own luminance
+    w_skin, w_hair, w_white, w_gear = class_weights(y, parts, skin_luma)
+
+    # skin: golden tan with the pixel's own luminance, locked to the
+    # vectorscope skin line; depth lowers only its chroma
     skin = y * (p["skin_rgb"] / float(p["skin_rgb"] @ LUMA))
-    x = x + (skin - x) * (p["skin_pull"] * k_skin)
-    # 3. vibrance on skin, then the vectorscope lock
-    x = sat(x, 1 + (p["skin_vibrance"] - 1) * k_skin)
-    x = x + (skin_line_lock(x, depth) - x) * k_skin
-    #    dark gear (fins, mask) and hair: the red WB gain would turn black
-    #    rubber brown, so take them most of the way to a neutral dark
-    x = x + (y - x) * (0.85 * k_dark)
-    #    whites (shorts) to a clean, very slightly warm white
-    white = y * np.array([1.0, 0.985, 0.955], np.float32)
-    x = x + (white - x) * (0.85 * k_white)
+    xs = x + (skin - x) * p["skin_pull"]
+    xs = sat(xs, p["skin_vibrance"])
+    xs = skin_line_lock(xs, depth)
+    # hair: natural dark brown, contrast intact, never the skin's warmth
+    xh = y * (p["hair_rgb"] / float(p["hair_rgb"] @ LUMA))
+    xh = x + (xh - x) * p["hair_pull"]
+    # shorts and speculars: their true white, luminance contrast intact
+    xw = y * np.array([1.0, 0.985, 0.955], np.float32)
+    # fins and dive mask: neutral black rubber / glass
+    xg = y * np.array([1.0, 1.0, 1.02], np.float32)
+    x = xs * w_skin + xh * w_hair + xw * w_white + xg * w_gear
+
     x = (x - 0.45) * p["contrast"] + 0.45
-    # 4. sit in the scene: some of the cool ambient water light on the body,
-    #    and a share of the scene darkening
-    # ambient water light only on what is not skin (shorts, fins, hair);
-    # the skin's depth falloff is the chroma reduction in skin_line_lock()
-    amb = (p["ambient_mix"] + p["depth_ambient"] * depth) * (1 - k_skin)
+    # sit in the scene: ambient water light on everything but the skin
+    # (the skin's depth falloff is its chroma), and a share of the scene
+    # darkening for the whole body
+    amb = (p["ambient_mix"] + p["depth_ambient"] * depth) * (1 - w_skin)
     x = x * (1 + (p["ambient"] - 1) * amb)
     fol = p["scene_follow"] + p["depth_follow"] * depth
     x = x * p["exposure"] * (1 - fol + fol * grad)
@@ -236,11 +264,11 @@ def finish(x):
     return np.clip(x, 0, 1)
 
 
-def grade_frame(rgb, alpha, grad, gains=None, depth=0.0, shorts=None, gear=None):
+def grade_frame(rgb, alpha, grad, gains=None, depth=0.0, parts=None):
     """rgb float 0..1 HxWx3, alpha float 0..1 HxW (diver), grad HxWx1,
     gains: per-frame diver white balance (diver_gains), None = DV["gains"],
-    shorts: float 0..1 HxW shorts alpha (None = luminance fallback),
-    gear: float 0..1 HxW fins alpha (None = luminance keys only)."""
+    parts: {name: HxW 0..1 alpha} SAM 3.1 part masks (hair, shorts, fins,
+    goggles); classes without a mask fall back to luminance keys."""
     import cv2
 
     bg = grade_background(rgb, grad)
@@ -248,15 +276,13 @@ def grade_frame(rgb, alpha, grad, gains=None, depth=0.0, shorts=None, gear=None)
     g0 = DV["gains"] if gains is None else gains
     yb = luma(rgb * (1 + (g0 - 1) * (1 - DV["depth_wb_keep"] * depth)))
     body = alpha > 0.9
-    if shorts is not None:
-        body &= shorts < 0.5
-    else:
+    for m in (parts or {}).values():
+        body &= m < 0.5
+    if not parts or "shorts" not in parts:
         body &= yb < DV["shorts_lo"]
     body &= yb > DV["dark_lo"]
-    if gear is not None:
-        body &= gear < 0.5
     skin_luma = float(np.percentile(yb[body], 70)) if body.sum() > 300 else None
-    dv = grade_diver(rgb, grad, gains, depth, shorts, skin_luma, gear)
+    dv = grade_diver(rgb, grad, gains, depth, parts, skin_luma)
     a = alpha[..., None]
     comp = bg * (1 - a) + dv * a
     if alpha.max() > 0:

@@ -33,6 +33,8 @@ from shades.config import Encode
 from shades.io import Encoder, iter_frames, probe
 
 REPO = Path(__file__).resolve().parent
+# diver classes masked by diver_parts.py (all but skin)
+PARTS = ("hair", "shorts", "fins", "goggles")
 
 
 def iou(a, b):
@@ -107,9 +109,12 @@ def part_alphas(stem, part, n, shape):
     if not d.exists():
         return None
     ref = []
+    k = np.ones((3, 3), np.uint8)
     for i in range(n):
-        m = read_mask(d, i, shape)
-        ref.append(np.clip(cv2.GaussianBlur(m.astype(np.float32), (0, 0), 1.5) * 255 + 0.5,
+        # grown by 1 px before a tight feather: at a skin/part boundary the
+        # part treatment wins, so no skin warmth reaches hair or fabric
+        m = cv2.dilate(read_mask(d, i, shape).astype(np.uint8), k).astype(np.float32)
+        ref.append(np.clip(cv2.GaussianBlur(m, (0, 0), 1.0) * 255 + 0.5,
                            0, 255).astype(np.uint8))
     return [np.median(np.stack([ref[max(0, i - 1)], ref[i], ref[min(n - 1, i + 1)]]), 0)
             .astype(np.uint8) for i in range(n)]
@@ -137,10 +142,13 @@ def main() -> int:
     qc.mkdir(parents=True, exist_ok=True)
 
     al, report = alphas(stem, n, (h, w))
-    sh = part_alphas(stem, "shorts", n, (h, w))
-    fi = part_alphas(stem, "fins", n, (h, w))
-    print(f"[mask] shorts mask: {'SAM 3.1' if sh is not None else 'none (luminance fallback)'}; "
-          f"fins mask: {'SAM 3.1' if fi is not None else 'none'}", flush=True)
+    part_al = {}
+    for name in PARTS:
+        pa = part_alphas(stem, name, n, (h, w))
+        if pa is not None:
+            part_al[name] = pa
+    print(f"[mask] SAM 3.1 part masks: {sorted(part_al) or 'none'} "
+          f"(missing classes fall back to luminance keys)", flush=True)
     (qc / f"{stem}_mask_report.json").write_text(json.dumps(report, indent=0))
     modes = {}
     for r in report:
@@ -155,6 +163,8 @@ def main() -> int:
     means = np.full((n, 3), np.nan, np.float32)
     for i, x in enumerate(iter_frames(a.input, info)):
         core = cv2.erode((al[i] > 230).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+        for v in part_al.values():  # white balance from the skin only
+            core &= v[i] < 128
         if core.sum() > 300:
             means[i] = np.median(x[core], 0)
     gains = np.full((n, 3), np.nan, np.float32)
@@ -195,8 +205,8 @@ def main() -> int:
         if a.qc and i not in sheet_idx:
             continue
         y = R.grade_frame(x, al[i].astype(np.float32) / 255, grad, gains[i], float(depth[i]),
-                          None if sh is None else sh[i].astype(np.float32) / 255,
-                          None if fi is None else fi[i].astype(np.float32) / 255)
+                          {k: v[i].astype(np.float32) / 255 for k, v in part_al.items()
+                           if v[i].any()})
         lum.append((i, float(R.luma(y[::4, ::4]).mean())))
         if enc is not None:
             enc.write(y)  # TPDF-dithered, BT.709 H.264

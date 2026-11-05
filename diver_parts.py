@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""SAM 3.1 mask of a part of the diver (e.g. the white shorts).
+"""Multi-class SAM 3.1 masks of the diver's parts: hair, shorts, fins, mask.
 
-The part is graded apart from the skin: a luminance key cannot tell sunlit
-skin from white fabric. Per chunk, SAM 3.1 detects the part from a text
-prompt on one seed frame (inside the diver mask), then its tracker head
-propagates that mask through the chunk in both directions (no detector on
-the other frames: ~5 s/frame on CPU instead of ~16 s).
+Each class is graded on its own (diver_reels.py / reels_grade.py): the
+skin is the diver mask minus every part, so the skin grade never reaches
+hair, fabric or gear. Per chunk, each class is detected by SAM 3.1 from its
+text prompt on a seed frame (inside the diver mask), then all classes are
+tracked together through the chunk in both directions by SAM 3.1's
+multiplex tracker head (one tracker pass for all classes; no detector on
+the other frames).
 
-    python diver_parts.py --input inputs/diver.mov --part shorts --text shorts
+    python diver_parts.py --input inputs/diver.mov \
+        --parts shorts=shorts fins="swim fin" hair=hair goggles="diving mask"
 """
 from __future__ import annotations
 
@@ -30,16 +33,19 @@ REPO = Path(__file__).resolve().parent
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", type=Path, required=True)
-    ap.add_argument("--part", default="shorts")
-    ap.add_argument("--text", default="shorts")
+    ap.add_argument("--parts", nargs="+", required=True, help="name=text prompt")
     ap.add_argument("--chunk", type=int, default=32)
     ap.add_argument("--overlap", type=int, default=4)
     a = ap.parse_args()
+    parts = dict(p.split("=", 1) for p in a.parts)
+    ids = {name: k + 1 for k, name in enumerate(parts)}
 
     stem = a.input.stem
     diver = REPO / "masks" / f"{stem}__fwd" / "subject"
-    out = REPO / "masks" / f"{stem}__{a.part}" / "subject"
-    out.mkdir(parents=True, exist_ok=True)
+    outs = {}
+    for name in parts:
+        outs[name] = REPO / "masks" / f"{stem}__{name}" / "subject"
+        outs[name].mkdir(parents=True, exist_ok=True)
     cache = REPO / ".cache"
     frames = cache / f"sam_frames_{stem}_bwd"
     if not (frames / "00000.jpg").exists():
@@ -47,7 +53,6 @@ def main() -> int:
     n = len(list(frames.glob("*.jpg")))
 
     pred, on_gpu = _build_predictor(Masking(parts={}), REPO, cache)
-    model = pred.model
 
     def _build_sam2_output(inference_state, frame_idx, refined_obj_id_to_mask=None):
         # see diver_masks_bwd.py: keep tracked masks on frames the detector
@@ -56,8 +61,14 @@ def main() -> int:
         o.update(refined_obj_id_to_mask or {})
         return o
 
-    model._build_sam2_output = _build_sam2_output
-    print(f"[part] SAM 3.1 on {'CUDA' if on_gpu else 'CPU'}; '{a.text}' over {n} frames", flush=True)
+    pred.model._build_sam2_output = _build_sam2_output
+    print(f"[parts] SAM 3.1 on {'CUDA' if on_gpu else 'CPU'}; {parts} over {n} frames", flush=True)
+
+    def diver_mask(f, grow=9):
+        dm = cv2.imread(str(diver / f"{f:05d}.png"), 0)
+        if dm is None or (dm > 127).sum() < 1500:
+            return None
+        return cv2.dilate((dm > 127).astype(np.uint8), np.ones((grow, grow), np.uint8)) > 0
 
     chunks, s = [], 0
     while True:
@@ -69,64 +80,64 @@ def main() -> int:
     log = {}
     for cs, ce in chunks:
         t0 = time.time()
-        cdir = cache / f"sam_chunk_{stem}_{a.part}"
+        cdir = cache / f"sam_chunk_{stem}_parts"
         shutil.rmtree(cdir, ignore_errors=True)
         cdir.mkdir()
         for i in range(cs, ce):
             (cdir / f"{i - cs:05d}.jpg").symlink_to(frames / f"{i:05d}.jpg")
         sid = pred.handle_request({"type": "start_session", "resource_path": str(cdir)})["session_id"]
-        # seed: the first frame (of a few candidates) where the detector finds
-        # the part inside the diver
-        seed, seed_mask = None, None
-        for f in sorted({cs + (ce - cs) // 2, cs, ce - 1}):
-            dm = cv2.imread(str(diver / f"{f:05d}.png"), 0)
-            if dm is None or (dm > 127).sum() < 2000:
-                continue
-            dm = cv2.dilate((dm > 127).astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
-            r = pred.handle_request({"type": "add_prompt", "session_id": sid,
-                                     "frame_index": f - cs, "text": a.text})
-            o = r["outputs"]
-            best, best_sc = None, 0.0
-            for oid, mm in zip(o["out_obj_ids"], o["out_binary_masks"]):
-                m = np.asarray(mm) > 0
-                if m.sum() < 200:
-                    continue
-                inside = (m & dm).sum() / m.sum()
-                if inside > 0.8 and m.sum() > best_sc:
-                    best, best_sc = m & dm, m.sum()
-            if best is not None:
-                seed, seed_mask = f, best
-                break
-        if seed is None:
-            pred.handle_request({"type": "close_session", "session_id": sid})
-            print(f"[part] chunk {cs}-{ce - 1}: '{a.text}' not found, skipped", flush=True)
-            log[f"{cs}-{ce - 1}"] = {"seed": None}
-            continue
-        pts, lab = prompts_from_mask(seed_mask, n_pos=4, n_neg=4)
-        pred.handle_request({"type": "add_prompt", "session_id": sid,
-                             "frame_index": seed - cs, "points": pts,
-                             "point_labels": lab, "obj_id": 1})
-        got = {seed: seed_mask}
-        for resp in pred.handle_stream_request({
-                "type": "propagate_in_video", "session_id": sid,
-                "propagation_direction": "both", "start_frame_index": seed - cs}):
-            fi = cs + int(resp["frame_index"])
-            o = resp["outputs"]
-            for oid, mm in zip(o["out_obj_ids"], o["out_binary_masks"]):
-                if int(oid) == 1:
-                    got[fi] = np.asarray(mm) > 0
+        cands = [f for f in sorted({cs + (ce - cs) // 2, cs, ce - 1, cs + (ce - cs) // 4,
+                                    cs + 3 * (ce - cs) // 4}) if diver_mask(f) is not None]
+        seeds = {}
+        # 1) detect each class from its text prompt on a seed frame
+        for name, text in parts.items():
+            for f in cands:
+                dm = diver_mask(f)
+                r = pred.handle_request({"type": "add_prompt", "session_id": sid,
+                                         "frame_index": f - cs, "text": text})
+                best, best_sc = None, 0
+                for mm in r["outputs"]["out_binary_masks"]:
+                    m = np.asarray(mm) > 0
+                    if m.sum() < 60:
+                        continue
+                    if (m & dm).sum() / m.sum() > 0.8 and m.sum() > best_sc:
+                        best, best_sc = m & dm, m.sum()
+                if best is not None:
+                    seeds[name] = (f, best)
+                    break
+        # 2) the detected masks become tracker objects; propagate all together
+        for name, (f, m) in seeds.items():
+            pts, lab = prompts_from_mask(m, n_pos=4, n_neg=4)
+            pred.handle_request({"type": "add_prompt", "session_id": sid,
+                                 "frame_index": f - cs, "points": pts,
+                                 "point_labels": lab, "obj_id": 100 + ids[name]})
+        got = {name: {f: m} for name, (f, m) in seeds.items()}
+        if seeds:
+            start = min(f for f, _ in seeds.values())
+            for resp in pred.handle_stream_request({
+                    "type": "propagate_in_video", "session_id": sid,
+                    "propagation_direction": "both", "start_frame_index": start - cs}):
+                fi = cs + int(resp["frame_index"])
+                o = resp["outputs"]
+                for oid, mm in zip(o["out_obj_ids"], o["out_binary_masks"]):
+                    for name in seeds:
+                        if int(oid) == 100 + ids[name] and fi != seeds[name][0]:
+                            got[name][fi] = np.asarray(mm) > 0
         pred.handle_request({"type": "close_session", "session_id": sid})
-        for fi, m in got.items():
-            dm = cv2.imread(str(diver / f"{fi:05d}.png"), 0)
-            if dm is not None:  # the part never leaves the diver
-                m = m & (cv2.dilate((dm > 127).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0)
-            cv2.imwrite(str(out / f"{fi:05d}.png"), m.astype(np.uint8) * 255)
-        log[f"{cs}-{ce - 1}"] = {"seed": seed, "seconds": round(time.time() - t0, 1),
-                                 "areas": {str(k): int(v.sum()) for k, v in sorted(got.items())}}
-        print(f"[part] chunk {cs}-{ce - 1}: seed {seed}, {len(got)} frames, "
-              f"{time.time() - t0:.0f}s", flush=True)
-    (out.parent / "meta.json").write_text(json.dumps({"num_frames": n, "text": a.text,
-                                                       "chunks": log}, indent=1))
+        for name, fr in got.items():
+            for fi, m in fr.items():
+                dm = diver_mask(fi, grow=5)
+                if dm is not None:  # a part never leaves the diver
+                    m = m & dm
+                cv2.imwrite(str(outs[name] / f"{fi:05d}.png"), m.astype(np.uint8) * 255)
+        log[f"{cs}-{ce - 1}"] = {"seconds": round(time.time() - t0, 1),
+                                 "seeds": {k: v[0] for k, v in seeds.items()},
+                                 "missing": [k for k in parts if k not in seeds]}
+        print(f"[parts] chunk {cs}-{ce - 1}: seeds {log[f'{cs}-{ce - 1}']['seeds']}, "
+              f"missing {log[f'{cs}-{ce - 1}']['missing']}, {time.time() - t0:.0f}s", flush=True)
+    for name in parts:
+        (outs[name].parent / "meta.json").write_text(json.dumps(
+            {"num_frames": n, "text": parts[name], "chunks": log}, indent=1))
     return 0
 
 
