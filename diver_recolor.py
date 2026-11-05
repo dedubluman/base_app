@@ -82,10 +82,30 @@ def wb_and_depth(src, info, al, part_al):
     return gains, smooth(depth, 0.0, 15.0)
 
 
-def set_skin(rgb):
-    rgb = np.asarray(rgb, np.float32)
-    R.DV["skin_rgb"] = rgb
+SKIN = {"hex": A.SKIN_OPTIONS["B"][1]}
+
+
+def set_skin(hx):
+    """Skin target: the grade_diver skin line is aimed at the same hue, then
+    the skin class is recoloured to the chosen colour (shading kept)."""
+    rgb = A.hex_rgb(hx)
+    R.DV["skin_rgb"] = rgb / rgb[0]
     R.DV["skin_hue"] = A.skin_hue_of(rgb)
+    SKIN["hex"] = hx
+
+
+def goggles_ring(a):
+    """Only the dive mask's frame/skirt is recoloured: the outer band of the
+    SAM 3.1 mask. The lens (the eroded inside, eyes behind glass) keeps its
+    neutral dark-glass grade."""
+    m = (a > 0.5).astype(np.uint8)
+    area = int(m.sum())
+    if area < 50:
+        return a
+    r = max(2, int(0.16 * np.sqrt(area)))
+    inner = cv2.erode(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
+    inner = cv2.GaussianBlur(inner.astype(np.float32), (0, 0), 1.2)
+    return a * (1 - inner)
 
 
 def grade_frame(x, alpha, parts, gains, depth, veil, scheme, fins=None):
@@ -104,9 +124,15 @@ def grade_frame(x, alpha, parts, gains, depth, veil, scheme, fins=None):
     body &= yb > R.DV["dark_lo"]
     skin_luma = float(np.percentile(yb[body], 70)) if body.sum() > 300 else None
     dv = R.grade_diver(x, grad, gains, depth, parts, skin_luma)
+    w_skin = R.class_weights(R.luma(xw)[..., None], parts, skin_luma)[0]
+    sk = A.colorize(xw, w_skin, SKIN["hex"], shading=0.9, hi_keep=0.3)
+    dv = dv * (1 - 0.9 * w_skin) + sk * (0.9 * w_skin)
     for name, hx in colours.items():
         if name in parts:
-            a = parts[name][..., None]
+            a = parts[name]
+            if name == "goggles":
+                a = goggles_ring(a)
+            a = a[..., None]
             dv = dv * (1 - a) + A.colorize(xw, a, hx) * a
     # a touch of the aquarium's clarity/contrast on the diver, so it sits in it
     s = dv * dv * (3 - 2 * dv)
@@ -230,7 +256,7 @@ def main() -> int:
                 np.vstack(tiles[:6]), [cv2.IMWRITE_JPEG_QUALITY, 85])
     jumps = np.abs(np.diff(lum))
     o = probe(a.output)
-    meta = {"skin": a.skin, "skin_rgb": list(A.SKIN_OPTIONS[a.skin][1]),
+    meta = {"skin": a.skin, "skin_hex": A.SKIN_OPTIONS[a.skin][1],
             "scheme": a.scheme, "scheme_colours": A.PART_SCHEMES[a.scheme],
             "parts_frames": cover, "veil": veil.round(4).tolist(),
             "max_luma_jump": round(float(jumps.max()), 4),

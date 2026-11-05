@@ -129,11 +129,13 @@ def colorize(x, w, target_hex, shading=0.85, hi_keep=0.6):
 
 
 SKIN_OPTIONS = {
-    # name: (label, R:G:B with G scaled) - luminance always from the pixel
-    "A": ("Dogal bronz", (1.0, 0.81, 0.70)),
-    "B": ("Altin sicak", (1.0, 0.72, 0.56)),
-    "C": ("Acik seftali", (1.0, 0.82, 0.74)),
-    "D": ("Koyu karamel", (1.0, 0.70, 0.50)),
+    # name: (label, skin colour at the skin's median brightness). Each pixel
+    # keeps its shading relative to that median, so the options differ in
+    # both hue and depth of tan.
+    "A": ("Acik seftali", "#E9BFA0"),
+    "B": ("Dogal bronz", "#D49A72"),
+    "C": ("Altin bronz", "#C68B59"),
+    "D": ("Koyu karamel", "#9A633E"),
 }
 
 PART_SCHEMES = {
