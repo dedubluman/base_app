@@ -257,7 +257,8 @@ def grade_diver(x, gain, vig, cfg, alpha=None, frame_mean=None, lum_gain=1.0):
     large-scale patchiness from water depth and caustics, gently lift the
     mids, then rebuild the colour from a three-point skin ramp. A little of
     the white-balanced original chroma is kept for local variation."""
-    y = (x @ LUMA) * lum_gain                      # temporal luminance match
+    y_src = (x @ LUMA) * lum_gain
+    y = y_src                                       # temporal luminance match
     if alpha is not None and alpha.max() > 0:
         # large-scale luma inside the body only (normalised masked blur),
         # compressed toward the frame's skin mean: smooths patchy torso /
@@ -283,6 +284,17 @@ def grade_diver(x, gain, vig, cfg, alpha=None, frame_mean=None, lum_gain=1.0):
     cool = np.array(cfg["cool_tone"], np.float32)
     cool = cool / (cool @ LUMA)
     d = (1 - cfg["fg_cool"]) * d + cfg["fg_cool"] * (d @ LUMA)[..., None] * cool
+    # near-black gear (shorts, diving mask, snorkel, watch, strap) must stay
+    # neutral black/grey, not turn into dark reddish skin: pixels much darker
+    # than the diver's skin get no skin colour, no patch lift and no shadow
+    # opening -- only the exposure the whole diver gets
+    if cfg["dark_neutral"] > 0:
+        ref = frame_mean if frame_mean is not None else float(np.median(y_src))
+        rel = y_src / max(ref, 1e-4)
+        n = np.clip((cfg["dark_rel_hi"] - rel) / (cfg["dark_rel_hi"] - cfg["dark_rel_lo"]), 0, 1)
+        n = cv2.GaussianBlur(n.astype(np.float32), (0, 0), 1.5) * cfg["dark_neutral"]
+        yd = to_disp(to_lin(y_src) * 2.0 ** cfg["fg_stops"]) * cfg["dark_level"]
+        d = d * (1 - n[..., None]) + yd[..., None] * n[..., None]
     # part of the vignette so the diver sits in the same space
     v = 1 - cfg["fg_vig"] * (1 - vig)
     return to_disp(to_lin(d) * v[..., None])
@@ -340,6 +352,7 @@ CFG = dict(bg_stops=1.3, tint=0.62, chroma_keep=0.55, hl_knee=0.45, hl_ceil=0.74
            skin_target=[0.80, 0.62, 0.52], max_gain=6.0, wb_sigma=10.0,
            feather=1.6, min_blob=1500, hole=6000,
            part_contrast=0.85, part_spec=0.5,
+           dark_neutral=1.0, dark_rel_lo=0.30, dark_rel_hi=0.60, dark_level=0.9,
            color_hair=None, color_shorts=None, color_watch=None, color_mask=None)
 
 
