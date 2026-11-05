@@ -10,8 +10,11 @@ Inputs (made beforehand, see prompts/sam31-diver-underwater-grade.md):
 
 Mask merge per frame: the forward pass is the mask; the backward pass fills
 frames where it is missing or collapses (see merge_masks).
-Then: drop specks, erode 1-2 px, feather (scaled to the diver's size),
-temporal median over 3 frames (symmetric, so no lag).
+Then, per frame (matte.py): part masks checked against the frame's colours
+(tracker drift, bubbles over hair/fins), water/bubbles at the diver's edge
+removed, and the edge snapped to the body with a guided filter and choked
+into the SAM 3.1 boundary (+1 px out at most); temporal median over 3 frames
+(symmetric, so no lag).
 """
 from __future__ import annotations
 
@@ -25,6 +28,7 @@ import numpy as np
 
 import dataclasses
 
+import matte as M
 import reels_grade as R
 from shades.config import Encode
 from shades.io import Encoder, iter_frames, probe
@@ -82,50 +86,56 @@ def merge_masks(stem: str, n: int, shape):
         else:
             m = a
             rec["mode"] = "lost"
-        # refine right away and keep 8 bit: 508 float frames would be ~2.7 GB
-        out.append(np.clip(refine(m.astype(np.float32)) * 255 + 0.5, 0, 255).astype(np.uint8))
+        out.append(m.astype(np.uint8))   # hard 0/1; the matte is built per frame later
         report.append(rec)
     return out, report
 
 
-def refine(soft: np.ndarray) -> np.ndarray:
-    hard = soft >= 0.5
-    area = hard.sum()
-    if area == 0:
-        return np.zeros_like(soft)
-    r = 1 if area < 4000 else 2
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
-    core = cv2.erode(hard.astype(np.uint8), k).astype(np.float32)
-    a = core
-    sigma = float(np.clip(np.sqrt(area) / 70.0, 1.2, 3.0))
-    return cv2.GaussianBlur(a, (0, 0), sigma)
-
-
-def part_alphas(stem, part, n, shape):
-    """SAM 3.1 part mask (diver_parts.py), feathered and median-filtered
-    over 3 frames; None if the part was never masked."""
-    d = REPO / "masks" / f"{stem}__{part}" / "subject"
-    if not d.exists():
-        return None
-    ref = []
-    k = np.ones((3, 3), np.uint8)
-    for i in range(n):
-        # grown by 1 px before a tight feather: at a skin/part boundary the
-        # part treatment wins, so no skin warmth reaches hair or fabric
-        m = cv2.dilate(read_mask(d, i, shape).astype(np.uint8), k).astype(np.float32)
-        ref.append(np.clip(cv2.GaussianBlur(m, (0, 0), 1.0) * 255 + 0.5,
-                           0, 255).astype(np.uint8))
-    return [np.median(np.stack([ref[max(0, i - 1)], ref[i], ref[min(n - 1, i + 1)]]), 0)
+def median3(seq):
+    """Temporal median over 3 frames (symmetric, so no lag)."""
+    n = len(seq)
+    return [np.median(np.stack([seq[max(0, i - 1)], seq[i], seq[min(n - 1, i + 1)]]), 0)
             .astype(np.uint8) for i in range(n)]
 
 
-def alphas(stem, n, shape):
-    ref, report = merge_masks(stem, n, shape)
-    out = []
-    for i in range(n):
-        st = np.stack([ref[max(0, i - 1)], ref[i], ref[min(n - 1, i + 1)]])
-        out.append(np.median(st, 0).astype(np.uint8))
-    return out, report  # uint8 alpha, 255 = diver
+def build_mattes(src: Path, info, stem: str, raw: list, log=print):
+    """Per frame: the diver alpha snapped to the body edge (matte.snap_diver_alpha)
+    and every SAM 3.1 part mask checked against this frame's skin/water colour
+    models (matte.refine_parts). Returns uint8 alphas (diver, {part: alphas})
+    and the per-frame fraction of each part mask that was given back."""
+    n, shape = len(raw), raw[0].shape
+    part_dirs = {name: REPO / "masks" / f"{stem}__{name}" / "subject" for name in PARTS}
+    part_dirs = {k: d for k, d in part_dirs.items() if d.exists()}
+    diver = []
+    parts = {k: [] for k in part_dirs}
+    removed = []
+    k3 = np.ones((3, 3), np.uint8)
+    parts["bubbles"] = []
+    for i, x in enumerate(iter_frames(src, info)):
+        m = raw[i] > 0
+        pm = {k: read_mask(d, i, shape) & cv2.dilate(m.astype(np.uint8), k3).astype(bool)
+              for k, d in part_dirs.items()}
+        pm = {k: v for k, v in pm.items() if v.any()}
+        # 1) part masks checked against this frame's colours (drift, bubbles)
+        ref, rem = M.refine_parts(x, m, pm)
+        # 2) water/bubbles hugging the diver's boundary leave the diver mask
+        m, edge_rem = M.clean_diver_edge(x, m, {k: v for k, v in ref.items() if k != "bubbles"})
+        rem["diver_edge"] = edge_rem
+        removed.append(rem)
+        # 3) the edge snapped to the body and choked into the SAM boundary
+        diver.append(np.clip(M.snap_diver_alpha(m, x) * 255 + 0.5, 0, 255).astype(np.uint8))
+        for k in list(part_dirs) + ["bubbles"]:
+            r = ref.get(k)
+            if r is None or not r.any():
+                parts[k].append(np.zeros(shape, np.uint8))
+                continue
+            # grown by 1 px before a tight feather: at a skin/part boundary
+            # the part treatment wins, so no skin warmth reaches hair/fabric
+            a = cv2.GaussianBlur(cv2.dilate(r.astype(np.uint8), k3).astype(np.float32), (0, 0), 1.0)
+            parts[k].append(np.clip(a * 255 + 0.5, 0, 255).astype(np.uint8))
+        if i % 100 == 0:
+            log(f"[matte] frame {i}/{n}", flush=True)
+    return median3(diver), {k: median3(v) for k, v in parts.items() if any(f.any() for f in v)}, removed
 
 
 def main() -> int:
@@ -140,14 +150,21 @@ def main() -> int:
     qc = REPO / "output" / "qc"
     qc.mkdir(parents=True, exist_ok=True)
 
-    al, report = alphas(stem, n, (h, w))
-    part_al = {}
-    for name in PARTS:
-        pa = part_alphas(stem, name, n, (h, w))
-        if pa is not None:
-            part_al[name] = pa
+    raw, report = merge_masks(stem, n, (h, w))
+    al, part_al, removed = build_mattes(a.input, info, stem, raw, log=print)
+    del raw
+    for r, rem in zip(report, removed):
+        if rem:
+            r["part_removed"] = rem
     print(f"[mask] SAM 3.1 part masks: {sorted(part_al) or 'none'} "
           f"(missing classes fall back to luminance keys)", flush=True)
+    for k in list(part_al) + ["diver_edge"]:
+        if k == "bubbles":
+            continue
+        fr = [(r["frame"], r["part_removed"][k]) for r in report
+              if r.get("part_removed", {}).get(k, 0) > 0.15]
+        print(f"[matte] {k}: {len(fr)} frames had >15% of the SAM mask given back "
+              f"to skin/water" + (f", e.g. {fr[:6]}" if fr else ""), flush=True)
     (qc / f"{stem}_mask_report.json").write_text(json.dumps(report, indent=0))
     modes = {}
     for r in report:

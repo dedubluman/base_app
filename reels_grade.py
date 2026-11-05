@@ -99,7 +99,8 @@ def grade_background(x, grad):
 #   2. skin key: the body minus the shorts (their own SAM 3.1 mask), minus
 #      the dark hair / mask / fins and specular highlights, is pulled toward
 #      the golden-tan flesh tone measured on the reference stills
-#      (R:G:B ~1 : 0.81 : 0.70, saturation ~0.29), luminance preserved so the
+#      user-picked look "C - golden warm" (more yellow-gold and a little
+#      richer than the reference's ~1 : 0.81 : 0.70), luminance preserved so the
 #      skin keeps its texture and shading
 #   3. the shorts go to a clean, very slightly warm white
 #   4. depth: a soft falloff - the skin darkens a little and takes a small
@@ -107,7 +108,7 @@ def grade_background(x, grad):
 DV = dict(
     gains=np.array([1.48, 1.0, 0.98], np.float32),   # fallback white balance
     # healthy, sun-tanned flesh as R:G:B (luminance comes from the pixel)
-    skin_rgb=np.array([1.0, 0.75, 0.615], np.float32),
+    skin_rgb=np.array([1.0, 0.72, 0.56], np.float32),
     skin_pull=0.72,          # 0 = WB only, 1 = flat skin colour
     skin_vibrance=1.0,
     dark_lo=0.10, dark_hi=0.24,    # hair, mask, fins stay as they are
@@ -134,10 +135,10 @@ DV = dict(
     # Vectorscope lock (BT.709 Cb/Cr plane, angle from +Cb): the skin's hue
     # is held on the skin-tone line, so no water cyan/blue can reach it.
     # The reference stills sit at 128-132 deg (classic line ~123 deg).
-    skin_hue=126.0, skin_hue_tol=5.0,
+    skin_hue=131.0, skin_hue_tol=5.0,
     # chroma/luma kept inside the references' spread (median 0.14,
     # IQR 0.09-0.19); depth lowers it (the only depth cooling on the skin)
-    skin_chroma=(0.045, 0.20), depth_chroma=0.25,
+    skin_chroma=(0.055, 0.23), depth_chroma=0.20,
 )
 
 # Average colour the diver should have after white balance (skin + white
@@ -196,7 +197,9 @@ def class_weights(y, parts=None, skin_luma=None):
     def part(name):
         return parts[name][..., None] if name in parts else z
 
-    hair, shorts = part("hair"), part("shorts")
+    hair = part("hair")
+    # bubbles in front of the body are graded like the white fabric: neutral
+    shorts = np.maximum(part("shorts"), part("bubbles"))
     gear = np.maximum(part("fins"), part("goggles"))
     claimed = np.clip(hair + shorts + gear, 0, 1)
     free = 1 - claimed
