@@ -37,8 +37,8 @@ BG = dict(
                   [0.00, 0.86, 0.06],
                   [0.02, 0.00, 1.02]], np.float32),
     # vertical darkening: multiplier at top -> bottom of frame
-    grad_top=0.34, grad_bottom=1.0, grad_gamma=0.8,
-    shadow_gamma=1.32,       # crush darks toward deep navy
+    grad_top=0.46, grad_bottom=1.0, grad_gamma=0.8,
+    shadow_gamma=1.12,       # deepen darks toward navy, without crushing
     sand_lo=0.42, sand_hi=0.80,   # luma window that counts as bright seabed
     sand_white=0.78,         # how far bright sand goes toward neutral white
     sand_lift=1.18,          # exposure on bright sand
@@ -104,20 +104,22 @@ def grade_background(x, grad):
 DV = dict(
     gains=np.array([1.48, 1.0, 0.98], np.float32),   # fallback white balance
     # healthy, sun-tanned flesh as R:G:B (luminance comes from the pixel)
-    skin_rgb=np.array([1.0, 0.79, 0.67], np.float32),
-    skin_pull=0.45,          # 0 = WB only, 1 = flat skin colour
-    skin_vibrance=1.05,
+    skin_rgb=np.array([1.0, 0.84, 0.76], np.float32),
+    skin_pull=0.22,          # 0 = WB only, 1 = flat skin colour
+    skin_vibrance=0.92,
     dark_lo=0.10, dark_hi=0.24,    # hair, mask, fins stay as they are
     hi_lo=0.56, hi_hi=0.80,        # white shorts: neutral, no warmth
-    exposure=1.0,
-    contrast=1.06,
-    scene_follow=0.30,       # how much of the background darkening it takes
+    exposure=0.88,
+    contrast=1.0,
+    scene_follow=0.45,
+    # share of the ambient water light that falls on the body (cohesion)
+    ambient=np.array([0.80, 0.94, 1.06], np.float32), ambient_mix=0.18,       # how much of the background darkening it takes
 )
 
 # Average colour the diver should have after white balance (skin + white
 # shorts together), as R:G:B with G = 1. Measured per frame inside the mask.
-DIVER_TARGET = np.array([1.20, 1.0, 0.86], np.float32)
-GAIN_LIMITS = (np.array([1.0, 1.0, 0.75], np.float32), np.array([2.1, 1.0, 1.05], np.float32))
+DIVER_TARGET = np.array([1.10, 1.0, 0.93], np.float32)
+GAIN_LIMITS = (np.array([1.0, 1.0, 0.75], np.float32), np.array([1.8, 1.0, 1.05], np.float32))
 
 
 def diver_gains(mean_rgb):
@@ -143,24 +145,39 @@ def grade_diver(x, grad, gains=None):
     white = y * np.array([1.0, 0.985, 0.955], np.float32)
     x = x + (white - x) * (0.7 * k_hi)
     x = (x - 0.45) * p["contrast"] + 0.45
-    # 4. sit in the scene without going grey
+    # 4. sit in the scene: some of the cool ambient water light on the body,
+    #    and a share of the scene darkening
+    x = x * (1 + (p["ambient"] - 1) * p["ambient_mix"])
     x = x * p["exposure"] * (1 - p["scene_follow"] + p["scene_follow"] * grad)
     return np.clip(x, 0, 1)
 
 
 # -------------------------------------------------------------- finishing --
 def finish(x):
-    """Gentle S-curve + highlight roll-off on the composite."""
+    """Soft S-curve, then a navy toe: blacks are lifted a little toward deep
+    blue so the water column keeps its gradient instead of going to 0."""
     x = np.clip(x, 0, 1)
     s = x * x * (3 - 2 * x)
-    x = x * 0.6 + s * 0.4
+    x = x * 0.82 + s * 0.18
+    toe = np.array([0.010, 0.022, 0.034], np.float32)
+    x = toe + x * (1 - toe)
     return np.clip(x, 0, 1)
 
 
 def grade_frame(rgb, alpha, grad, gains=None):
     """rgb float 0..1 HxWx3, alpha float 0..1 HxW (diver), grad HxWx1,
     gains: per-frame diver white balance (diver_gains), None = DV["gains"]."""
+    import cv2
+
     bg = grade_background(rgb, grad)
     dv = grade_diver(rgb, grad, gains)
     a = alpha[..., None]
-    return finish(bg * (1 - a) + dv * a)
+    comp = bg * (1 - a) + dv * a
+    if alpha.max() > 0:
+        # light wrap: the blurred background light spills a little over the
+        # diver's inner edge, so the body sits in the water, not on top of it
+        ab = cv2.GaussianBlur(alpha, (0, 0), 4.0)
+        ring = np.clip((alpha - ab) * 2.5, 0, 1)[..., None]
+        bgb = cv2.GaussianBlur(bg, (0, 0), 6.0)
+        comp = comp + (bgb - comp) * (0.35 * ring)
+    return finish(comp)

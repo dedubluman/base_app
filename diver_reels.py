@@ -96,7 +96,7 @@ def refine(soft: np.ndarray) -> np.ndarray:
     core = cv2.erode(hard.astype(np.uint8), k).astype(np.float32)
     # keep the half-weight (one-pass-only) band, but only next to the core
     a = np.maximum(core, cv2.erode((soft > 0).astype(np.uint8), k) * 0.5 * (soft < 0.75))
-    sigma = float(np.clip(np.sqrt(area) / 90.0, 0.8, 2.5))
+    sigma = float(np.clip(np.sqrt(area) / 70.0, 1.2, 3.0))
     return cv2.GaussianBlur(a, (0, 0), sigma)
 
 
