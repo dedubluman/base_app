@@ -122,6 +122,9 @@ def refine(alpha_u8: np.ndarray, y: np.ndarray, feather: float) -> np.ndarray:
     p = alpha_u8.astype(np.float32) / 255.0
     if p.max() == 0:
         return p
+    # pull the edge ~2 px inward so the feather sits on the body, not on the
+    # bright water around it (otherwise the skin grade paints a light rim)
+    p = cv2.erode(p, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
     a = guided_filter(y, p, 5, 1e-3)
     a = cv2.GaussianBlur(np.clip(a, 0, 1), (0, 0), feather)
     return np.clip(a, 0, 1)
@@ -176,7 +179,7 @@ def grade_bg(x, vig, cfg):
     yk = soft_knee(y, cfg["hl_knee"], cfg["hl_ceil"])
     d = d * (yk / np.maximum(y, 1e-5))[..., None]
     m = d.max(-1, keepdims=True)
-    d = np.where(m > cfg["hl_ceil"] + 0.1, d * (cfg["hl_ceil"] + 0.1) / m, d)
+    d = np.where(m > cfg["hl_ceil"] + 0.1, d * (cfg["hl_ceil"] + 0.1) / np.maximum(m, 1e-6), d)
     # crushed (not clipped) blacks: lowered floor + gentle toe
     d = np.clip(d - cfg["black"], 0, None) / (1 - cfg["black"])
     d = np.where(d < 0.25, 0.25 * (d / 0.25) ** cfg["toe"], d)
@@ -242,7 +245,8 @@ def main():
     ap.add_argument("--output", type=Path, default=REPO / "output" / "diver_dark_grade.mp4")
     ap.add_argument("--matte-out", type=Path, default=REPO / "output" / "diver_matte.mp4")
     ap.add_argument("--stride", type=int, default=2)
-    ap.add_argument("--stick-stride", type=int, default=2)
+    ap.add_argument("--stick-stride", type=int, default=4)
+    ap.add_argument("--head-stride", type=int, default=4)
     ap.add_argument("--end", type=int, default=588)
     ap.add_argument("--checks", type=Path, default=REPO / "output" / "checks")
     ap.add_argument("--check-frames", default="60,270,480,576,660")
@@ -263,10 +267,20 @@ def main():
         greys.append(cv2.cvtColor((f * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY))
 
     mattes = {}
-    for name, s in (("person", a.stride), ("stick", a.stick_stride)):
-        keys = load_keys(REPO / "masks" / f"{stem}__{name}_s{s}", s, end, h, w)
-        mattes[name] = build_mattes(greys, keys, s, end, CFG["min_blob"], CFG["hole"])
+    for name, s, blob in (("person", a.stride, CFG["min_blob"]),
+                          ("stick", a.stick_stride, CFG["min_blob"]),
+                          ("head", a.head_stride, 300)):
+        mdir = REPO / "masks" / f"{stem}__{name}_s{s}"
+        if name == "head" and not (mdir / "meta.json").exists():
+            log("[matte] head: no SAM 3.1 run found, skipped")
+            continue
+        keys = load_keys(mdir, s, end, h, w)
+        mattes[name] = build_mattes(greys, keys, s, end, blob, CFG["hole"])
         log(f"[matte] {name}: {len(keys)} SAM 3.1 keyframes -> {end} frames")
+        del keys
+    if "head" in mattes:
+        # diving mask / snorkel / hair belong to the diver, not to the water
+        np.maximum(mattes["person"], mattes.pop("head"), out=mattes["person"])
     del greys
 
     # pass 2: diver colour stats (linear mean inside the eroded body core)
