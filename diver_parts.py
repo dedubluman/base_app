@@ -119,9 +119,14 @@ def main() -> int:
         got = {name: {f: m} for name, (f, m) in seeds.items()}
         if seeds:
             start = min(f for f, _ in seeds.values())
+            # From a chunk edge, propagate one way only: after a pass that
+            # starts on the first/last frame SAM 3.1 switches the second
+            # direction to "fetch cached outputs", which do not exist here.
+            direction = ("forward" if start == cs else
+                         "backward" if start == ce - 1 else "both")
             for resp in pred.handle_stream_request({
                     "type": "propagate_in_video", "session_id": sid,
-                    "propagation_direction": "both", "start_frame_index": start - cs}):
+                    "propagation_direction": direction, "start_frame_index": start - cs}):
                 fi = cs + int(resp["frame_index"])
                 o = resp["outputs"]
                 for oid, mm in zip(o["out_obj_ids"], o["out_binary_masks"]):
