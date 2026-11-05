@@ -100,6 +100,21 @@ def refine(soft: np.ndarray) -> np.ndarray:
     return cv2.GaussianBlur(a, (0, 0), sigma)
 
 
+def part_alphas(stem, part, n, shape):
+    """SAM 3.1 part mask (diver_parts.py), feathered and median-filtered
+    over 3 frames; None if the part was never masked."""
+    d = REPO / "masks" / f"{stem}__{part}" / "subject"
+    if not d.exists():
+        return None
+    ref = []
+    for i in range(n):
+        m = read_mask(d, i, shape)
+        ref.append(np.clip(cv2.GaussianBlur(m.astype(np.float32), (0, 0), 1.5) * 255 + 0.5,
+                           0, 255).astype(np.uint8))
+    return [np.median(np.stack([ref[max(0, i - 1)], ref[i], ref[min(n - 1, i + 1)]]), 0)
+            .astype(np.uint8) for i in range(n)]
+
+
 def alphas(stem, n, shape):
     ref, report = merge_masks(stem, n, shape)
     out = []
@@ -122,6 +137,9 @@ def main() -> int:
     qc.mkdir(parents=True, exist_ok=True)
 
     al, report = alphas(stem, n, (h, w))
+    sh = part_alphas(stem, "shorts", n, (h, w))
+    print(f"[mask] shorts mask: {'SAM 3.1' if sh is not None else 'none (luminance fallback)'}",
+          flush=True)
     (qc / f"{stem}_mask_report.json").write_text(json.dumps(report, indent=0))
     modes = {}
     for r in report:
@@ -175,7 +193,8 @@ def main() -> int:
     for i, x in enumerate(iter_frames(a.input, info)):
         if a.qc and i not in sheet_idx:
             continue
-        y = R.grade_frame(x, al[i].astype(np.float32) / 255, grad, gains[i], float(depth[i]))
+        y = R.grade_frame(x, al[i].astype(np.float32) / 255, grad, gains[i], float(depth[i]),
+                          None if sh is None else sh[i].astype(np.float32) / 255)
         lum.append((i, float(R.luma(y[::4, ::4]).mean())))
         if enc is not None:
             enc.write(y)  # TPDF-dithered, BT.709 H.264

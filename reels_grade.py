@@ -96,31 +96,36 @@ def grade_background(x, grad):
 # The diver is graded only inside the SAM 3.1 mask, so none of the water's
 # blue/cyan shift above reaches the skin. Steps:
 #   1. per-frame white balance (diver_gains) that undoes the red loss at depth
-#   2. skin key: mid-tones of the body (not the bright white shorts, not the
-#      dark hair / mask / fins) are pulled toward a healthy warm flesh tone,
-#      luminance preserved so the skin keeps its texture and shading
-#   3. vibrance on the skin, neutral whites on the shorts
-#   4. a gentle share of the scene darkening, so the diver sits in the light
+#   2. skin key: the body minus the shorts (their own SAM 3.1 mask), minus
+#      the dark hair / mask / fins and specular highlights, is pulled toward
+#      the golden-tan flesh tone measured on the reference stills
+#      (R:G:B 1 : 0.76 : 0.63, saturation ~0.35), luminance preserved so the
+#      skin keeps its texture and shading
+#   3. the shorts go to a clean, very slightly warm white
+#   4. depth: the skin keeps its warm hue and only darkens a little (as in
+#      the references); a share of the scene darkening ties it to the water
 DV = dict(
     gains=np.array([1.48, 1.0, 0.98], np.float32),   # fallback white balance
     # healthy, sun-tanned flesh as R:G:B (luminance comes from the pixel)
-    skin_rgb=np.array([1.0, 0.84, 0.76], np.float32),
-    skin_pull=0.22,          # 0 = WB only, 1 = flat skin colour
-    skin_vibrance=0.92,
+    skin_rgb=np.array([1.0, 0.725, 0.585], np.float32),
+    skin_pull=0.85,          # 0 = WB only, 1 = flat skin colour
+    skin_vibrance=1.0,
     dark_lo=0.10, dark_hi=0.24,    # hair, mask, fins stay as they are
-    hi_lo=0.56, hi_hi=0.80,        # white shorts: neutral, no warmth
-    exposure=0.88,
+    hi_lo=0.84, hi_hi=0.97,        # specular highlights stay neutral
+    # fallback shorts key when there is no shorts mask (luminance)
+    shorts_lo=0.56, shorts_hi=0.80,
+    exposure=1.0,
     contrast=1.0,
-    scene_follow=0.45,
+    scene_follow=0.35,
     # share of the ambient water light that falls on the body (cohesion)
-    ambient=np.array([0.80, 0.94, 1.06], np.float32), ambient_mix=0.18,
+    ambient=np.array([0.80, 0.94, 1.06], np.float32), ambient_mix=0.04,
     # Depth adaptation (depth 0 = surface .. 1 = deep, see diver_depth()):
     # deeper, the red is only partly restored, more ambient cyan/blue falls
     # on the skin and the body takes more of the scene darkening.
-    depth_wb_keep=0.45,      # share of the WB correction given up at depth 1
-    depth_ambient=0.32,      # extra ambient mix at depth 1
-    depth_follow=0.30,       # extra scene_follow at depth 1
-    depth_wrap=0.25,         # extra light wrap at depth 1       # how much of the background darkening it takes
+    depth_wb_keep=0.15,      # share of the WB correction given up at depth 1
+    depth_ambient=0.08,      # extra ambient mix at depth 1
+    depth_follow=0.20,       # extra scene_follow at depth 1
+    depth_wrap=0.25,         # extra light wrap at depth 1
 )
 
 # Average colour the diver should have after white balance (skin + white
@@ -146,22 +151,26 @@ def diver_depth(mean_rgb):
     return float(np.clip((0.85 - m[0] / m[1]) / 0.30, 0, 1))
 
 
-def grade_diver(x, grad, gains=None, depth=0.0):
+def grade_diver(x, grad, gains=None, depth=0.0, shorts=None):
     p = DV
     g = p["gains"] if gains is None else gains
     g = 1 + (g - 1) * (1 - p["depth_wb_keep"] * depth)
     x = x * g
     y = luma(x)[..., None]
     k_hi = smoothstep(p["hi_lo"], p["hi_hi"], y)
+    if shorts is None:
+        k_white = smoothstep(p["shorts_lo"], p["shorts_hi"], y)
+    else:
+        k_white = np.maximum(shorts[..., None], k_hi)
     k_dark = 1 - smoothstep(p["dark_lo"], p["dark_hi"], y)
-    k_skin = (1 - k_hi) * (1 - k_dark)
+    k_skin = (1 - k_white) * (1 - k_dark)
     # 2. flesh tone with the pixel's own luminance
     skin = y * (p["skin_rgb"] / float(p["skin_rgb"] @ LUMA))
     x = x + (skin - x) * (p["skin_pull"] * k_skin)
     # 3. vibrance on skin; whites (shorts) to a clean, very slightly warm white
     x = sat(x, 1 + (p["skin_vibrance"] - 1) * k_skin)
     white = y * np.array([1.0, 0.985, 0.955], np.float32)
-    x = x + (white - x) * (0.7 * k_hi)
+    x = x + (white - x) * (0.85 * k_white)
     x = (x - 0.45) * p["contrast"] + 0.45
     # 4. sit in the scene: some of the cool ambient water light on the body,
     #    and a share of the scene darkening
@@ -184,13 +193,14 @@ def finish(x):
     return np.clip(x, 0, 1)
 
 
-def grade_frame(rgb, alpha, grad, gains=None, depth=0.0):
+def grade_frame(rgb, alpha, grad, gains=None, depth=0.0, shorts=None):
     """rgb float 0..1 HxWx3, alpha float 0..1 HxW (diver), grad HxWx1,
-    gains: per-frame diver white balance (diver_gains), None = DV["gains"]."""
+    gains: per-frame diver white balance (diver_gains), None = DV["gains"],
+    shorts: float 0..1 HxW shorts alpha (None = luminance fallback)."""
     import cv2
 
     bg = grade_background(rgb, grad)
-    dv = grade_diver(rgb, grad, gains, depth)
+    dv = grade_diver(rgb, grad, gains, depth, shorts)
     a = alpha[..., None]
     comp = bg * (1 - a) + dv * a
     if alpha.max() > 0:
