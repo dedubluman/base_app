@@ -99,16 +99,16 @@ def grade_background(x, grad):
 #   2. skin key: the body minus the shorts (their own SAM 3.1 mask), minus
 #      the dark hair / mask / fins and specular highlights, is pulled toward
 #      the golden-tan flesh tone measured on the reference stills
-#      (R:G:B 1 : 0.76 : 0.63, saturation ~0.35), luminance preserved so the
+#      (R:G:B ~1 : 0.81 : 0.70, saturation ~0.29), luminance preserved so the
 #      skin keeps its texture and shading
 #   3. the shorts go to a clean, very slightly warm white
-#   4. depth: the skin keeps its warm hue and only darkens a little (as in
-#      the references); a share of the scene darkening ties it to the water
+#   4. depth: a soft falloff - the skin darkens a little and takes a small
+#      share of the ambient blue/cyan light, so it cools without going grey
 DV = dict(
     gains=np.array([1.48, 1.0, 0.98], np.float32),   # fallback white balance
     # healthy, sun-tanned flesh as R:G:B (luminance comes from the pixel)
-    skin_rgb=np.array([1.0, 0.725, 0.585], np.float32),
-    skin_pull=0.85,          # 0 = WB only, 1 = flat skin colour
+    skin_rgb=np.array([1.0, 0.75, 0.615], np.float32),
+    skin_pull=0.72,          # 0 = WB only, 1 = flat skin colour
     skin_vibrance=1.0,
     dark_lo=0.10, dark_hi=0.24,    # hair, mask, fins stay as they are
     hi_lo=0.84, hi_hi=0.97,        # specular highlights stay neutral
@@ -118,12 +118,12 @@ DV = dict(
     contrast=1.0,
     scene_follow=0.35,
     # share of the ambient water light that falls on the body (cohesion)
-    ambient=np.array([0.80, 0.94, 1.06], np.float32), ambient_mix=0.04,
+    ambient=np.array([0.80, 0.94, 1.06], np.float32), ambient_mix=0.06,
     # Depth adaptation (depth 0 = surface .. 1 = deep, see diver_depth()):
     # deeper, the red is only partly restored, more ambient cyan/blue falls
     # on the skin and the body takes more of the scene darkening.
-    depth_wb_keep=0.15,      # share of the WB correction given up at depth 1
-    depth_ambient=0.08,      # extra ambient mix at depth 1
+    depth_wb_keep=0.25,      # share of the WB correction given up at depth 1
+    depth_ambient=0.20,      # extra ambient mix at depth 1
     depth_follow=0.20,       # extra scene_follow at depth 1
     depth_wrap=0.25,         # extra light wrap at depth 1
 )
