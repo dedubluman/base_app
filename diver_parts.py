@@ -49,7 +49,7 @@ def main() -> int:
     ap.add_argument("--seed-prev", action="store_true",
                     help="if a class's text prompt finds nothing in a chunk, seed the "
                          "tracker from that class's existing mask on the chunk's first "
-                         "frame (written by the previous chunk / the full run)")
+                         "frame (tracks forward) or else its last frame (tracks backward)")
     a = ap.parse_args()
     parts = dict(p.split("=", 1) for p in a.parts)
     ids = {name: k + 1 for k, name in enumerate(parts)}
@@ -128,10 +128,12 @@ def main() -> int:
             for name in parts:
                 if name in seeds:
                     continue
-                pm = cv2.imread(str(outs[name] / f"{cs:05d}.png"), 0)
-                if pm is not None and (pm > 127).sum() >= 60:
-                    seeds[name] = (cs, pm > 127)
-                    print(f"[parts] {name}: seeded from existing mask on frame {cs}", flush=True)
+                for f in (cs, ce - 1):        # first frame -> forward, last -> backward
+                    pm = cv2.imread(str(outs[name] / f"{f:05d}.png"), 0)
+                    if pm is not None and (pm > 127).sum() >= 60:
+                        seeds[name] = (f, pm > 127)
+                        print(f"[parts] {name}: seeded from existing mask on frame {f}", flush=True)
+                        break
         # 2) the detected masks become tracker objects; propagate all together
         for name, (f, m) in seeds.items():
             pts, lab = prompts_from_mask(m, n_pos=4, n_neg=4)
