@@ -25,7 +25,11 @@ In the result, the green fog is gone, the water is deep blue, the reef has dark 
    a. Global curves (whole frame): set the black point, then apply a gentle S-curve to cut the haze. Keep the highlights in the sun and the rays, and do not clip them.
    b. Global white balance: neutralize the green cast and push the water toward a deep cyan-blue, as in the reference. Keep the sun rays.
    c. Diver lift, using the full-diver mask: raise the shadows and midtones to a "balanced" level. Skin detail and the body shape should read clearly, but a little of the backlit rim feel should stay. Do not make it look like it was lit from the front.
-   d. Skin color, using the skin masks: move skin hue and saturation toward a Mediterranean tan, about #C68B59 at midtones. Keep the original luminance texture by changing chroma, then nudging luminance slightly; do not paint a flat color. Leave the specular highlights as they are.
+   d. Skin color, using the skin masks (skin = diver minus hair, swimsuit, fins and dive mask; the dive-mask lens and strap are never skin even when no text prompt finds them, so exclude dark, low-saturation pixels on the face):
+      - Surface skin reference: light-warm #E8B896. This is the colour the skin would have at the surface, not the colour to paint.
+      - Physical water absorption: estimate the water path to the diver per frame, d in metres (combine the red loss on the diver's skin in the source, with R/G calibrated on the clip itself: its 95th-percentile frame is the shallowest (~1 m) and its 5th-percentile frame the deepest (~5 m); add any other cue you find reliable; smooth it over time with a Gaussian of about 8 frames; report what you used). Attenuate the reference per channel with T = exp(-k*d), k = (0.40, 0.075, 0.035) per metre for R, G, B, and add veiling light: target = ref*T + water*(1-T)*0.45, where water is the median graded water colour in a ring around the diver. Red goes first, then orange, so deeper skin turns paler and cyan-ish and darker.
+      - Subtle and realistic: shift the skin's a*/b* by 0.6 x (target - frame median skin a*/b*) and L by 0.15 x the L difference, as an offset, so every pixel keeps its own texture, shading and specular highlights. Never replace chroma or paint a flat colour.
+      - Edges: feather the skin matte about 3 px wider than the diver matte so skin blends into the water at the silhouette edge; the diver must not look cut out or pasted on.
    e. Color separation: keep the water cool and the diver warm. Raise saturation a little on the diver and lower it a little in the far background.
 4. Keep the original resolution, frame rate and frame count, and copy the audio stream through unchanged.
 5. Do only what is listed here: no text overlays, no reframing, no stabilization, no sharpening beyond a light local contrast on the diver.
@@ -42,7 +46,8 @@ Now do the work. Inspect the source with ffprobe first, extract frames, build an
 Before you finish, check your result against these criteria and fix anything that fails:
 - Pull the same 4 frames (0%, 33%, 66%, 95%) from the source and from the output and look at them. The diver must be clearly more readable, and the water must be blue rather than green.
 - Overlay the skin masks on those frames. They must cover the face, arms and legs, stay off the swimsuit and the stick, and show no flicker between neighboring frames.
-- Measure the mean skin color inside the masks in the output. It should sit near #C68B59, within roughly ΔE 10.
+- Measure the median skin colour per frame in the output and plot it against the depth estimate: it must get cooler (lower a*, lower b*) as d grows and stay smooth from frame to frame. Report the shallow and deep ends.
+- Look at the face: the dive mask must stay dark glass, never skin-toned.
 - Confirm that the output's resolution, frame rate, frame count and audio match the source.
 
 When you finish, report the output path, the SAM 3.1 prompts you used for each mask, the final curve, white-balance and skin values, and anything that did not meet the criteria. If something is uncertain, such as a track that drifted on a few frames, list it rather than hiding it.

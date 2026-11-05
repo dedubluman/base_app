@@ -8,8 +8,9 @@ Reference reel "How to recover bad visibility": 1. Curves, 2. White balance,
   b. global WB         green cast out, water to deep cyan-blue
   c. diver lift        SAM 3.1 diver matte; shadow-weighted gain, "balanced"
   d. skin colour       skin = diver matte minus SAM 3.1 part masks (hair,
-                       shorts, fins); chroma to Mediterranean tan #C68B59,
-                       luminance texture kept, L nudged
+                       shorts, fins) and the dive mask; surface skin #E8B896
+                       seen through the estimated water path (red absorbed
+                       first), applied as an a*b*/L offset so texture stays
   e. separation        diver a little warmer/more saturated, water a little
                        less saturated
 
@@ -35,11 +36,17 @@ from shades.io import Encoder, iter_frames, probe
 REPO = Path(__file__).resolve().parent
 LUMA = np.array([0.2126, 0.7152, 0.0722], np.float32)
 
-SKIN_HEX = "#C68B59"          # Mediterranean tan
+SKIN_HEX = "#E8B896"          # light-warm skin, as it would look at the surface
 LIFT_TARGET = 0.27            # "balanced": median diver luma after the lift
 LIFT_MAX = 2.6
-SKIN_CHROMA = 0.55            # share of the (target - frame median) a*/b* shift
-SKIN_L_NUDGE = 0.20           # how far the skin's mean L moves to the target
+SKIN_CHROMA = 0.6             # share of the (depth target - frame median) a*/b* shift
+SKIN_L_NUDGE = 0.15           # share of the L difference
+# physical absorption: per-metre attenuation R, G, B and veiling-light share
+K_ABS = np.array([0.40, 0.075, 0.035], np.float32)
+VEIL = 0.45
+# water path from the red loss on the diver (source R/G), calibrated on the
+# clip itself: the 95th-percentile R/G frame is D_MIN, the 5th is D_MAX
+D_MIN, D_MAX = 1.0, 5.0
 
 # a. curves (same points as the approved ffmpeg preview)
 _MASTER = PchipInterpolator([0, .06, .30, .70, 1], [0, .02, .30, .76, 1])
@@ -90,6 +97,36 @@ def hex_lab(h):
 
 
 TARGET = hex_lab(SKIN_HEX)
+SKIN_RGB = np.array([int(SKIN_HEX[i:i + 2], 16) for i in (1, 3, 5)], np.float32) / 255
+
+
+def depth_m(rg, rg_shallow, rg_deep):
+    """Water path (m) from the diver's source R/G ratio (more red lost = deeper)."""
+    t = np.clip((rg_shallow - rg) / max(rg_shallow - rg_deep, 1e-3), 0, 1)
+    return D_MIN + (D_MAX - D_MIN) * t
+
+
+def skin_at_depth(d, water):
+    """Surface skin colour seen through d metres of water (RGB 0..1)."""
+    t = np.exp(-K_ABS * d)
+    return np.clip(SKIN_RGB * t + np.asarray(water, np.float32) * (1 - t) * VEIL, 0, 1)
+
+
+def goggles(x, dm):
+    """Dive-mask lens/strap: dark, low-chroma pixels in the head (top 30% of the
+    diver's box). No SAM 3.1 text prompt finds it on this clip."""
+    ys, xs = np.nonzero(dm)
+    if len(ys) < 500:
+        return np.zeros(dm.shape, bool)
+    top = ys.min() + 0.30 * (ys.max() - ys.min())
+    head = dm.copy()
+    head[int(top):] = False
+    if head.sum() < 100:
+        return np.zeros(dm.shape, bool)
+    L = luma(x)
+    dark = L < 0.6 * np.median(L[head])
+    g = cv2.morphologyEx((dark & head).astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    return cv2.dilate(g, np.ones((5, 5), np.uint8)) > 0
 
 
 def gsmooth(v, sigma):
@@ -135,46 +172,71 @@ def main() -> int:
     part_al.pop("bubbles", None)
     print(f"[mask] parts: {sorted(part_al)}", flush=True)
 
-    def skin_alpha(i):
+    def skin_alpha(i, x):
         s = al[i].astype(np.float32) / 255
         for v in part_al.values():
             s = s * (1 - v[i].astype(np.float32) / 255)
-        return s
+        s = s * (1 - goggles(x, al[i] > 127))
+        # ~3 px wider feather than the diver matte: skin melts into the water
+        return cv2.GaussianBlur(s, (0, 0), 3.0) * (al[i].astype(np.float32) / 255)
 
-    # pass 1: per-frame lift gain and skin L offset, smoothed over time
+    # pass 1: per frame - lift gain, water path d (red loss on the source
+    # skin), water colour around the diver; all smoothed over time
     gains = np.full(n, np.nan, np.float32)
-    loffs = np.full(n, np.nan, np.float32)
-    aoffs = np.full((n, 2), np.nan, np.float32)
+    depth = np.full(n, np.nan, np.float32)
+    water = np.full((n, 3), np.nan, np.float32)
+    k41 = np.ones((41, 41), np.uint8)
     for i, x in enumerate(iter_frames(a.input, info)):
         core = al[i] > 200
         if core.sum() < 500:
             continue
-        y = global_grade(x[::2, ::2])
-        c2 = core[::2, ::2]
+        xs, c2 = x[::2, ::2], core[::2, ::2]
+        y = global_grade(xs)
         med = float(np.median(luma(y)[c2]))
-        g = float(np.clip(LIFT_TARGET / max(med, 1e-3), 1.0, LIFT_MAX))
-        gains[i] = g
-        sk = skin_alpha(i)[::2, ::2] > 0.8
+        gains[i] = float(np.clip(LIFT_TARGET / max(med, 1e-3), 1.0, LIFT_MAX))
+        ring = (cv2.dilate(c2.astype(np.uint8), k41) > 0) & ~c2
+        water[i] = np.median(y[ring], 0)
+        sk = skin_alpha(i, x)[::2, ::2] > 0.8
         if sk.sum() > 200:
-            lab = to_lab(lift(y, g))[sk]
-            loffs[i] = SKIN_L_NUDGE * (TARGET[0] - float(np.median(lab[:, 0])))
-            aoffs[i] = SKIN_CHROMA * (TARGET[1:] - np.median(lab[:, 1:], 0))
-    gains, loffs = gsmooth(gains, 8.0), gsmooth(loffs, 8.0)
+            m = np.median(xs[sk], 0)
+            depth[i] = m[0] / max(m[1], 1e-4)          # R/G for now
+    ok = ~np.isnan(depth)
+    rg_sh, rg_dp = np.percentile(depth[ok], 95), np.percentile(depth[ok], 5)
+    depth[ok] = depth_m(depth[ok], rg_sh, rg_dp)
+    print(f"[depth] source skin R/G {rg_dp:.2f} (deep, {D_MAX} m) .. {rg_sh:.2f} (shallow, {D_MIN} m)", flush=True)
+    gains, depth = gsmooth(gains, 8.0), gsmooth(depth, 8.0)
+    water = np.stack([gsmooth(water[:, c], 8.0) for c in range(3)], 1)
+    print(f"[lift] gain {gains.min():.2f}-{gains.max():.2f}; water path "
+          f"{depth.min():.2f}-{depth.max():.2f} m", flush=True)
+
+    # pass 2: per-frame skin target at that depth -> offsets on the lifted skin
+    loffs = np.full(n, np.nan, np.float32)
+    aoffs = np.full((n, 2), np.nan, np.float32)
+    targets = np.zeros((n, 3), np.float32)
+    for i, x in enumerate(iter_frames(a.input, info)):
+        targets[i] = to_lab(skin_at_depth(float(depth[i]), water[i])[None, None])[0, 0]
+        sk = skin_alpha(i, x)[::2, ::2] > 0.8
+        if sk.sum() > 200:
+            lab = to_lab(lift(global_grade(x[::2, ::2]), float(gains[i])))[sk]
+            med = np.median(lab, 0)
+            loffs[i] = SKIN_L_NUDGE * (targets[i][0] - med[0])
+            aoffs[i] = SKIN_CHROMA * (targets[i][1:] - med[1:])
+    loffs = gsmooth(loffs, 8.0)
     aoffs = np.stack([gsmooth(aoffs[:, c], 8.0) for c in range(2)], 1)
-    print(f"[lift] gain {gains.min():.2f}-{gains.max():.2f}; skin L offset "
-          f"{loffs.min():.1f}-{loffs.max():.1f}; a*b* offset {np.round(aoffs.mean(0), 1).tolist()}; target Lab {np.round(TARGET, 1).tolist()}", flush=True)
+    print(f"[skin] target Lab shallow {np.round(targets[int(depth.argmin())], 1).tolist()} "
+          f"deep {np.round(targets[int(depth.argmax())], 1).tolist()}", flush=True)
 
     a.output.parent.mkdir(parents=True, exist_ok=True)
     enc = Encoder(a.input, a.output, info, Encode(crf=16, preset="slow", profile="high", dither=True))
     checks = sorted({0, n // 3, 2 * n // 3, int(0.95 * n)})
     skin_means, tiles = [], []
     for i, x in enumerate(iter_frames(a.input, info)):
-        s = skin_alpha(i)
+        s = skin_alpha(i, x)
         y = grade(x, al[i].astype(np.float32) / 255, s, float(gains[i]), float(loffs[i]), aoffs[i])
         enc.write(y)
         m = s > 0.8
         if m.sum() > 200:
-            skin_means.append(np.median(to_lab(y)[m], 0))
+            skin_means.append((i, float(depth[i]), np.median(to_lab(y)[m], 0)))
         if i in checks:
             src8 = (np.clip(x, 0, 1) * 255).astype(np.uint8)[..., ::-1]
             out8 = (np.clip(y, 0, 1) * 255).astype(np.uint8)[..., ::-1]
@@ -189,13 +251,18 @@ def main() -> int:
     enc.close()
     cv2.imwrite(str(qc / f"{stem}_silhouette_check.jpg"), np.vstack(tiles), [cv2.IMWRITE_JPEG_QUALITY, 88])
 
-    sm = np.median(np.array(skin_means), 0) if skin_means else np.full(3, np.nan)
-    de = float(np.linalg.norm(sm - TARGET))
-    de_ab = float(np.linalg.norm(sm[1:] - TARGET[1:]))
+    ds = np.array([d for _, d, _ in skin_means])
+    labs = np.array([l for _, _, l in skin_means])
+    lo, hi_ = ds <= np.percentile(ds, 20), ds >= np.percentile(ds, 80)
+    corr_b = float(np.corrcoef(ds, labs[:, 2])[0, 1]) if ds.std() > 1e-3 else float("nan")
+    jumps = np.abs(np.diff(labs, axis=0)).max(0)
     o = probe(a.output)
-    rep = {"skin_target_hex": SKIN_HEX, "skin_target_lab": np.round(TARGET, 2).tolist(),
-           "skin_measured_lab": np.round(sm, 2).tolist(), "deltaE76": round(de, 2),
-           "deltaE76_chroma_only": round(de_ab, 2),
+    rep = {"skin_surface_hex": SKIN_HEX, "k_abs_per_m": K_ABS.tolist(), "veil": VEIL,
+           "water_path_m": [round(float(depth.min()), 2), round(float(depth.max()), 2)],
+           "skin_lab_shallow": np.round(labs[lo].mean(0), 1).tolist(),
+           "skin_lab_deep": np.round(labs[hi_].mean(0), 1).tolist(),
+           "corr_depth_vs_b": round(corr_b, 3),
+           "max_frame_jump_lab": np.round(jumps, 2).tolist(),
            "lift_gain_range": [round(float(gains.min()), 2), round(float(gains.max()), 2)],
            "frames_with_skin": len(skin_means), "parts": sorted(part_al),
            "out": {"w": o.width, "h": o.height, "fps": str(o.fps), "frames": o.n_frames, "audio": o.has_audio},
