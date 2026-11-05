@@ -247,7 +247,8 @@ def main():
     ap.add_argument("--stride", type=int, default=2)
     ap.add_argument("--stick-stride", type=int, default=4)
     ap.add_argument("--head-stride", type=int, default=4)
-    ap.add_argument("--end", type=int, default=588)
+    ap.add_argument("--end", type=int, default=579,
+                    help="first frame after the cut (diver and stick gone)")
     ap.add_argument("--checks", type=Path, default=REPO / "output" / "checks")
     ap.add_argument("--check-frames", default="60,270,480,576,660")
     ap.add_argument("--limit", type=int, default=0, help="debug: stop after N frames")
