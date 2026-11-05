@@ -113,7 +113,14 @@ DV = dict(
     contrast=1.0,
     scene_follow=0.45,
     # share of the ambient water light that falls on the body (cohesion)
-    ambient=np.array([0.80, 0.94, 1.06], np.float32), ambient_mix=0.18,       # how much of the background darkening it takes
+    ambient=np.array([0.80, 0.94, 1.06], np.float32), ambient_mix=0.18,
+    # Depth adaptation (depth 0 = surface .. 1 = deep, see diver_depth()):
+    # deeper, the red is only partly restored, more ambient cyan/blue falls
+    # on the skin and the body takes more of the scene darkening.
+    depth_wb_keep=0.45,      # share of the WB correction given up at depth 1
+    depth_ambient=0.32,      # extra ambient mix at depth 1
+    depth_follow=0.30,       # extra scene_follow at depth 1
+    depth_wrap=0.25,         # extra light wrap at depth 1       # how much of the background darkening it takes
 )
 
 # Average colour the diver should have after white balance (skin + white
@@ -130,9 +137,20 @@ def diver_gains(mean_rgb):
     return np.clip(g, *GAIN_LIMITS)
 
 
-def grade_diver(x, grad, gains=None):
+def diver_depth(mean_rgb):
+    """Water between camera/surface and the diver, from the red loss on the
+    diver itself (source colours, before any grade). Measured on this clip:
+    R/G about 0.85 on the sunlit body at the surface, about 0.55 deep in
+    the blue. Returns 0..1."""
+    m = np.maximum(np.asarray(mean_rgb, np.float32), 1e-4)
+    return float(np.clip((0.85 - m[0] / m[1]) / 0.30, 0, 1))
+
+
+def grade_diver(x, grad, gains=None, depth=0.0):
     p = DV
-    x = x * (p["gains"] if gains is None else gains)
+    g = p["gains"] if gains is None else gains
+    g = 1 + (g - 1) * (1 - p["depth_wb_keep"] * depth)
+    x = x * g
     y = luma(x)[..., None]
     k_hi = smoothstep(p["hi_lo"], p["hi_hi"], y)
     k_dark = 1 - smoothstep(p["dark_lo"], p["dark_hi"], y)
@@ -147,8 +165,10 @@ def grade_diver(x, grad, gains=None):
     x = (x - 0.45) * p["contrast"] + 0.45
     # 4. sit in the scene: some of the cool ambient water light on the body,
     #    and a share of the scene darkening
-    x = x * (1 + (p["ambient"] - 1) * p["ambient_mix"])
-    x = x * p["exposure"] * (1 - p["scene_follow"] + p["scene_follow"] * grad)
+    amb = p["ambient_mix"] + p["depth_ambient"] * depth
+    x = x * (1 + (p["ambient"] - 1) * amb)
+    fol = p["scene_follow"] + p["depth_follow"] * depth
+    x = x * p["exposure"] * (1 - fol + fol * grad)
     return np.clip(x, 0, 1)
 
 
@@ -164,13 +184,13 @@ def finish(x):
     return np.clip(x, 0, 1)
 
 
-def grade_frame(rgb, alpha, grad, gains=None):
+def grade_frame(rgb, alpha, grad, gains=None, depth=0.0):
     """rgb float 0..1 HxWx3, alpha float 0..1 HxW (diver), grad HxWx1,
     gains: per-frame diver white balance (diver_gains), None = DV["gains"]."""
     import cv2
 
     bg = grade_background(rgb, grad)
-    dv = grade_diver(rgb, grad, gains)
+    dv = grade_diver(rgb, grad, gains, depth)
     a = alpha[..., None]
     comp = bg * (1 - a) + dv * a
     if alpha.max() > 0:
@@ -179,5 +199,5 @@ def grade_frame(rgb, alpha, grad, gains=None):
         ab = cv2.GaussianBlur(alpha, (0, 0), 4.0)
         ring = np.clip((alpha - ab) * 2.5, 0, 1)[..., None]
         bgb = cv2.GaussianBlur(bg, (0, 0), 6.0)
-        comp = comp + (bgb - comp) * (0.35 * ring)
+        comp = comp + (bgb - comp) * ((0.35 + DV["depth_wrap"] * depth) * ring)
     return finish(comp)

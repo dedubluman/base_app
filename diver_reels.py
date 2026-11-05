@@ -142,17 +142,25 @@ def main() -> int:
     ok = ~np.isnan(means[:, 0])
     for i in np.nonzero(ok)[0]:
         gains[i] = R.diver_gains(means[i])
+    depth = np.array([R.diver_depth(m) if o else np.nan for m, o in zip(means, ok)], np.float32)
     t = np.arange(n)
-    for c in range(3):  # fill frames without a usable diver, then smooth
-        gains[:, c] = np.interp(t, t[ok], gains[ok, c]) if ok.any() else R.DV["gains"][c]
-    k = np.exp(-0.5 * (np.arange(-30, 31) / 10.0) ** 2); k /= k.sum()
-    gains = np.stack([np.convolve(np.pad(gains[:, c], 30, mode="edge"), k, "valid")
-                      for c in range(3)], 1).astype(np.float32)
-    for r, g in zip(report, gains):
+
+    def smooth(v, fallback, sigma):
+        v = np.interp(t, t[ok], v[ok]) if ok.any() else np.full(n, fallback, np.float32)
+        r = int(3 * sigma)
+        k = np.exp(-0.5 * (np.arange(-r, r + 1) / sigma) ** 2)
+        return np.convolve(np.pad(v, r, mode="edge"), k / k.sum(), "valid").astype(np.float32)
+
+    # fill frames without a usable diver, then smooth (WB 10 frames, depth 15)
+    gains = np.stack([smooth(gains[:, c], R.DV["gains"][c], 10.0) for c in range(3)], 1)
+    depth = smooth(depth, 0.0, 15.0)
+    for r, g, d in zip(report, gains, depth):
         r["gains"] = [round(float(v), 3) for v in g]
+        r["depth"] = round(float(d), 3)
     (qc / f"{stem}_mask_report.json").write_text(json.dumps(report, indent=0))
     print(f"[wb] diver gains R {gains[:, 0].min():.2f}-{gains[:, 0].max():.2f}, "
-          f"B {gains[:, 2].min():.2f}-{gains[:, 2].max():.2f}", flush=True)
+          f"B {gains[:, 2].min():.2f}-{gains[:, 2].max():.2f}; depth "
+          f"{depth.min():.2f}-{depth.max():.2f}", flush=True)
 
     grad = R.vertical_gradient(h, w, R.BG["grad_top"], R.BG["grad_bottom"], R.BG["grad_gamma"])
     sheet_idx = sorted(set([0, n - 1] + list(range(0, n, int(round(2 * float(info.fps)))))))
@@ -163,10 +171,12 @@ def main() -> int:
         # silent delivery: the encoder copies audio only if the info says so
         enc = Encoder(a.input, a.output, dataclasses.replace(info, has_audio=False),
                       Encode(crf=16, preset="slow", profile="high", dither=True))
+    lum = []
     for i, x in enumerate(iter_frames(a.input, info)):
         if a.qc and i not in sheet_idx:
             continue
-        y = R.grade_frame(x, al[i].astype(np.float32) / 255, grad, gains[i])
+        y = R.grade_frame(x, al[i].astype(np.float32) / 255, grad, gains[i], float(depth[i]))
+        lum.append((i, float(R.luma(y[::4, ::4]).mean())))
         if enc is not None:
             enc.write(y)  # TPDF-dithered, BT.709 H.264
         if i in sheet_idx:
@@ -193,6 +203,11 @@ def main() -> int:
     cv2.imwrite(str(qc / f"{stem}_mask_overlay.jpg"), grid(ov_tiles, 3), [cv2.IMWRITE_JPEG_QUALITY, 85])
     cv2.imwrite(str(qc / f"{stem}_before_after.jpg"), grid(ba_tiles, 2), [cv2.IMWRITE_JPEG_QUALITY, 85])
     print(f"[qc] sheets in {qc}", flush=True)
+    if len(lum) > 1 and not a.qc:
+        jumps = np.abs(np.diff([v for _, v in lum]))
+        print(f"[qc] mean luma {min(v for _, v in lum):.3f}-{max(v for _, v in lum):.3f}, "
+              f"max frame-to-frame jump {jumps.max():.4f} at frame {lum[int(jumps.argmax()) + 1][0]}",
+              flush=True)
     if enc is not None:
         o = probe(a.output)
         print(f"[out] {a.output}: {o.width}x{o.height} {o.fps} fps, {o.n_frames} frames "
