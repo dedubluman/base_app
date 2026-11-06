@@ -150,14 +150,17 @@ class Grader:
         t = np.clip((L - lo) / max(hi - lo, 1e-3), 0, 1)
         # local skin detail (chromatophore pattern) kept and slightly boosted
         d = L - gblur(L, 3)
-        t = np.clip(t + 2.0 * d / max(hi - lo, 1e-3), 0, 1)
+        t = np.clip(t + 1.6 * d / max(hi - lo, 1e-3), 0, 1)
+        # keep pale animals saturated: top of the range stays electric cyan,
+        # never white
+        t = 0.06 + 0.74 * t ** 1.15
         # iridescence: violet in the darker pattern and toward the fin edges,
         # electric blue/cyan on the lit mantle
         edge = 1 - np.clip(gblur(alpha, 3) * 1.4, 0, 1)
-        mix = np.clip(0.55 * (1 - t) + 0.9 * edge, 0, 1)[..., None]
+        mix = np.clip(0.15 + 0.6 * (1 - t) + 0.9 * edge, 0, 1)[..., None]
         col = gradient_map(t, CUTTLE_BLUE) * (1 - mix) + gradient_map(t, CUTTLE_VIOLET) * mix
         # luminous core: a gentle self-glow lift on the brightest skin
-        col = col + 0.18 * (t ** 3)[..., None] * hexrgb("#7FEFFF")
+        col = col + 0.22 * (t ** 3)[..., None] * hexrgb("#7FEFFF")
         return np.clip(col, 0, 1)
 
 
