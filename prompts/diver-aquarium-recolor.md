@@ -6,7 +6,7 @@ inputs/diver.mov: 1232x1078, 29.97 fps, 172 decoded frames (the container report
 
 <approved_look>
 The user picked these from side-by-side sheets (output/qc/diver_ten_secenekleri_60.jpg, output/qc/diver_parca_renkleri_110.jpg):
-- Skin: "D - Koyu karamel" #9A633E at the skin's median brightness; every pixel keeps its shading relative to that median.
+- Skin: "B - Dogal bronz" #D49A72 at the skin's median brightness (the user first chose "D - Koyu karamel" #9A633E, then switched to B); every pixel keeps its shading relative to that median.
 - Parts: scheme "1 - Dogal belirgin": hair dark chestnut #3A2A1F, dive-mask frame/skirt charcoal #1C1E22, fins navy #1E3A6E.
 - Background: vivid aquarium look (aquarium_grade.AQ): dehazed, clear turquoise-blue water, warm clean sand, a little red back on the rocks, large-radius clarity, no navy crush.
 </approved_look>
@@ -21,7 +21,7 @@ The user picked these from side-by-side sheets (output/qc/diver_ten_secenekleri_
 </rules>
 
 <task>
-python diver_recolor.py --input inputs/diver.mov --skin D --scheme 1 --output output/diver_aquarium.mp4
+python diver_recolor.py --input inputs/diver.mov --skin B --scheme 1 --output output/diver_aquarium_bronz.mp4
 Then view output/qc/diver_aquarium_before_after.jpg before you report.
 </task>
 
