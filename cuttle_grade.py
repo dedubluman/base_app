@@ -144,10 +144,13 @@ class Grader:
         out[y0:y1, x0:x1] = a
         return out
 
-    def cuttle(self, rgb, alpha, lvl):
+    def cuttle(self, rgb, alpha, lvl, offset=0.0):
         L = luma(rgb)
         lo, hi = lvl
-        t = np.clip((L - lo) / max(hi - lo, 1e-3), 0, 1)
+        # offset: temporal stabiliser (smoothed minus raw mean tone of this
+        # animal), removes frame-to-frame brightness shimmer the 3x contrast
+        # expansion would otherwise amplify from the 8-bit source
+        t = np.clip((L - lo) / max(hi - lo, 1e-3) + offset, 0, 1)
         # local skin detail (chromatophore pattern) kept and slightly boosted
         d = L - gblur(L, 3)
         t = np.clip(t + 1.6 * d / max(hi - lo, 1e-3), 0, 1)
@@ -168,7 +171,7 @@ def levels_for(rgb, alpha):
     L = luma(rgb)[alpha > 0.6]
     if L.size < 20:
         return None
-    return np.percentile(L, 3), np.percentile(L, 99)
+    return np.percentile(L, 3), np.percentile(L, 99), float(L.mean())
 
 
 def smooth(series, k=15):
@@ -209,6 +212,44 @@ def load_masks(mdir, n):
     return objs
 
 
+def shift(m, dx, dy):
+    M = np.float32([[1, 0, dx], [0, 1, dy]])
+    return cv2.warpAffine(m.astype(np.float32), M, (W, H), flags=cv2.INTER_LINEAR)
+
+
+def repair_masks(fr, tol=0.25, log=print):
+    """Load an object's masks; any frame whose area is off by more than `tol`
+    from the median of its +-3 neighbours is a SAM failure (e.g. a mask that
+    bloats into the water for one frame). It is rebuilt from the nearest good
+    masks before and after, each moved to the interpolated centroid."""
+    idx = sorted(fr)
+    masks = {i: cv2.imread(str(fr[i]), 0) > 127 for i in idx}
+    area = {i: masks[i].sum() for i in idx}
+    bad = set()
+    for k, i in enumerate(idx):
+        nb = [area[j] for j in idx[max(k - 3, 0):k + 4] if j != i]
+        if nb and abs(area[i] / np.median(nb) - 1) > tol:
+            bad.add(i)
+    for i in sorted(bad):
+        prev = max((j for j in idx if j < i and j not in bad), default=None)
+        nxt = min((j for j in idx if j > i and j not in bad), default=None)
+        src = [j for j in (prev, nxt) if j is not None]
+        if not src:
+            continue
+        cs = {j: np.argwhere(masks[j]).mean(0) for j in src}
+        if len(src) == 2:
+            w = (i - prev) / (nxt - prev)
+            tgt = cs[prev] * (1 - w) + cs[nxt] * w
+            acc = sum(shift(masks[j], *(tgt - cs[j])[::-1]) * (1 - abs(i - j) / (nxt - prev))
+                      for j in src)
+        else:
+            acc = masks[src[0]].astype(np.float32)
+        new = acc > 0.5
+        log(f"  repaired frame {i}: area {area[i]} -> {new.sum()}")
+        masks[i] = new
+    return masks, sorted(bad)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", type=Path, required=True)
@@ -218,6 +259,7 @@ def main():
     ap.add_argument("--stills", type=Path)
     ap.add_argument("--min-frames", type=int, default=10,
                     help="drop SAM objects seen on fewer frames (spurious)")
+    ap.add_argument("--exclude", default="", help="comma list of SAM ids that are not cuttlefish")
     a = ap.parse_args()
 
     stats_f = a.input.with_suffix(".stats.json")
@@ -229,24 +271,35 @@ def main():
     G = Grader(json.loads(stats_f.read_text()))
 
     objs = load_masks(a.masks, 0) if a.masks else {}
-    objs = {g: v for g, v in objs.items() if len(v) >= a.min_frames}
+    ex = {int(x) for x in a.exclude.split(",") if x}
+    objs = {g: v for g, v in objs.items() if len(v) >= a.min_frames and g not in ex}
+    repaired = {}
+    for g in list(objs):
+        print(f"object {g}: {len(objs[g])} frames")
+        objs[g], repaired[g] = repair_masks(objs[g])
     want = set(map(int, a.frames.split(","))) if a.frames else None
 
     # pass 1: per-animal levels, smoothed over time
-    levels = {}
+    levels, offsets = {}, {}
     if objs:
         n = int(subprocess.check_output(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v",
                                          "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0",
                                          str(a.input)]).strip())
-        raw = {g: [[np.nan, np.nan]] * n for g in objs}
+        raw = {g: [[np.nan, np.nan, np.nan]] * n for g in objs}
         for i, f in enumerate(read_frames(a.input)):
             for g, fr in objs.items():
                 if i in fr:
-                    m = cv2.imread(str(fr[i]), 0) > 127
+                    m = fr[i]
                     lv = levels_for(f, m.astype(np.float32))
                     if lv:
                         raw[g][i] = list(lv)
-        levels = {g: smooth(v) for g, v in raw.items()}
+        levels, offsets = {}, {}
+        for g, v in raw.items():
+            v = np.array(v, np.float64)
+            lv = smooth(v[:, :2])
+            tm = (smooth(v[:, 2:3], k=0)[:, 0] - lv[:, 0]) / np.maximum(lv[:, 1] - lv[:, 0], 1e-3)
+            levels[g] = lv
+            offsets[g] = smooth(tm[:, None], k=3)[:, 0] - tm
 
     enc = None
     if a.output and not want:
@@ -269,9 +322,9 @@ def main():
         for g, fr in objs.items():
             if i not in fr:
                 continue
-            m = cv2.imread(str(fr[i]), 0) > 127
+            m = fr[i]
             al = G.cuttle_alpha(Lsrc, m)
-            col = G.cuttle(f, al, levels[g][i])
+            col = G.cuttle(f, al, levels[g][i], offsets[g][i])
             out = out * (1 - al[..., None]) + col * al[..., None]
             amax = np.maximum(amax, al)
         if want:
