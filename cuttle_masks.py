@@ -48,6 +48,10 @@ def main() -> int:
     ap.add_argument("--crop-y", type=int, default=None,
                     help="feed SAM a square WxW crop starting at this row (no aspect squash, "
                          "small animals stay larger); masks are pasted back at full frame")
+    ap.add_argument("--crop-x", type=int, default=0, help="left edge of the crop (with --crop-y)")
+    ap.add_argument("--crop-size", type=int, default=None,
+                    help="side of the square crop (default: frame width); a tighter crop "
+                         "gives SAM more pixels on a small subject such as thin fin rays")
     a = ap.parse_args()
 
     cache = REPO / ".cache"
@@ -59,15 +63,16 @@ def main() -> int:
         extract_jpeg_frames(a.input, full_dir, cfg.jpeg_quality)
     n_all = len(list(full_dir.glob("*.jpg")))
     h, w = cv2.imread(str(full_dir / "00000.jpg")).shape[:2]
-    frames_dir, cy = full_dir, 0
+    frames_dir, cy, cx = full_dir, 0, 0
     if a.crop_y is not None:
-        cy = a.crop_y
-        frames_dir = cache / f"sam_frames_{a.input.stem}_crop{cy}"
+        cy, cx = a.crop_y, a.crop_x
+        cs = a.crop_size or w
+        frames_dir = cache / f"sam_frames_{a.input.stem}_crop{cx}_{cy}_{cs}"
         if not frames_dir.exists():
             import subprocess
             frames_dir.mkdir()
             subprocess.run(["ffmpeg", "-v", "error", "-i", str(a.input), "-fps_mode", "passthrough",
-                            "-vf", f"crop={w}:{w}:0:{cy}", "-q:v", "2", "-start_number", "0",
+                            "-vf", f"crop={cs}:{cs}:{cx}:{cy}", "-q:v", "2", "-start_number", "0",
                             str(frames_dir / "%05d.jpg")], check=True)
     end = a.end or n_all
     print(f"[sam] {n_all} frames {w}x{h}; processing {a.start}-{end - 1}", flush=True)
@@ -110,9 +115,9 @@ def main() -> int:
             pr = list(o.get("out_probs", [])) or [None] * len(o["out_obj_ids"])
             for oid, m, p in zip(o["out_obj_ids"], o["out_binary_masks"], pr):
                 m = np.asarray(m) > 0
-                if cy or m.shape[0] != h:
+                if cy or cx or m.shape[0] != h:
                     full = np.zeros((h, w), bool)
-                    full[cy:cy + m.shape[0], :m.shape[1]] = m
+                    full[cy:cy + m.shape[0], cx:cx + m.shape[1]] = m
                     m = full
                 if m.any():
                     local.setdefault(int(oid), {})[fi] = m
@@ -156,7 +161,7 @@ def main() -> int:
                                     "median_area": float(np.median([m.sum() for m in G[g].values()])),
                                     "prob": {str(f): p for f, p in sorted(P[g].items())}}
                            for g in G}
-        meta.update(crop_y=cy, num_frames=n_all, width=w, height=h, prompt=a.prompt,
+        meta.update(crop_y=cy, crop_x=cx, num_frames=n_all, width=w, height=h, prompt=a.prompt,
                     device="cuda" if on_gpu else "cpu")
         meta_f.write_text(json.dumps(meta, indent=1))
         del local

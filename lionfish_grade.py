@@ -53,46 +53,69 @@ def ramp(t, pts):
 
 
 # ---------------------------------------------------------------- masks ----
-def index_objects(mask_dirs):
+def index_objects(mask_dirs, tags="AB"):
     objs = {}
-    for tag, d in enumerate(mask_dirs):
+    for tag, d in zip(tags, mask_dirs):
         for od in sorted(Path(d).glob("obj_*")):
             m = {int(p.stem): p for p in od.glob("*.png")}
             if m:
-                objs[f"{'AB'[tag]}{od.name[4:]}"] = (tag, m)
+                objs[f"{tag}{od.name[4:]}"] = (tag, m)
     return objs
 
 
-def load_mask(path, cy, h, w):
+def load_mask(path, crop, h, w):
+    """crop = (x, y) of the crop the SAM run saw (full frame -> (0, 0))."""
     a = cv2.imread(str(path), 0) > 127
-    if a.shape[0] != h:
+    if a.shape[0] != h or a.shape[1] != w:
         full = np.zeros((h, w), bool)
-        full[cy:cy + a.shape[0], :a.shape[1]] = a
+        cx, cy = crop
+        full[cy:cy + a.shape[0], cx:cx + a.shape[1]] = a
         a = full
     return a
 
 
-def build_union_masks(objs, crop_ys, h, w, out_dir, min_frames=6, iou_t=0.3):
+def _small(path, crop, h, w, q=4):
+    return cv2.resize(load_mask(path, crop, h, w).astype(np.uint8), (w // q, h // q),
+                      interpolation=cv2.INTER_AREA) > 0
+
+
+def build_union_masks(objs, crops, h, w, out_dir, min_frames=6, iou_t=0.3):
+    """objs: {name: (tag, {frame: png})}; crops: {tag: (x, y)}.
+    Tag 'L' = the tight-crop lionfish run: if present it IS the lionfish
+    (finer fin rays); the coarse full-crop lionfish detections are only a
+    per-frame fallback where the tight run lost it."""
     q = 4
-    sm = {n: {f: cv2.resize(load_mask(p, crop_ys[tag], h, w).astype(np.uint8), (w // q, h // q),
-                            interpolation=cv2.INTER_AREA) > 0
-              for f, p in list(fr.items())[::8]}
+    lion_names = [n for n, (t, fr) in objs.items() if t == "L" and len(fr) >= min_frames]
+    sm = {n: {f: _small(p, crops[tag], h, w) for f, p in list(fr.items())[::8]}
           for n, (tag, fr) in objs.items() if len(fr) >= min_frames}
     area = {n: np.median([m.sum() for m in v.values()]) for n, v in sm.items()}
-    names = sorted(sm, key=lambda k: -area[k])
+
+    def iou(a, b):
+        sh = [f for f in sm[a] if f in sm[b]]
+        return np.mean([(sm[a][f] & sm[b][f]).sum() / max((sm[a][f] | sm[b][f]).sum(), 1)
+                        for f in sh]) if sh else 0.0
+
+    names = sorted([n for n in sm if objs[n][0] != "L"], key=lambda k: -area[k])
     groups = []
     for n in names:
         for g in groups:
-            sh = [f for f in sm[n] if f in sm[g[0]]]
-            if sh and np.mean([(sm[n][f] & sm[g[0]][f]).sum() /
-                               max((sm[n][f] | sm[g[0]][f]).sum(), 1) for f in sh]) > iou_t:
+            if iou(n, g[0]) > iou_t:
                 g.append(n)
                 break
         else:
             groups.append([n])
-    print(f"[masks] {len(groups)} fish identities; lionfish = {groups[0]}", flush=True)
+    fallback = []
+    if lion_names:
+        lion = max(lion_names, key=lambda k: area[k])
+        for g in list(groups):
+            if iou(g[0], lion) > iou_t:
+                fallback = g
+                groups.remove(g)
+        groups = [[lion]] + groups
+    print(f"[masks] {len(groups)} fish identities; lionfish = {groups[0]} "
+          f"(coarse fallback {fallback})", flush=True)
     out_dir.mkdir(parents=True, exist_ok=True)
-    frames = sorted({f for n in names for f in objs[n][1]})
+    frames = sorted({f for g in groups for n in g for f in objs[n][1]})
     areas = {gi: {} for gi in range(len(groups))}
     for f in frames:
         allm = np.zeros((h, w), bool)
@@ -103,7 +126,12 @@ def build_union_masks(objs, crop_ys, h, w, out_dir, min_frames=6, iou_t=0.3):
             for n in g:
                 tag, fr = objs[n]
                 if f in fr:
-                    gm |= load_mask(fr[f], crop_ys[tag], h, w)
+                    gm |= load_mask(fr[f], crops[tag], h, w)
+            if gi == 0 and not gm.any():
+                for n in fallback:
+                    tag, fr = objs[n]
+                    if f in fr:
+                        gm |= load_mask(fr[f], crops[tag], h, w)
             if gm.any():
                 areas[gi][f] = int(gm.sum())
                 allm |= gm
@@ -248,24 +276,26 @@ def snap_regions(mask, rgb):
 
 
 # ---------------------------------------------------------------- grade ----
-# lionfish: signed relative luminance vs the local water (s) -> colour
+# lionfish: signed relative luminance vs the local water (s) -> colour.
+# Crimson / scarlet dominate; amber and gold are reserved for the brightest
+# membrane only. Blacks are lifted to burgundy so the dark patterns keep detail.
 LION_RAMP = [
-    (-0.75, 0.050, 0.008, 0.012),   # burgundy-black (rays, gaps, deep body)
-    (-0.50, 0.260, 0.020, 0.030),   # dark burgundy
-    (-0.28, 0.620, 0.050, 0.035),   # deep crimson
-    (-0.08, 0.900, 0.150, 0.040),   # fiery red
-    (0.08, 1.000, 0.300, 0.050),    # red-orange (translucent fin membrane)
-    (0.25, 1.000, 0.470, 0.080),    # intense orange
-    (0.55, 1.000, 0.650, 0.160),    # amber
-    (1.00, 1.000, 0.800, 0.340),    # golden highlight
+    (-0.75, 0.100, 0.014, 0.026),   # deep burgundy (not crushed black)
+    (-0.50, 0.340, 0.028, 0.050),   # burgundy-crimson
+    (-0.30, 0.700, 0.055, 0.075),   # deep crimson
+    (-0.12, 0.900, 0.110, 0.060),   # scarlet
+    (0.04, 1.000, 0.260, 0.060),    # red-orange
+    (0.22, 1.000, 0.400, 0.085),    # fiery orange
+    (0.50, 1.000, 0.540, 0.130),    # amber
+    (1.00, 1.000, 0.660, 0.220),    # restrained golden highlight
 ]
 # other fish: own-tone normalised (0..1) -> natural blue / silver / olive / gold
 FISH_RAMP = [
-    (0.00, 0.020, 0.060, 0.085),
-    (0.30, 0.140, 0.340, 0.430),
-    (0.62, 0.620, 0.700, 0.560),
-    (0.85, 0.900, 0.860, 0.520),
-    (1.00, 1.000, 0.950, 0.680),
+    (0.00, 0.030, 0.090, 0.130),
+    (0.30, 0.140, 0.380, 0.500),
+    (0.62, 0.520, 0.680, 0.560),
+    (0.85, 0.860, 0.820, 0.440),
+    (1.00, 1.000, 0.900, 0.580),
 ]
 
 
@@ -283,50 +313,89 @@ def norm_blur(x, w, sigma, scale=4):
     """Normalised blur of x over weight map w (computed at 1/scale res)."""
     h0, w0 = w.shape
     sm = (w0 // scale, h0 // scale)
-    xs = cv2.resize(x * (w[..., None] if x.ndim == 3 else w), sm, interpolation=cv2.INTER_AREA)
-    ws = cv2.resize(w, sm, interpolation=cv2.INTER_AREA)
+    xs = cv2.resize(x * (w[..., None] if x.ndim == 3 else w), sm, interpolation=cv2.INTER_AREA) \
+        if scale > 1 else x * (w[..., None] if x.ndim == 3 else w)
+    ws = cv2.resize(w, sm, interpolation=cv2.INTER_AREA) if scale > 1 else w
     xb = cv2.GaussianBlur(xs, (0, 0), sigma / scale)
     wb = cv2.GaussianBlur(ws, (0, 0), sigma / scale)
     if x.ndim == 3:
         wb = wb[..., None]
     out = xb / np.maximum(wb, 1e-4)
-    return cv2.resize(out, (w0, h0), interpolation=cv2.INTER_CUBIC)
+    return cv2.resize(out, (w0, h0), interpolation=cv2.INTER_CUBIC) if scale > 1 else out
+
+
+def decontaminate(col, region):
+    """Edge decontamination. Colour is only trusted deep inside `region`
+    (mask eroded by 1.5 px); the rim takes the colour of the nearest interior
+    pixels, so water mixed into the edge pixels can never form a pale halo."""
+    inner = cv2.erode(region.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))) > 0
+    if inner.sum() < 20:
+        return col
+    wgt = inner.astype(np.float32)
+    ext = norm_blur(col, wgt, 2.5, scale=1)
+    return np.where(inner[..., None], col, ext)
+
+
+def soft_knee(c, k=0.78, r=0.45):
+    """Highlight roll-off: above k, compress instead of clipping, so bright
+    fin areas keep their ray structure."""
+    return np.where(c > k, k + (c - k) * r, c)
 
 
 def grade_lion(rgb, air, veil, a_lion, a_all):
     j = dehaze(rgb, air, veil, 1.0)
-    lum = luma(j)
-    # local water level: heavy fish-excluded blur, filled under the fish
+    lum = cv2.GaussianBlur(luma(j), (0, 0), 0.8)               # tame luma/chroma noise
     excl = 1 - cv2.dilate(a_all, np.ones((31, 31), np.uint8))
-    bg = norm_blur(lum, excl.astype(np.float32), 40)
-    s = (lum - bg) / (bg + 0.05) - 0.12
-    s = s + 0.95 * (s - cv2.GaussianBlur(s, (0, 0), 3.5))      # fin-ray / pattern micro-contrast
-    col = ramp(np.clip(s, -0.75, 0.6), LION_RAMP)
-    # luminous: soft inner glow of the fish's own colour, only inside its mask
-    glow = cv2.GaussianBlur(col * a_lion[..., None], (0, 0), 10)
-    col = np.clip(col + 0.12 * glow * a_lion[..., None], 0, 1)
-    return col
+    bg = norm_blur(lum, excl.astype(np.float32), 40)           # local water level
+    s = (lum - bg) / (bg + 0.05) - 0.13
+    detail = s - cv2.GaussianBlur(s, (0, 0), 3.5)
+    s = s + 0.45 * detail                                      # restrained micro-contrast
+    col = ramp(np.clip(s, -0.75, 1.0), LION_RAMP)
+    col = col * (1 + 0.55 * np.clip(detail, -0.35, 0.35))[..., None]   # keep rays in bright areas
+    col = np.clip(soft_knee(col), 0, 1)
+    return decontaminate(col, a_lion > 0.5)
 
 
-def grade_fish(rgb, air, veil, a_other, ids, state):
+def grade_fish(rgb, air, veil, a_other, ids, state, bg):
     j = dehaze(rgb, air, veil)
-    l = luma(j)
+    jc = np.clip(j, 0, 1)
+    l = cv2.GaussianBlur(luma(jc), (0, 0), 0.7)
     out = np.zeros_like(rgb)
+    own = np.clip(l[..., None] + (jc - l[..., None]) * 2.4, 0, 1)   # boosted own colour
+    detail = (l - cv2.GaussianBlur(l, (0, 0), 2.0))
     for gid in np.unique(ids[a_other > 0.5]):
         if gid <= 1:
             continue
         m = (ids == gid) & (a_other > 0.3)
         if m.sum() < 30:
             continue
-        lo, hi = np.percentile(l[m], [3, 97])
+        inner = cv2.erode(m.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        mm = inner if inner.sum() > 20 else m
+        lo, med, hi = np.percentile(l[mm], [4, 50, 96])
+        span = max(hi - lo, 0.10)              # never stretch sensor noise of a flat, dark fish
         st = state.get(int(gid))
-        st = (lo, hi) if st is None else (0.88 * st[0] + 0.12 * lo, 0.88 * st[1] + 0.12 * hi)
+        st = (med, span) if st is None else (0.88 * st[0] + 0.12 * med, 0.88 * st[1] + 0.12 * span)
         state[int(gid)] = st
-        tn = np.clip((l - st[0]) / max(st[1] - st[0], 1e-3), 0, 1)
+        tn = np.clip(0.48 + 1.25 * (l - st[0]) / st[1], 0, 1)
         col = ramp(tn, FISH_RAMP)
-        ll = luma(np.clip(j, 0, 1))[..., None]
-        own = np.clip(ll + (np.clip(j, 0, 1) - ll) * 1.6, 0, 1)
-        col = np.clip(0.80 * col + 0.20 * own, 0, 1)
+        col = np.clip(0.62 * col + 0.38 * own, 0, 1)
+        col = col * (1 + 1.4 * np.clip(detail, -0.05, 0.05))[..., None]
+        # visibility: bring each fish to a readable, per-fish-smoothed brightness
+        med = float(np.median(luma(col[mm])))
+        # readable but belonging to its water: brightness relative to the graded
+        # background around this fish (ring), so fish over dark rock stay darker
+        ring = cv2.dilate(m.astype(np.uint8), np.ones((31, 31), np.uint8)) > 0
+        ring &= ~(cv2.dilate(m.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0)
+        ring_l = float(np.median(luma(bg[ring]))) if ring.sum() > 50 else 0.2
+        ring_c = np.median(bg[ring], 0) if ring.sum() > 50 else np.array([0.1, 0.2, 0.25], np.float32)
+        target = float(np.clip(0.10 + 1.7 * ring_l, 0.22, 0.52))
+        g = float(np.clip(target / max(med, 0.04), 0.9, 3.5))
+        gp = state.get(("g", int(gid)))
+        g = g if gp is None else 0.9 * gp + 0.1 * g
+        state[("g", int(gid))] = g
+        col = np.clip(soft_knee(col * g, 0.85, 0.5), 0, 1)
+        col = 0.86 * col + 0.14 * np.clip(ring_c * 1.5, 0, 1)      # ambient water tint: sits in the scene
+        col = decontaminate(col, m)
         out[m] = col[m]
     return out
 
@@ -335,29 +404,32 @@ def grade_bg(rgb, air, a_all, vig):
     excl = 1 - cv2.dilate(a_all, np.ones((9, 9), np.uint8))
     fill = norm_blur(rgb, excl.astype(np.float32), 8, scale=2)
     x = np.where(a_all[..., None] > 0.02, fill, rgb)
-    x = cv2.GaussianBlur(x, (0, 0), 1.3)                       # gentle defocus, texture stays
+    x = cv2.GaussianBlur(x, (0, 0), 1.0)                       # gentle defocus, texture stays
     x = np.clip((x - 0.30 * air) / 0.70, 0, 1)                 # lift the worst of the haze
     l = luma(x)[..., None]
-    x = l + (x - l) * 0.34                                     # desaturate
-    x = x * np.array([0.66, 0.96, 1.04], np.float32)           # petrol / teal
-    x = x ** 1.35 * 0.92                                       # darker, contrast kept
-    x = x + np.array([0.004, 0.016, 0.024], np.float32)        # never crush to pure black
+    x = l + (x - l) * 0.28                                     # desaturate
+    # local contrast first: recovers rock / sand texture before the tone curve
+    x = np.clip(x + 0.55 * (x - cv2.GaussianBlur(x, (0, 0), 9.0)), 0, 1)
+    x = x ** 1.12                                              # keep shadow information
+    x = x / (1 + 0.95 * x * x) * 1.22                          # shoulder: sand compressed, rock lifted
+    x = x * np.array([0.55, 0.84, 1.02], np.float32)           # petrol blue, less cyan
+    x = x * 0.80 + np.array([0.006, 0.018, 0.026], np.float32)
     return np.clip(x * vig[..., None], 0, 1)
 
 
-def make_vignette(h, w, strength=0.80):
+def make_vignette(h, w, strength=0.50):
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    d = np.sqrt(((xx - w * 0.52) / (w * 0.60)) ** 2 + ((yy - h * 0.62) / (h * 0.58)) ** 2)
-    return (1 - strength * smoothstep(0.30, 1.10, d)).astype(np.float32)
+    d = np.sqrt(((xx - w * 0.52) / (w * 0.78)) ** 2 + ((yy - h * 0.60) / (h * 0.70)) ** 2)
+    return (1 - strength * smoothstep(0.45, 1.20, d)).astype(np.float32)
 
 
-def process(rgb, am, al, ids, air, veil, vig, noise, state, grain=0.011):
+def process(rgb, am, al, ids, air, veil, vig, noise, state, grain=0.010):
     a_all = snap_regions(am > 0.5, rgb)
     a_lion = np.minimum(snap_regions(al > 0.5, rgb), a_all)
     a_oth = np.clip(a_all - a_lion, 0, 1)
     bg = grade_bg(rgb, air, a_all, vig)
     lion = grade_lion(rgb, air, veil, a_lion, a_all)
-    fish = grade_fish(rgb, air, veil, a_oth, ids, state)
+    fish = grade_fish(rgb, air, veil, a_oth, ids, state, bg)
     fg = lion * a_lion[..., None] + fish * (1 - a_lion[..., None])
     out = bg * (1 - a_all[..., None]) + fg * a_all[..., None]
     out = out + (noise * grain)[..., None] * (1 - 0.7 * a_all[..., None])
@@ -369,6 +441,9 @@ def main():
     ap.add_argument("--input", type=Path, required=True)
     ap.add_argument("--masks", nargs="+", type=Path, required=True)
     ap.add_argument("--crop-ys", nargs="+", type=int, required=True)
+    ap.add_argument("--lion-masks", type=Path, default=None,
+                    help="SAM 3.1 'lionfish' run on a tight crop (see --lion-crop)")
+    ap.add_argument("--lion-crop", nargs=2, type=int, default=None, metavar=("X", "Y"))
     ap.add_argument("--stride", type=int, default=3)
     ap.add_argument("--workdir", type=Path, required=True)
     ap.add_argument("--output", type=Path, default=None)
@@ -383,7 +458,13 @@ def main():
     h, w = info.height, info.width
     mdir = a.workdir / "union_masks"
     if a.rebuild_masks or not (mdir / "done").exists():
-        build_union_masks(index_objects(a.masks), a.crop_ys, h, w, mdir, a.min_frames)
+        dirs, tags = list(a.masks), "AB"[:len(a.masks)]
+        crops = {t: (0, cy) for t, cy in zip(tags, a.crop_ys)}
+        if a.lion_masks:
+            dirs.append(a.lion_masks)
+            tags += "L"
+            crops["L"] = tuple(a.lion_crop)
+        build_union_masks(index_objects(dirs, tags), crops, h, w, mdir, a.min_frames)
         repair_masks(mdir, a.input, a.stride, h, w)
         (mdir / "done").write_text("1")
     store = MaskStore(mdir)
