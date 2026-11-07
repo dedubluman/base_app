@@ -97,14 +97,10 @@ def main() -> int:
     have = {int(p.stem) for p in files}
     print(f"[matte] {len(have)}/{n} SAM frames", flush=True)
 
-    raw = {}
-    for f in range(n):
-        if f in have:
-            raw[f] = cv2.imread(str(mdir / "fine" / f"{f:05d}.png"), 0) > 127
-
     # --- QC: area outliers vs local median ---
-    areas = np.array([raw[f].sum() if f in raw else 0 for f in range(n)], float)
-    qc = {"missing": [f for f in range(n) if f not in raw], "outliers": []}
+    areas = np.array([(cv2.imread(str(mdir / "fine" / f"{f:05d}.png"), 0) > 127).sum() if f in have else 0
+                      for f in range(n)], float)
+    qc = {"missing": [f for f in range(n) if f not in have], "outliers": []}
     for f in range(n):
         nb = [areas[g] for g in range(max(0, f - 6), min(n, f + 7)) if g != f and areas[g] > 0]
         med = np.median(nb) if nb else 0
@@ -115,19 +111,55 @@ def main() -> int:
 
     # --- per frame clean + guided matte (soft alpha, full frame float) ---
     dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
-    alphas = {}
-    grays = {}
-    prev = None
     k_in = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * a.band_in + 1,) * 2)
     k_out = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * a.band_out + 1,) * 2)
-    bands = {}
+    gx, gy = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32))
+    # --- pass A: temporal 2-of-3 vote of SAM masks (flow-aligned neighbours) ---
+    vdir = mdir / "voted"
+    vdir.mkdir(exist_ok=True)
+    gcache: dict[int, np.ndarray] = {}
+
+    def gray(f):
+        if f not in gcache:
+            gcache[f] = cv2.cvtColor(cv2.imread(str(fdir / f"{f:05d}.jpg")), cv2.COLOR_BGR2GRAY)
+        return gcache[f]
+
+    def sam_f(f):
+        return (cv2.imread(str(mdir / "fine" / f"{f:05d}.png"), 0) > 127).astype(np.float32)
+
+    changed = []
     for f in range(n):
+        if f not in have:
+            continue
+        cur = sam_f(f)
+        votes, nv = cur.copy(), 1
+        for g in (f - 1, f + 1):
+            if 0 <= g < n and g in have:
+                flow = dis.calc(gray(f), gray(g), None)
+                votes += cv2.remap(sam_f(g), gx + flow[..., 0], gy + flow[..., 1], cv2.INTER_LINEAR) > 0.5
+                nv += 1
+        v = votes >= 2 if nv == 3 else cur > 0.5
+        diff = int((v != (cur > 0.5)).sum())
+        changed.append(diff)
+        cv2.imwrite(str(vdir / f"{f:05d}.png"), v.astype(np.uint8) * 255)
+        gcache.pop(f - 1, None)
+    qc["vote_changed_px"] = {"mean": float(np.mean(changed)), "max": int(np.max(changed)),
+                             "max_frame": int(np.argmax(changed))}
+    print(f"[matte] temporal vote: mean {np.mean(changed):.0f} px changed/frame, "
+          f"max {np.max(changed)} @ f{int(np.argmax(changed))}", flush=True)
+    gcache.clear()
+
+    # streaming: only a 3-frame window of alphas / guides lives in RAM
+    alphas, grays, bands = {}, {}, {}
+    state = {"prev": None}
+
+    def compute(f):
         img = cv2.imread(str(fdir / f"{f:05d}.jpg"))
         grays[f] = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        if f not in raw:
-            continue
-        m = clean(raw[f], prev)
-        prev = m
+        if f not in have:
+            return
+        m = clean(cv2.imread(str(vdir / f"{f:05d}.png"), 0) > 127, state["prev"])
+        state["prev"] = m
         ys, xs = np.nonzero(m)
         y0, y1 = max(0, ys.min() - 40), min(H, ys.max() + 41)
         x0, x1 = max(0, xs.min() - 40), min(W, xs.max() + 41)
@@ -136,8 +168,7 @@ def main() -> int:
         core = cv2.erode(mm, k_in) > 0
         outer = cv2.dilate(mm, k_out) > 0
         p = cv2.GaussianBlur(mm.astype(np.float32), (0, 0), 1.0)
-        q = guided_filter_color(I, p, a.r, a.eps)
-        q = np.clip(q, 0, 1)
+        q = np.clip(guided_filter_color(I, p, a.r, a.eps), 0, 1)
         q[core] = 1
         q[~outer] = 0
         al = np.zeros((H, W), np.float32)
@@ -147,51 +178,44 @@ def main() -> int:
         band[y0:y1, x0:x1] = outer & ~core
         bands[f] = band
 
-    # --- temporal: flow-warped neighbour alphas, edge band only ---
     def warp_to(f, g):
-        """alpha of frame g warped into frame f's geometry."""
-        flow = dis.calc(grays[f], grays[g], None)  # f -> g
-        gx, gy = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32))
+        """alpha of frame g warped into frame f's geometry (DIS flow f->g)."""
+        flow = dis.calc(grays[f], grays[g], None)
         return cv2.remap(alphas[g], gx + flow[..., 0], gy + flow[..., 1], cv2.INTER_LINEAR,
                          borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
-    # frames SAM did not return (should be none): flow-warp the nearest SAM matte
-    filled = []
+    stats, filled = [], []
+    compute(0)
+    if n > 1:
+        compute(1)
     for f in range(n):
-        if f in alphas:
-            continue
-        cand = [g for g in alphas if g not in filled]
-        if not cand:
-            continue
-        g = min(cand, key=lambda g: abs(g - f))
-        alphas[f] = warp_to(f, g)
-        bands[f] = bands[g]
-        filled.append(f)
-    qc["flow_filled"] = filled
-    if filled:
-        print(f"[matte] flow-filled frames without SAM output: {filled}", flush=True)
-
-    stats = []
-    for f in range(n):
-        if f not in alphas:
-            continue
+        if f + 1 < n and (f + 1) not in grays:
+            compute(f + 1)
+        if f not in alphas:  # no SAM output (should not happen): warp previous
+            g = f - 1 if (f - 1) in alphas else f + 1
+            if g not in alphas:
+                continue
+            alphas[f], bands[f] = warp_to(f, g), bands[g]
+            filled.append(f)
         al = alphas[f]
         acc, wsum = al.copy(), np.ones_like(al)
+        w = np.where(bands[f], a.temporal, 0).astype(np.float32)
         for g in (f - 1, f + 1):
             if g in alphas:
-                wa = warp_to(f, g)
-                w = np.where(bands[f], a.temporal, 0).astype(np.float32)
-                acc += w * wa
+                acc += w * warp_to(f, g)
                 wsum += w
         out = acc / wsum
         diff = float(np.abs(out - al)[bands[f]].mean()) if bands[f].any() else 0
         stats.append(diff)
         cv2.imwrite(str(odir / f"{f:05d}.png"), np.round(out * 65535).astype(np.uint16))
-        if f % 50 == 0:
+        for d_ in (alphas, grays, bands):
+            d_.pop(f - 1, None)
+        if f % 100 == 0:
             print(f"[matte] {f}/{n} band change {diff:.3f}", flush=True)
+    qc["flow_filled"] = filled
     qc["mean_temporal_band_change"] = float(np.mean(stats))
     (mdir / "matte_qc.json").write_text(json.dumps(qc, indent=1))
-    print(f"[matte] done, {len(alphas)} alphas", flush=True)
+    print(f"[matte] done, {len(stats)} alphas, flow-filled {filled}", flush=True)
     return 0
 
 

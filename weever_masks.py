@@ -66,12 +66,26 @@ def run_session(pred, frame_paths, prompt, points=()):
     for i, p in enumerate(frame_paths):
         (cdir / f"{i:05d}.jpg").symlink_to(p)
     sid = pred.handle_request({"type": "start_session", "resource_path": str(cdir)})["session_id"]
-    pred.handle_request({"type": "add_prompt", "session_id": sid, "frame_index": 0, "text": prompt})
-    for (li, xn, yn, lab, oid) in points:
-        pred.handle_request({"type": "add_prompt", "session_id": sid, "frame_index": int(li),
-                             "points": torch.tensor([[xn, yn]], dtype=torch.float32),
-                             "point_labels": torch.tensor([int(lab)], dtype=torch.int32),
-                             "obj_id": int(oid)})
+    r = pred.handle_request({"type": "add_prompt", "session_id": sid, "frame_index": 0, "text": prompt})
+    ids = list(r.get("outputs", {}).get("out_obj_ids", []))
+    if points:
+        # interactive SAM 3.1 flow: full text propagation first ...
+        for _ in pred.handle_stream_request({"type": "propagate_in_video", "session_id": sid}):
+            pass
+        # ... then refinement of the text-detected fish itself: all clicks of
+        # one frame in a single call (positive on the body, negative on the
+        # cast shadow), on the fish's own object id.
+        fish_id = int(ids[0]) if len(ids) == 1 else 0
+        by_frame: dict[int, list] = {}
+        for (li, xn, yn, lab) in points:
+            by_frame.setdefault(int(li), []).append((xn, yn, lab))
+        for li, pl in sorted(by_frame.items()):
+            pred.handle_request({"type": "add_prompt", "session_id": sid, "frame_index": li,
+                                 "points": torch.tensor([[x, y] for x, y, _ in pl], dtype=torch.float32),
+                                 "point_labels": torch.tensor([lab for *_, lab in pl], dtype=torch.int32),
+                                 "obj_id": fish_id})
+        print(f"[sam]   refine: text ids {ids}, {sum(len(v) for v in by_frame.values())} clicks "
+              f"on {len(by_frame)} frames -> obj {fish_id}", flush=True)
     masks, probs = {}, {}
     for resp in pred.handle_stream_request({"type": "propagate_in_video", "session_id": sid}):
         fi = int(resp["frame_index"])
@@ -170,7 +184,7 @@ def main() -> int:
     # ---------------- fine pass ----------------
     end = a.end or n
     mf = out / "meta.json"
-    meta = json.loads(mf.read_text()) if (mf.exists() and a.start > 0) else {"chunks": [], "frames": {}}
+    meta = json.loads(mf.read_text()) if mf.exists() else {"chunks": [], "frames": {}}
     have = {int(p.stem) for p in (out / "fine").glob("*.png")} if a.start > 0 else set()
     prev: dict[int, np.ndarray] = {}
     for f in range(max(0, a.start - a.overlap), a.start):
@@ -187,7 +201,7 @@ def main() -> int:
     for ci, (cs, ce) in enumerate(_chunks(end - a.start, a.chunk, a.overlap)):
         cs, ce = cs + a.start, ce + a.start
         t0 = time.time()
-        cpts = [(f - cs, x / a.win, (y - wy[f]) / a.win, lab, 1000)
+        cpts = [(f - cs, (x - wx) / a.win, (y - wy[f]) / a.win, lab)
                 for f, x, y, lab in pts if cs <= f < ce]
         masks, probs = run_session(pred, [win_dir / f"{i:05d}.jpg" for i in range(cs, ce)],
                                    a.prompt, cpts)
@@ -209,26 +223,22 @@ def main() -> int:
             return float(np.mean(s)) * len(fs) / (ce - cs)
 
         chosen = max(masks, key=score) if masks else None
-        # a corrective point prompt creates obj 1000: merge it into the fish
-        extra = [o for o in masks if o == 1000 and o != chosen]
         nf = 0
         for li in range(ce - cs):
             f = cs + li
             if chosen is None or li not in masks[chosen]:
                 continue
             m = to_full(li, masks[chosen][li])
-            for o in extra:
-                if li in masks[o]:
-                    m |= to_full(li, masks[o][li])
             if f in prev and f < cs + a.overlap // 2:
                 continue  # first half of the seam: keep the previous chunk's mask
             cv2.imwrite(str(out / "fine" / f"{f:05d}.png"), m.astype(np.uint8) * 255)
-            meta["frames"][str(f)] = {"chunk": ci, "obj": chosen, "area": int(m.sum()),
+            meta["frames"][str(f)] = {"chunk": len(meta["chunks"]), "obj": chosen, "clicks": bool(cpts), "area": int(m.sum()),
                                       "prob": probs[chosen].get(li), "wy": int(wy[f])}
             prev[f] = m
             nf += 1
         prev = {f: m for f, m in prev.items() if f >= ce - a.overlap}
         meta["chunks"].append({"range": [cs, ce], "objects": sorted(masks), "fish": chosen,
+                               "clicks": len(cpts),
                                "score": float(score(chosen)) if chosen is not None else 0})
         meta.update(num_frames=n, width=W, height=H, prompt=a.prompt, device=dev,
                     checkpoint=cfg.checkpoint, model="SAM 3.1 multiplex", win=a.win)

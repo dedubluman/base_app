@@ -266,7 +266,8 @@ class Grader:
         hc = np.arctan2(cool_lab[..., 2:], cool_lab[..., 1:2])
         hc = np.where(hc < hw, hc + 2 * np.pi, hc)
         h = hw + (hc - hw) * k
-        C = cw * (1 - k) + cc * k
+        # mute chroma mid-crossover so the hue sweep does not paint a green band
+        C = (cw * (1 - k) + cc * k) * (1 - P["cross_mute"] * np.sin(np.pi * k) ** 2)
         ab = np.concatenate([C * np.cos(h), C * np.sin(h)], -1)
         # rounded-body shading: gentle falloff toward the flanks (cylinder)
         dn = dist / max(float(np.percentile(dist[dist > 0], 98)) if (dist > 0).any() else 1.0, 1.0)
@@ -309,7 +310,7 @@ DEFAULTS = dict(
     fish_src_mix=0.0, fish_exposure=1.0,
     tail_start=0.86, tail_end=0.95, tail_cool=0.95, rim_cool=0.0,
     retic_lo=0.28, retic_hi=0.55, retic_cool=0.75, cool_lift=0.95,
-    bloom=0.05, body_shade=0.16, fish_dn_range=0.18, fish_dn_space=2.5, retic_sigma=1.2, fin_open=0.85, tone_below=1.25, tone_above=1.75,
+    bloom=0.05, cross_mute=0.6, body_shade=0.16, fish_dn_range=0.18, fish_dn_space=2.5, retic_sigma=1.2, fin_open=0.85, tone_below=1.25, tone_above=1.75,
 )
 
 
