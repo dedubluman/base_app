@@ -276,26 +276,17 @@ def snap_regions(mask, rgb):
 
 
 # ---------------------------------------------------------------- grade ----
-# lionfish: signed relative luminance vs the local water (s) -> colour.
-# Crimson / scarlet dominate; amber and gold are reserved for the brightest
-# membrane only. Blacks are lifted to burgundy so the dark patterns keep detail.
+# lionfish colour ramp (t = tone-mapped, shadow-lifted fish luminance 0..1).
+# Wide and smooth: crimson in the shade, scarlet/red-orange in the midtones,
+# amber only in the lights. The floor is a lit crimson, never black.
 LION_RAMP = [
-    (-0.75, 0.100, 0.014, 0.026),   # deep burgundy (not crushed black)
-    (-0.50, 0.340, 0.028, 0.050),   # burgundy-crimson
-    (-0.30, 0.700, 0.055, 0.075),   # deep crimson
-    (-0.12, 0.900, 0.110, 0.060),   # scarlet
-    (0.04, 1.000, 0.260, 0.060),    # red-orange
-    (0.22, 1.000, 0.400, 0.085),    # fiery orange
-    (0.50, 1.000, 0.540, 0.130),    # amber
-    (1.00, 1.000, 0.660, 0.220),    # restrained golden highlight
-]
-# other fish: own-tone normalised (0..1) -> natural blue / silver / olive / gold
-FISH_RAMP = [
-    (0.00, 0.030, 0.090, 0.130),
-    (0.30, 0.140, 0.380, 0.500),
-    (0.62, 0.520, 0.680, 0.560),
-    (0.85, 0.860, 0.820, 0.440),
-    (1.00, 1.000, 0.900, 0.580),
+    (0.00, 0.330, 0.035, 0.060),   # deep lit crimson (shadow)
+    (0.18, 0.560, 0.045, 0.070),   # crimson
+    (0.38, 0.780, 0.085, 0.070),   # rich scarlet
+    (0.58, 0.900, 0.190, 0.065),   # fiery red-orange
+    (0.78, 1.000, 0.380, 0.090),   # orange
+    (0.92, 1.000, 0.520, 0.150),   # amber
+    (1.00, 1.000, 0.600, 0.220),   # soft golden light
 ]
 
 
@@ -326,8 +317,8 @@ def norm_blur(x, w, sigma, scale=4):
 
 def decontaminate(col, region, iters=1):
     """Edge decontamination. Colour is only trusted deep inside `region`
-    (mask eroded by 1.5 px); the rim takes the colour of the nearest interior
-    pixels, so water mixed into the edge pixels can never form a pale halo."""
+    (mask eroded by `iters` px); the rim takes the colour of the nearest interior
+    pixels, so water mixed into the edge pixels can never form a halo."""
     inner = cv2.erode(region.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
                       iterations=iters) > 0
     if inner.sum() < 20:
@@ -338,91 +329,110 @@ def decontaminate(col, region, iters=1):
 
 
 def soft_knee(c, k=0.78, r=0.45):
-    """Highlight roll-off: above k, compress instead of clipping, so bright
-    fin areas keep their ray structure."""
     return np.where(c > k, k + (c - k) * r, c)
 
 
-def grade_lion(rgb, air, veil, a_lion, a_all):
-    j = dehaze(rgb, air, veil, 1.0)
-    lum = cv2.GaussianBlur(luma(j), (0, 0), 0.8)               # tame luma/chroma noise
-    excl = 1 - cv2.dilate(a_all, np.ones((31, 31), np.uint8))
-    bg = norm_blur(lum, excl.astype(np.float32), 40)           # local water level
-    s_raw = (lum - bg) / (bg + 0.05) - 0.13
-    # frequency split: the broad tone (membrane vs body) comes from the contrast
-    # against the water, the pattern (rays, stripes, body marks) from the fish's
-    # own log-luminance, so dark body areas keep their detail instead of going flat
-    s_low = cv2.GaussianBlur(s_raw, (0, 0), 5.0)
-    ln = np.log(np.maximum(lum, 0.0) + 0.03)
-    dl = np.clip(ln - cv2.GaussianBlur(ln, (0, 0), 5.0), -0.55, 0.55)
-    s = s_low + 1.25 * dl
-    col = ramp(np.clip(s, -0.75, 1.0), LION_RAMP)
-    col = np.clip(soft_knee(col), 0, 1)
-    return decontaminate(col, a_lion > 0.5, iters=3)
-
-
-def grade_fish(rgb, air, veil, a_other, ids, state, bg):
-    j = dehaze(rgb, air, veil)
-    jc = np.clip(j, 0, 1)
-    l = cv2.GaussianBlur(luma(jc), (0, 0), 0.7)
-    out = np.zeros_like(rgb)
-    own = np.clip(l[..., None] + (jc - l[..., None]) * 2.4, 0, 1)   # boosted own colour
-    detail = (l - cv2.GaussianBlur(l, (0, 0), 2.0))
-    for gid in np.unique(ids[a_other > 0.5]):
-        if gid <= 1:
-            continue
-        m = (ids == gid) & (a_other > 0.3)
-        if m.sum() < 30:
-            continue
-        inner = cv2.erode(m.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=2) > 0
-        mm = inner if inner.sum() > 20 else m
-        lo, med, hi = np.percentile(l[mm], [4, 50, 96])
-        span = max(hi - lo, 0.10)              # never stretch sensor noise of a flat, dark fish
-        st = state.get(int(gid))
-        st = (med, span) if st is None else (0.88 * st[0] + 0.12 * med, 0.88 * st[1] + 0.12 * span)
-        state[int(gid)] = st
-        tn = np.clip(0.48 + 1.25 * (l - st[0]) / st[1], 0, 1)
-        # natural body colour with only gentle shading: the full ramp swing would
-        # turn sensor noise of a smooth, dark fish into invented blotchy texture
-        base = ramp(np.full_like(tn, 0.46), FISH_RAMP)
-        col = base + 0.28 * (ramp(tn, FISH_RAMP) - base)
-        col = np.clip(0.62 * col + 0.38 * own, 0, 1)
-        col = col * (1 + 0.8 * np.clip(detail, -0.05, 0.05))[..., None]
-        # visibility: bring each fish to a readable, per-fish-smoothed brightness
-        med = float(np.median(luma(col[mm])))
-        # readable but belonging to its water: brightness relative to the graded
-        # background around this fish (ring), so fish over dark rock stay darker
-        ring = cv2.dilate(m.astype(np.uint8), np.ones((31, 31), np.uint8)) > 0
-        ring &= ~(cv2.dilate(m.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0)
-        ring_l = float(np.median(luma(bg[ring]))) if ring.sum() > 50 else 0.2
-        ring_c = np.median(bg[ring], 0) if ring.sum() > 50 else np.array([0.1, 0.2, 0.25], np.float32)
-        target = float(np.clip(0.09 + 1.45 * ring_l, 0.20, 0.46))
-        g = float(np.clip(target / max(med, 0.04), 0.9, 3.5))
-        gp = state.get(("g", int(gid)))
-        g = g if gp is None else 0.9 * gp + 0.1 * g
-        state[("g", int(gid))] = g
-        col = np.clip(soft_knee(col * g, 0.85, 0.5), 0, 1)
-        col = 0.86 * col + 0.14 * np.clip(ring_c * 1.5, 0, 1)      # ambient water tint: sits in the scene
-        col = decontaminate(col, m, iters=2)
-        out[m] = col[m]
-    return out
+def scene_look(x, air, vig):
+    """The scene's own grade (what the water, rock and sand get). Fish are run
+    through it too, so every fish shares the scene's light and atmosphere."""
+    x = np.clip((x - 0.30 * air) / 0.70, 0, 1)                 # lift the worst of the haze
+    l = luma(x)[..., None]
+    x = l + (x - l) * 0.28                                     # desaturate
+    x = np.clip(x + 0.55 * (x - cv2.GaussianBlur(x, (0, 0), 9.0)), 0, 1)   # texture recovery
+    x = x ** 1.12
+    x = x / (1 + 0.95 * x * x) * 1.22                          # shoulder: sand compressed, rock lifted
+    x = x * np.array([0.55, 0.84, 1.02], np.float32)           # petrol blue
+    x = x * 0.80 + np.array([0.006, 0.018, 0.026], np.float32)
+    return np.clip(x * vig[..., None], 0, 1)
 
 
 def grade_bg(rgb, air, a_all, vig):
     excl = 1 - cv2.dilate(a_all, np.ones((9, 9), np.uint8))
     fill = norm_blur(rgb, excl.astype(np.float32), 8, scale=2)
     x = np.where(a_all[..., None] > 0.02, fill, rgb)
-    x = cv2.GaussianBlur(x, (0, 0), 1.0)                       # gentle defocus, texture stays
-    x = np.clip((x - 0.30 * air) / 0.70, 0, 1)                 # lift the worst of the haze
-    l = luma(x)[..., None]
-    x = l + (x - l) * 0.28                                     # desaturate
-    # local contrast first: recovers rock / sand texture before the tone curve
-    x = np.clip(x + 0.55 * (x - cv2.GaussianBlur(x, (0, 0), 9.0)), 0, 1)
-    x = x ** 1.12                                              # keep shadow information
-    x = x / (1 + 0.95 * x * x) * 1.22                          # shoulder: sand compressed, rock lifted
-    x = x * np.array([0.55, 0.84, 1.02], np.float32)           # petrol blue, less cyan
-    x = x * 0.80 + np.array([0.006, 0.018, 0.026], np.float32)
-    return np.clip(x * vig[..., None], 0, 1)
+    return scene_look(cv2.GaussianBlur(x, (0, 0), 1.0), air, vig)
+
+
+def grade_lion(rgb, air, veil, a_lion, bg, scene):
+    """Lionfish: its own photographic light structure is kept (so fins, rays and
+    body marks stay organic), the shadows are opened, and the colour comes from
+    a smooth ramp. Then it is integrated into the water: atmosphere, ambient
+    colour in the shade, softness and edge wrap matching the scene."""
+    m = a_lion > 0.5
+    j = dehaze(rgb, air, veil, 1.0)
+    lum = cv2.GaussianBlur(luma(j), (0, 0), 0.7)
+    if m.sum() < 500:
+        return scene
+    lo, hi = np.percentile(lum[m], [1.5, 99.0])
+    t = np.clip((lum - lo) / max(hi - lo, 1e-3), 0, 1)
+    # local tone balance on a FIXED window (no per-frame window jitter): the bright fin
+    # membrane no longer dictates the exposure of the darker body
+    x0, y0, sz = 155, 850, 640
+    win = np.where(m, t, np.median(t[m]))[y0:y0 + sz, x0:x0 + sz]
+    tc = cv2.createCLAHE(clipLimit=1.3, tileGridSize=(4, 4)).apply(
+        (np.clip(win, 0, 1) * 255).astype(np.uint8)).astype(np.float32) / 255
+    t_loc = t.copy()
+    t_loc[y0:y0 + sz, x0:x0 + sz] = tc
+    t = 0.7 * t + 0.3 * t_loc
+    t = 0.10 + 0.90 * (t ** 0.60)                              # open the shadows (lit crimson floor)
+    # translucent fin membrane lets the water through: pull it down a little so
+    # it does not turn into a flat bright patch (water-relative lightness)
+    excl = (1 - cv2.dilate(a_lion, np.ones((31, 31), np.uint8))).astype(np.float32)
+    water = norm_blur(lum, excl, 40)
+    rel = np.clip((lum - water) / (water + 0.05), -1, 1)
+    t = np.clip(t + 0.22 * np.minimum(rel, 0.0) - 0.10 * np.maximum(rel, 0.0), 0, 1)
+    col = ramp(t, LION_RAMP)
+    # photographic micro-detail on top (restrained)
+    det = lum - cv2.GaussianBlur(lum, (0, 0), 2.2)
+    col = col * (1 + 1.6 * np.clip(det / (lum + 0.05), -0.30, 0.30))[..., None]
+    col = np.clip(soft_knee(col, 0.80, 0.5), 0, 1)
+    # atmosphere + ambient light: a little of the surrounding water colour, more in the shade
+    amb = norm_blur(bg, excl, 30)
+    shade = (1 - t)[..., None]
+    col = col * (1 - 0.10 - 0.14 * shade) + amb * (0.10 + 0.14 * shade) * 1.5
+    col = decontaminate(col, m, iters=3)
+    # edge wrap: the rim takes the water's colour/light (no cut-out edge)
+    d = cv2.distanceTransform(m.astype(np.uint8), cv2.DIST_L2, 3)
+    wrap = (np.exp(-d / 3.0) * 0.30)[..., None]
+    col = col * (1 - wrap) + np.clip(0.5 * col + 0.5 * amb * 1.7, 0, 1) * wrap
+    return np.clip(cv2.GaussianBlur(col, (0, 0), 0.7), 0, 1)    # match the footage's optical softness
+
+
+def grade_fish(rgb, air, a_other, ids, state, bg, scene):
+    """Other fish: graded with the scene's own look (same light/atmosphere), then
+    opened up just enough to read as fish, with a little colour and definition.
+    Brightness is tied to the water around each fish (smoothed per identity)."""
+    out = np.zeros_like(rgb)
+    l_s = luma(scene)
+    for gid in np.unique(ids[a_other > 0.5]):
+        if gid <= 1:
+            continue
+        m = (ids == gid) & (a_other > 0.3)
+        if m.sum() < 30:
+            continue
+        mm = cv2.erode(m.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=2) > 0
+        mm = mm if mm.sum() > 20 else m
+        ring = cv2.dilate(m.astype(np.uint8), np.ones((31, 31), np.uint8)) > 0
+        ring &= ~(cv2.dilate(m.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0)
+        ring_l = float(np.median(l_s[ring])) if ring.sum() > 50 else 0.2
+        med = float(np.median(l_s[mm]))
+        g = float(np.clip(0.78 * ring_l / max(med, 0.02), 1.0, 3.6))   # fish ~78% of the water brightness
+        gp = state.get(("g", int(gid)))
+        g = g if gp is None else 0.92 * gp + 0.08 * g
+        state[("g", int(gid))] = g
+        col = scene * g
+        ll = luma(col)[..., None]
+        col = ll + (col - ll) * 1.25                                 # keep the scene's colour, a little richer
+        # species-neutral natural body tone: olive-silver, blended in so the fish
+        # reads as a fish, not as a teal-tinted cut-out
+        body = ll * np.array([1.12, 1.02, 0.80], np.float32)
+        col = 0.50 * col + 0.50 * body
+        det = l_s - cv2.GaussianBlur(l_s, (0, 0), 1.8)
+        col = col * (1 + 0.8 * np.clip(det / (l_s + 0.04), -0.20, 0.20))[..., None]   # gentle definition
+        col = np.clip(soft_knee(col, 0.60, 0.5), 0, 1)
+        col = decontaminate(col, m, iters=2)
+        out[m] = col[m]
+    return out
 
 
 def make_vignette(h, w, strength=0.50):
@@ -439,11 +449,14 @@ def process(rgb, am, al, ids, air, veil, vig, noise, state, grain=0.010):
     a_lion = np.minimum(snap_regions(lion_b, rgb), a_all)
     a_oth = np.clip(a_all - a_lion, 0, 1)
     bg = grade_bg(rgb, air, a_all, vig)
-    lion = grade_lion(rgb, air, veil, a_lion, a_all)
-    fish = grade_fish(rgb, air, veil, a_oth, ids, state, bg)
+    scene = scene_look(rgb, air, vig)                            # same look applied to the fish pixels
+    lion = grade_lion(rgb, air, veil, a_lion, bg, scene)
+    fish = grade_fish(rgb, air, a_oth, ids, state, bg, scene)
     fg = lion * a_lion[..., None] + fish * (1 - a_lion[..., None])
-    out = bg * (1 - a_all[..., None]) + fg * a_all[..., None]
-    out = out + (noise * grain)[..., None] * (1 - 0.7 * a_all[..., None])
+    # soft, sub-pixel edge: slight feather (colour is already decontaminated)
+    af = np.clip(cv2.GaussianBlur(a_all, (0, 0), 0.9) * 1.15, 0, 1)
+    out = bg * (1 - af[..., None]) + fg * af[..., None]
+    out = out + (noise * grain)[..., None]                       # one grain over everything
     return np.clip(out, 0, 1)
 
 
