@@ -324,11 +324,12 @@ def norm_blur(x, w, sigma, scale=4):
     return cv2.resize(out, (w0, h0), interpolation=cv2.INTER_CUBIC) if scale > 1 else out
 
 
-def decontaminate(col, region):
+def decontaminate(col, region, iters=1):
     """Edge decontamination. Colour is only trusted deep inside `region`
     (mask eroded by 1.5 px); the rim takes the colour of the nearest interior
     pixels, so water mixed into the edge pixels can never form a pale halo."""
-    inner = cv2.erode(region.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))) > 0
+    inner = cv2.erode(region.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                      iterations=iters) > 0
     if inner.sum() < 20:
         return col
     wgt = inner.astype(np.float32)
@@ -369,7 +370,7 @@ def grade_fish(rgb, air, veil, a_other, ids, state, bg):
         m = (ids == gid) & (a_other > 0.3)
         if m.sum() < 30:
             continue
-        inner = cv2.erode(m.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        inner = cv2.erode(m.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=2) > 0
         mm = inner if inner.sum() > 20 else m
         lo, med, hi = np.percentile(l[mm], [4, 50, 96])
         span = max(hi - lo, 0.10)              # never stretch sensor noise of a flat, dark fish
@@ -377,7 +378,10 @@ def grade_fish(rgb, air, veil, a_other, ids, state, bg):
         st = (med, span) if st is None else (0.88 * st[0] + 0.12 * med, 0.88 * st[1] + 0.12 * span)
         state[int(gid)] = st
         tn = np.clip(0.48 + 1.25 * (l - st[0]) / st[1], 0, 1)
-        col = ramp(tn, FISH_RAMP)
+        # natural body colour with only gentle shading: the full ramp swing would
+        # turn sensor noise of a smooth, dark fish into invented blotchy texture
+        base = ramp(np.full_like(tn, 0.46), FISH_RAMP)
+        col = base + 0.40 * (ramp(tn, FISH_RAMP) - base)
         col = np.clip(0.62 * col + 0.38 * own, 0, 1)
         col = col * (1 + 1.4 * np.clip(detail, -0.05, 0.05))[..., None]
         # visibility: bring each fish to a readable, per-fish-smoothed brightness
@@ -388,14 +392,14 @@ def grade_fish(rgb, air, veil, a_other, ids, state, bg):
         ring &= ~(cv2.dilate(m.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0)
         ring_l = float(np.median(luma(bg[ring]))) if ring.sum() > 50 else 0.2
         ring_c = np.median(bg[ring], 0) if ring.sum() > 50 else np.array([0.1, 0.2, 0.25], np.float32)
-        target = float(np.clip(0.10 + 1.7 * ring_l, 0.22, 0.52))
+        target = float(np.clip(0.09 + 1.45 * ring_l, 0.20, 0.46))
         g = float(np.clip(target / max(med, 0.04), 0.9, 3.5))
         gp = state.get(("g", int(gid)))
         g = g if gp is None else 0.9 * gp + 0.1 * g
         state[("g", int(gid))] = g
         col = np.clip(soft_knee(col * g, 0.85, 0.5), 0, 1)
         col = 0.86 * col + 0.14 * np.clip(ring_c * 1.5, 0, 1)      # ambient water tint: sits in the scene
-        col = decontaminate(col, m)
+        col = decontaminate(col, m, iters=2)
         out[m] = col[m]
     return out
 
@@ -424,8 +428,11 @@ def make_vignette(h, w, strength=0.50):
 
 
 def process(rgb, am, al, ids, air, veil, vig, noise, state, grain=0.010):
-    a_all = snap_regions(am > 0.5, rgb)
-    a_lion = np.minimum(snap_regions(al > 0.5, rgb), a_all)
+    lion_b = al > 0.5
+    # SAM masks of small fish sit a pixel or two outside the body: pull them in
+    oth_b = cv2.erode(((am > 0.5) & ~lion_b).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    a_all = snap_regions(lion_b | oth_b, rgb)
+    a_lion = np.minimum(snap_regions(lion_b, rgb), a_all)
     a_oth = np.clip(a_all - a_lion, 0, 1)
     bg = grade_bg(rgb, air, a_all, vig)
     lion = grade_lion(rgb, air, veil, a_lion, a_all)
