@@ -280,8 +280,8 @@ def snap_regions(mask, rgb):
 # Wide and smooth: crimson in the shade, scarlet/red-orange in the midtones,
 # amber only in the lights. The floor is a lit crimson, never black.
 LION_RAMP = [
-    (0.00, 0.330, 0.035, 0.060),   # deep lit crimson (shadow)
-    (0.18, 0.560, 0.045, 0.070),   # crimson
+    (0.00, 0.420, 0.075, 0.070),   # sienna-crimson (shadow, clearly not black)
+    (0.18, 0.600, 0.085, 0.075),   # crimson
     (0.38, 0.780, 0.085, 0.070),   # rich scarlet
     (0.58, 0.900, 0.190, 0.065),   # fiery red-orange
     (0.78, 1.000, 0.380, 0.090),   # orange
@@ -341,7 +341,7 @@ def scene_look(x, air, vig):
     x = np.clip(x + 0.55 * (x - cv2.GaussianBlur(x, (0, 0), 9.0)), 0, 1)   # texture recovery
     x = x ** 1.12
     x = x / (1 + 0.95 * x * x) * 1.22                          # shoulder: sand compressed, rock lifted
-    x = x * np.array([0.55, 0.84, 1.02], np.float32)           # petrol blue
+    x = x * np.array([0.57, 0.88, 1.00], np.float32)           # petrol / dark teal
     x = x * 0.80 + np.array([0.006, 0.018, 0.026], np.float32)
     return np.clip(x * vig[..., None], 0, 1)
 
@@ -374,7 +374,7 @@ def grade_lion(rgb, air, veil, a_lion, bg, scene, vig):
     t_loc = t.copy()
     t_loc[y0:y0 + sz, x0:x0 + sz] = tc
     t = 0.7 * t + 0.3 * t_loc
-    t = 0.13 + 0.80 * (t ** 0.65)                              # opened shadows, moderate range
+    t = 0.22 + 0.70 * (t ** 0.65)                              # opened shadows: body keeps real mid-tones
     # translucent fin membrane lets the water through: pull it down a little so
     # it does not turn into a flat bright patch (water-relative lightness)
     excl = (1 - cv2.dilate(a_lion, np.ones((31, 31), np.uint8))).astype(np.float32)
@@ -388,12 +388,12 @@ def grade_lion(rgb, air, veil, a_lion, bg, scene, vig):
     # organic mid-tones in the shade: log-domain local variation of the body itself
     ln = np.log(lum + 0.03)
     dln = np.clip(ln - cv2.GaussianBlur(ln, (0, 0), 3.0), -0.35, 0.35)
-    col = col * (1 + 1.5 * (1 - t)[..., None] * dln[..., None])
+    col = col * (1 + 2.8 * (1 - t)[..., None] * dln[..., None])
     col = np.clip(soft_knee(col, 0.80, 0.5), 0, 1)
     # --- submerge it: same water, same light -------------------------------------
     # 1) tame the pop: documentary-level saturation, luminance preserved
     ll = luma(col)[..., None]
-    col = ll + (col - ll) * 0.88
+    col = ll + (col - ll) * 0.90
     # 2) water absorbs red first and adds blue-green: transmission + veil in the
     #    colour of the surrounding water (stronger in the shade of the body)
     amb = norm_blur(bg, excl, 30)
@@ -430,7 +430,7 @@ def grade_fish(rgb, air, a_other, ids, state, bg, scene):
         ring &= ~(cv2.dilate(m.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0)
         ring_l = float(np.median(l_s[ring])) if ring.sum() > 50 else 0.2
         med = float(np.median(l_s[mm]))
-        g = float(np.clip(0.78 * ring_l / max(med, 0.02), 1.0, 3.6))   # fish ~78% of the water brightness
+        g = float(np.clip(0.55 * ring_l / max(med, 0.02), 0.9, 3.0))   # fish read as clear, natural silhouettes
         gp = state.get(("g", int(gid)))
         g = g if gp is None else 0.92 * gp + 0.08 * g
         state[("g", int(gid))] = g
