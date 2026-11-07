@@ -359,41 +359,38 @@ def grade_lion(rgb, air, veil, a_lion, bg, scene, vig):
     a smooth ramp. Then it is integrated into the water: atmosphere, ambient
     colour in the shade, softness and edge wrap matching the scene."""
     m = a_lion > 0.5
-    j = dehaze(rgb, air, veil, 1.0)
-    lum = cv2.GaussianBlur(luma(j), (0, 0), 0.7)
     if m.sum() < 500:
         return scene
-    lo, hi = np.percentile(lum[m], [1.5, 99.0])
-    t = np.clip((lum - lo) / max(hi - lo, 1e-3), 0, 1)
-    # local tone balance on a FIXED window (no per-frame window jitter): the bright fin
-    # membrane no longer dictates the exposure of the darker body
-    x0, y0, sz = 155, 850, 640
-    win = np.where(m, t, np.median(t[m]))[y0:y0 + sz, x0:x0 + sz]
-    tc = cv2.createCLAHE(clipLimit=1.3, tileGridSize=(4, 4)).apply(
-        (np.clip(win, 0, 1) * 255).astype(np.uint8)).astype(np.float32) / 255
-    t_loc = t.copy()
-    t_loc[y0:y0 + sz, x0:x0 + sz] = tc
-    t = 0.7 * t + 0.3 * t_loc
-    t = 0.22 + 0.70 * (t ** 0.65)                              # opened shadows: body keeps real mid-tones
-    # translucent fin membrane lets the water through: pull it down a little so
-    # it does not turn into a flat bright patch (water-relative lightness)
+    # Natural lionfish. Everything is relative to the water around the fish, so the
+    # translucent membrane stays at the water's own level (it simply shows the water),
+    # the rays and bands go darker than the water (dark brown/black) and the accents go
+    # lighter (near-white): organic transmission instead of paint.
+    j = dehaze(rgb, air, min(veil + 0.05, 0.6), 1.0)
+    Y = cv2.GaussianBlur(luma(j), (0, 0), 0.6)
     excl = (1 - cv2.dilate(a_lion, np.ones((31, 31), np.uint8))).astype(np.float32)
-    water = norm_blur(lum, excl, 40)
-    rel = np.clip((lum - water) / (water + 0.05), -1, 1)
-    t = np.clip(t + 0.22 * np.minimum(rel, 0.0) - 0.10 * np.maximum(rel, 0.0), 0, 1)
-    col = ramp(t, LION_RAMP)
-    # photographic micro-detail on top (restrained)
-    det = lum - cv2.GaussianBlur(lum, (0, 0), 2.2)
-    col = col * (1 + 1.2 * np.clip(det / (lum + 0.05), -0.25, 0.25))[..., None]
-    # organic mid-tones in the shade: log-domain local variation of the body itself
-    ln = np.log(lum + 0.03)
+    water = norm_blur(Y, excl, 40)
+    r = (Y - water) / (water + 0.05)
+    r = r + 0.5 * (r - cv2.GaussianBlur(r, (0, 0), 2.5))         # crisp rays, restrained
+    Lbg = norm_blur(luma(bg), excl, 40)                          # graded water level here
+    L = Lbg * (1 + np.where(r < 0, 1.0 * r, 2.4 * r))
+    ln = np.log(Y + 0.03)                                         # open the body's own mid-tones
     dln = np.clip(ln - cv2.GaussianBlur(ln, (0, 0), 3.0), -0.35, 0.35)
-    col = col * (1 + 2.8 * (1 - t)[..., None] * dln[..., None])
-    col = np.clip(soft_knee(col, 0.80, 0.5), 0, 1)
+    L = L * (1 + 1.6 * dln * (L < 0.2))
+    L = np.where(L > 0.42, 0.42 + (L - 0.42) * 0.5, L)           # accents roll off softly
+    L = np.clip(L, 0.058, 0.62)
+    warm = np.array([1.12, 1.00, 0.78], np.float32); warm = warm / luma(warm)
+    cool = np.array([1.00, 1.00, 0.95], np.float32); cool = cool / luma(cool)
+    wt = smoothstep(0.22, 0.45, L)[..., None]
+    col_t = np.clip((warm * (1 - wt) + cool * wt) * L[..., None], 0, 1)    # sepia shade -> near-white accents
+    o = smoothstep(0.05, 0.30, np.abs(r))
+    o = cv2.GaussianBlur((0.15 + 0.85 * o).astype(np.float32), (0, 0), 1.0)
+    scene_nv = scene / np.maximum(vig, 0.3)[..., None]           # the vignette is applied once, below
+    col = scene_nv * (1 - o[..., None]) + col_t * o[..., None]
+    t = np.clip(L / 0.5, 0, 1)
     # --- submerge it: same water, same light -------------------------------------
     # 1) tame the pop: documentary-level saturation, luminance preserved
     ll = luma(col)[..., None]
-    col = ll + (col - ll) * 0.90
+    col = ll + (col - ll) * 1.0
     # 2) water absorbs red first and adds blue-green: transmission + veil in the
     #    colour of the surrounding water (stronger in the shade of the body)
     amb = norm_blur(bg, excl, 30)
@@ -439,7 +436,7 @@ def grade_fish(rgb, air, a_other, ids, state, bg, scene):
         col = ll + (col - ll) * 1.25                                 # keep the scene's colour, a little richer
         # species-neutral natural body tone: olive-silver, blended in so the fish
         # reads as a fish, not as a teal-tinted cut-out
-        body = ll * np.array([1.12, 1.02, 0.80], np.float32)
+        body = ll * np.array([1.05, 1.01, 0.90], np.float32)
         col = 0.50 * col + 0.50 * body
         det = l_s - cv2.GaussianBlur(l_s, (0, 0), 1.8)
         col = col * (1 + 0.8 * np.clip(det / (l_s + 0.04), -0.20, 0.20))[..., None]   # gentle definition
