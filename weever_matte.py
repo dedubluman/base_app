@@ -84,7 +84,11 @@ def main() -> int:
     ap.add_argument("--band-in", type=int, default=3, help="px the edge may move inward")
     ap.add_argument("--band-out", type=int, default=4, help="px the edge may move outward")
     ap.add_argument("--temporal", type=float, default=0.5, help="weight of warped neighbours")
+    ap.add_argument("--smooth-range", default="462:482",
+                    help="frames (lo:hi) with fast-motion blur that get edge-geometry smoothing")
+    ap.add_argument("--smooth-r", type=int, default=4)
     a = ap.parse_args()
+    smooth_lo, smooth_hi = (int(v) for v in a.smooth_range.split(":"))
 
     stem = a.input.stem
     mdir = REPO / "masks" / f"{stem}__fish"
@@ -159,6 +163,12 @@ def main() -> int:
         if f not in have:
             return
         m = clean(cv2.imread(str(vdir / f"{f:05d}.png"), 0) > 127, state["prev"])
+        if smooth_lo <= f <= smooth_hi:
+            # fast-motion section: SAM's edge follows the ragged motion blur;
+            # smooth the boundary geometry (removes jags/islands, keeps shape)
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * a.smooth_r + 1,) * 2)
+            mu = cv2.morphologyEx(cv2.morphologyEx(m.astype(np.uint8), cv2.MORPH_OPEN, k), cv2.MORPH_CLOSE, k)
+            m = clean(cv2.GaussianBlur(mu.astype(np.float32), (0, 0), a.smooth_r * 0.8) > 0.5, state["prev"])
         state["prev"] = m
         ys, xs = np.nonzero(m)
         y0, y1 = max(0, ys.min() - 40), min(H, ys.max() + 41)

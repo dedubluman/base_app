@@ -368,6 +368,7 @@ def main() -> int:
     ap.add_argument("--stills", type=Path, default=REPO / "output" / "stills")
     ap.add_argument("--set", action="append", default=[], help="PARAM=VALUE")
     ap.add_argument("--crf", type=int, default=12)
+    ap.add_argument("--from-frame", type=int, default=0, help="render from this frame to the end")
     a = ap.parse_args()
 
     P = dict(DEFAULTS)
@@ -414,7 +415,9 @@ def main() -> int:
     enc = subprocess.Popen(["ffmpeg", "-v", "error", "-y",
                             "-f", "rawvideo", "-pix_fmt", "rgb48le", "-s", f"{W}x{H}",
                             "-framerate", "30000/1001", "-i", "-",
-                            "-i", str(a.input), "-map", "0:v", "-map", "1:a", "-c:a", "copy",
+                            "-ss", f"{a.from_frame * 1001 / 30000:.6f}", "-i", str(a.input),
+                            "-map", "0:v", "-map", "1:a",
+                            *(["-c:a", "copy"] if a.from_frame == 0 else ["-c:a", "aac", "-b:a", "192k"]),
                             "-c:v", "libx264", "-preset", "slow", "-crf", str(a.crf),
                             "-profile:v", "high", "-pix_fmt", "yuv420p",
                             "-vf", "scale=out_color_matrix=bt709:out_range=tv",
@@ -427,6 +430,8 @@ def main() -> int:
         buf = dec.stdout.read(sz)
         if len(buf) < sz:
             break
+        if f < a.from_frame:
+            continue
         rgb = np.frombuffer(buf, np.uint8).reshape(H, W, 3)
         o = G(rgb, load_alpha(adir, f), f)
         # 16-bit out + tiny dither: no banding in the dark water gradients

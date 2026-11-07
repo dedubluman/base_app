@@ -69,3 +69,20 @@ objects or particles added; seabed geometry untouched.
   with the source (caustics moving over the fish) at 0.82x their size, so
   the grade adds no flicker.
 * Rendered file: ffprobe 610 frames, 20.354 s, 1080x1920, 29.97 fps, audio present.
+
+## Revision: tail slip at ~15.4–16.0 s (frames 463–480)
+
+The fish whips its tail; the frames are motion-blurred and SAM had absorbed the
+blurred ghost of the previous tail position (left of the caudal peduncle).
+Measured as the body's extension left of its own dark-spot row: clean frames
+27–29 px, affected frames 35–42 px.
+
+* SAM 3.1 refinement on frames 452–491 (one 40-frame session) with clicks on
+  every frame 463–480 (288 clicks): negative clicks at 40 px left of the spot
+  row where the mask reached ≥ 44 px, and positive clicks on the spot row,
+  head-to-tail interior and pale pectoral fins. Result: 23–34 px (467: 38).
+* `weever_matte.py --smooth-range 462:482`: open/close and blur-threshold of
+  the mask edge for this fast-motion section only, because SAM's edge follows
+  the ragged blur there.
+* `weever_grade.py --from-frame 310` renders the last 10 s (frames 310–609,
+  300 frames, 10.01 s, H.264 High, audio re-encoded to AAC from the same point).
