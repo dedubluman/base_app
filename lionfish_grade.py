@@ -348,13 +348,17 @@ def grade_lion(rgb, air, veil, a_lion, a_all):
     lum = cv2.GaussianBlur(luma(j), (0, 0), 0.8)               # tame luma/chroma noise
     excl = 1 - cv2.dilate(a_all, np.ones((31, 31), np.uint8))
     bg = norm_blur(lum, excl.astype(np.float32), 40)           # local water level
-    s = (lum - bg) / (bg + 0.05) - 0.13
-    detail = s - cv2.GaussianBlur(s, (0, 0), 3.5)
-    s = s + 0.45 * detail                                      # restrained micro-contrast
+    s_raw = (lum - bg) / (bg + 0.05) - 0.13
+    # frequency split: the broad tone (membrane vs body) comes from the contrast
+    # against the water, the pattern (rays, stripes, body marks) from the fish's
+    # own log-luminance, so dark body areas keep their detail instead of going flat
+    s_low = cv2.GaussianBlur(s_raw, (0, 0), 5.0)
+    ln = np.log(np.maximum(lum, 0.0) + 0.03)
+    dl = np.clip(ln - cv2.GaussianBlur(ln, (0, 0), 5.0), -0.55, 0.55)
+    s = s_low + 1.25 * dl
     col = ramp(np.clip(s, -0.75, 1.0), LION_RAMP)
-    col = col * (1 + 0.55 * np.clip(detail, -0.35, 0.35))[..., None]   # keep rays in bright areas
     col = np.clip(soft_knee(col), 0, 1)
-    return decontaminate(col, a_lion > 0.5)
+    return decontaminate(col, a_lion > 0.5, iters=3)
 
 
 def grade_fish(rgb, air, veil, a_other, ids, state, bg):
@@ -381,9 +385,9 @@ def grade_fish(rgb, air, veil, a_other, ids, state, bg):
         # natural body colour with only gentle shading: the full ramp swing would
         # turn sensor noise of a smooth, dark fish into invented blotchy texture
         base = ramp(np.full_like(tn, 0.46), FISH_RAMP)
-        col = base + 0.40 * (ramp(tn, FISH_RAMP) - base)
+        col = base + 0.28 * (ramp(tn, FISH_RAMP) - base)
         col = np.clip(0.62 * col + 0.38 * own, 0, 1)
-        col = col * (1 + 1.4 * np.clip(detail, -0.05, 0.05))[..., None]
+        col = col * (1 + 0.8 * np.clip(detail, -0.05, 0.05))[..., None]
         # visibility: bring each fish to a readable, per-fish-smoothed brightness
         med = float(np.median(luma(col[mm])))
         # readable but belonging to its water: brightness relative to the graded
