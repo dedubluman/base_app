@@ -164,15 +164,11 @@ def estimate_veil(frames):
     return air.astype(np.float32)
 
 
-def grade_fg(rgb, air, veil, fish_a):
+def grade_fg(rgb, air, veil, fish_a, hi_const):
     """Dehaze + exposure normalised on the fish pixels + natural colour."""
     j = (rgb - veil * air) / (1 - veil)
     j = np.clip(j, 0, 1.5) * np.array([1.45, 1.0, 1.0], np.float32)
-    sel = fish_a > 0.5
-    l = luma(j)
-    if sel.sum() > 300:
-        hi = np.percentile(l[sel], 97)
-        j = j * (0.80 / max(hi, 0.05))          # expose the fish properly
+    j = j * (0.80 / max(hi_const, 0.05))        # one clip-wide exposure (no flicker)
     j = np.clip(j, 0, 1)
     j = j ** 0.75                                # lift shadows (no crushed silhouettes)
     blur = cv2.GaussianBlur(j, (0, 0), 6)
@@ -180,6 +176,14 @@ def grade_fg(rgb, air, veil, fish_a):
     ll = luma(j)[..., None]
     j = np.clip(ll + (j - ll) * 1.45, 0, 1)      # vibrance
     return j
+
+
+def natural_fish(j):
+    """Small fish: keep their own luminance structure but pull the colour
+    to a natural silver-olive instead of the neon cyan the dehaze leaves."""
+    ll = luma(j)[..., None]
+    tint = np.array([1.00, 0.95, 0.84], np.float32)
+    return np.clip(ll * tint * 1.05 + (j - ll) * 0.35, 0, 1)
 
 
 def grade_lion(rgb, fg_graded, lion_a):
@@ -216,7 +220,7 @@ def feather_alpha(m, px):
     return np.clip((a - 0.5) * 1.6 + 0.5, 0, 1) if px > 0 else m
 
 
-def process(rgb, alpha_all, alpha_lion, air, veil, vig, rng_noise, grain=0.012):
+def process(rgb, alpha_all, alpha_lion, air, veil, vig, rng_noise, hi_const, grain=0.012):
     h, w = alpha_all.shape
     a = feather_alpha(alpha_all, 1.2)
     al = feather_alpha(alpha_lion, 1.2)
@@ -228,9 +232,24 @@ def process(rgb, alpha_all, alpha_lion, air, veil, vig, rng_noise, grain=0.012):
     bgsrc = num / np.maximum(den, 1e-3)
     bgsrc = np.where(den > 0.05, bgsrc, cv2.GaussianBlur(rgb, (0, 0), 14))
     bg = grade_bg(rgb, bgsrc, vig, None)
-    fg = grade_fg(rgb, air, veil, a)
+    fg = grade_fg(rgb, air, veil, a, hi_const)
+    fg_other = natural_fish(fg)
+    # each small fish normalised to a consistent body tone (their raw tone only
+    # reflects the water behind them), no matter how haze-bright the backdrop
+    oth = ((a > 0.5) & (al < 0.5)).astype(np.uint8)
+    n_lab, lab, st, _ = cv2.connectedComponentsWithStats(oth, connectivity=8)
+    for c in range(1, n_lab):
+        x0, y0, bw, bh, ar = st[c]
+        if ar < 40:
+            continue
+        sl = (slice(max(y0 - 3, 0), y0 + bh + 3), slice(max(x0 - 3, 0), x0 + bw + 3))
+        mc = lab[sl] == c
+        lc = luma(fg_other[sl])
+        med = float(np.median(lc[mc]))
+        gain = float(np.clip(0.50 / max(med, 0.03), 0.35, 7.0))
+        fg_other[sl] = np.clip(fg_other[sl] * (1 + (gain - 1) * 1.0), 0, 1)
     lion = grade_lion(rgb, fg, al)
-    fg = fg * (1 - al[..., None]) + lion * al[..., None]
+    fg = fg_other * (1 - al[..., None]) + lion * al[..., None]
     out = bg * (1 - a[..., None]) + fg * a[..., None]
     # grain on the background mostly
     g = rng_noise * grain
@@ -273,10 +292,18 @@ def main():
     enc = Encoder(a.input, a.output, info, Encode()) if a.output else None
     frames_cache = {}
     gray_proxy = {}
+    his = []
     # first pass: grays of proxy frames
     for i, f in enumerate(iter_frames(a.input, info)):
         if i % a.stride == 0:
             gray_proxy[i // a.stride] = cv2.cvtColor((f * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+            if i % (a.stride * 8) == 0:
+                mk = store.get('all', i // a.stride)
+                if mk is not None and mk.sum() > 300:
+                    jj = np.clip((f - a.veil * air) / (1 - a.veil), 0, 1.5) * np.array([1.45, 1, 1], np.float32)
+                    his.append(np.percentile(luma(jj)[mk], 97))
+    hi_const = float(np.median(his))
+    print(f'[grade] fish exposure ref {hi_const:.3f}', flush=True)
     for i, f in enumerate(iter_frames(a.input, info)):
         if not enc and i not in still_idx:
             continue
@@ -287,7 +314,7 @@ def main():
         al = (al > 0.5).astype(np.float32) * am
         noise = rng.standard_normal((h // 2, w // 2)).astype(np.float32)
         noise = cv2.resize(noise, (w, h), interpolation=cv2.INTER_LINEAR)
-        out = process(f, am, al, air, a.veil, vig, noise)
+        out = process(f, am, al, air, a.veil, vig, noise, hi_const)
         if enc:
             enc.write(out)
         if i in still_idx:
