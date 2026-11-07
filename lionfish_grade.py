@@ -353,7 +353,7 @@ def grade_bg(rgb, air, a_all, vig):
     return scene_look(cv2.GaussianBlur(x, (0, 0), 1.0), air, vig)
 
 
-def grade_lion(rgb, air, veil, a_lion, bg, scene):
+def grade_lion(rgb, air, veil, a_lion, bg, scene, vig):
     """Lionfish: its own photographic light structure is kept (so fins, rays and
     body marks stay organic), the shadows are opened, and the colour comes from
     a smooth ramp. Then it is integrated into the water: atmosphere, ambient
@@ -374,7 +374,7 @@ def grade_lion(rgb, air, veil, a_lion, bg, scene):
     t_loc = t.copy()
     t_loc[y0:y0 + sz, x0:x0 + sz] = tc
     t = 0.7 * t + 0.3 * t_loc
-    t = 0.10 + 0.90 * (t ** 0.60)                              # open the shadows (lit crimson floor)
+    t = 0.13 + 0.80 * (t ** 0.65)                              # opened shadows, moderate range
     # translucent fin membrane lets the water through: pull it down a little so
     # it does not turn into a flat bright patch (water-relative lightness)
     excl = (1 - cv2.dilate(a_lion, np.ones((31, 31), np.uint8))).astype(np.float32)
@@ -384,18 +384,32 @@ def grade_lion(rgb, air, veil, a_lion, bg, scene):
     col = ramp(t, LION_RAMP)
     # photographic micro-detail on top (restrained)
     det = lum - cv2.GaussianBlur(lum, (0, 0), 2.2)
-    col = col * (1 + 1.6 * np.clip(det / (lum + 0.05), -0.30, 0.30))[..., None]
+    col = col * (1 + 1.2 * np.clip(det / (lum + 0.05), -0.25, 0.25))[..., None]
+    # organic mid-tones in the shade: log-domain local variation of the body itself
+    ln = np.log(lum + 0.03)
+    dln = np.clip(ln - cv2.GaussianBlur(ln, (0, 0), 3.0), -0.35, 0.35)
+    col = col * (1 + 1.5 * (1 - t)[..., None] * dln[..., None])
     col = np.clip(soft_knee(col, 0.80, 0.5), 0, 1)
-    # atmosphere + ambient light: a little of the surrounding water colour, more in the shade
+    # --- submerge it: same water, same light -------------------------------------
+    # 1) tame the pop: documentary-level saturation, luminance preserved
+    ll = luma(col)[..., None]
+    col = ll + (col - ll) * 0.88
+    # 2) water absorbs red first and adds blue-green: transmission + veil in the
+    #    colour of the surrounding water (stronger in the shade of the body)
     amb = norm_blur(bg, excl, 30)
     shade = (1 - t)[..., None]
-    col = col * (1 - 0.10 - 0.14 * shade) + amb * (0.10 + 0.14 * shade) * 1.5
+    col = col * np.array([0.90, 0.96, 1.00], np.float32)
+    v = 0.12 + 0.12 * shade
+    col = col * (1 - v) + np.clip(amb * 1.25, 0, 1) * v
+    # 3) the scene's own light falloff (vignette) and depth darkening
+    yy = np.linspace(0, 1, col.shape[0], dtype=np.float32)[:, None, None]
+    col = col * vig[..., None]                                  # exactly the scene's own falloff
     col = decontaminate(col, m, iters=3)
-    # edge wrap: the rim takes the water's colour/light (no cut-out edge)
+    # 4) edge wrap: the rim takes the water's colour and light, with a wide falloff
     d = cv2.distanceTransform(m.astype(np.uint8), cv2.DIST_L2, 3)
-    wrap = (np.exp(-d / 3.0) * 0.30)[..., None]
-    col = col * (1 - wrap) + np.clip(0.5 * col + 0.5 * amb * 1.7, 0, 1) * wrap
-    return np.clip(cv2.GaussianBlur(col, (0, 0), 0.7), 0, 1)    # match the footage's optical softness
+    wrap = (np.exp(-d / 4.5) * 0.88)[..., None]
+    col = col * (1 - wrap) + bg * wrap                         # the rim IS the water: no seam
+    return np.clip(cv2.GaussianBlur(col, (0, 0), 0.9), 0, 1)    # match the footage's optical softness
 
 
 def grade_fish(rgb, air, a_other, ids, state, bg, scene):
@@ -450,11 +464,19 @@ def process(rgb, am, al, ids, air, veil, vig, noise, state, grain=0.010):
     a_oth = np.clip(a_all - a_lion, 0, 1)
     bg = grade_bg(rgb, air, a_all, vig)
     scene = scene_look(rgb, air, vig)                            # same look applied to the fish pixels
-    lion = grade_lion(rgb, air, veil, a_lion, bg, scene)
+    lion = grade_lion(rgb, air, veil, a_lion, bg, scene, vig)
     fish = grade_fish(rgb, air, a_oth, ids, state, bg, scene)
-    fg = lion * a_lion[..., None] + fish * (1 - a_lion[..., None])
+    # foreground colour = weighted by the SAME soft masks that make the alpha, normalised:
+    # never multiplied by a fractional alpha, so no dark rim at the boundary
+    wl = cv2.GaussianBlur(a_lion, (0, 0), 1.3) + 1e-4
+    wf = cv2.GaussianBlur(a_oth, (0, 0), 1.3) + 1e-4
+    fg = (lion * wl[..., None] + fish * wf[..., None]) / (wl + wf)[..., None]
     # soft, sub-pixel edge: slight feather (colour is already decontaminated)
-    af = np.clip(cv2.GaussianBlur(a_all, (0, 0), 0.9) * 1.15, 0, 1)
+    af = np.clip(cv2.GaussianBlur(a_all, (0, 0), 1.3) * 1.10, 0, 1)
+    # fin membrane is translucent: let some water show through toward the rim
+    dl = cv2.distanceTransform((a_lion > 0.5).astype(np.uint8), cv2.DIST_L2, 3)
+    edge_t = 0.55 + 0.45 * smoothstep(0.0, 7.0, dl)
+    af = np.where(cv2.dilate(a_lion, np.ones((9, 9), np.uint8)) > 0.5, af * edge_t, af)
     out = bg * (1 - af[..., None]) + fg * af[..., None]
     out = out + (noise * grain)[..., None]                       # one grain over everything
     return np.clip(out, 0, 1)
