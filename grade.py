@@ -26,12 +26,12 @@ PARAMS = dict(
     feather_subject_px=1.5, feather_fish_px=2.5, feather_bg_px=2.5,
     mask_ema_current=0.6,
     # subject
-    reinhard_strength=0.6, subject_ev=0.25, subject_highlight_knee=0.80,
+    reinhard_strength=1.0, subject_ev=0.25, subject_highlight_knee=0.80,
     subject_unsharp_sigma=2.0, subject_unsharp_amount=0.4, subject_red_chroma=0.12,
     # fish
     fish_gamma_L=1.15, fish_unsharp_sigma=1.5, fish_unsharp_amount=0.25,
     # background
-    bg_hue_rotate_deg=17.0, bg_chroma=0.75, bg_blur_sigma=1.0,
+    bg_hue_rotate_deg=20.0, bg_chroma=0.55, bg_blur_sigma=1.0,
     sand_L=0.87, sand_midtone_contrast=0.90,
     rock_L=0.80, rock_texture_reduce=0.60,
     haze_strength=0.22, haze_lab=(0.55, -0.03, -0.035),
@@ -200,11 +200,15 @@ def unsharp(L, sigma, amount):
 
 
 def reference_stats(ref_path):
+    """Target colour of the lionfish from the reference. The prescribed box (x 28-60 %, y 60-77 %) is
+    mostly water (mean hue ~200 deg, teal-grey), which would pull the lionfish towards teal. So the
+    statistics use only the lionfish pixels inside that box: warm (a>0.005) or dark (L<0.30)."""
     ref = cv2.cvtColor(cv2.imread(str(ref_path)), cv2.COLOR_BGR2RGB).astype(np.float32) / 255
     h, w = ref.shape[:2]
     box = ref[int(0.60 * h):int(0.77 * h), int(0.28 * w):int(0.60 * w)]
     lab = lin_to_oklab(srgb_to_lin(box)).reshape(-1, 3)
-    return lab.mean(0), lab.std(0), box.shape
+    sel = (lab[:, 1] > 0.005) | (lab[:, 0] < 0.30)
+    return lab[sel].mean(0), lab[sel].std(0), (box.shape, float(sel.mean()))
 
 
 def subject_source_stats(video, mask_dir, w, h, P, n=30):
@@ -269,10 +273,11 @@ def grade_frame(rgb, S, F, B, P, tgt, src, centroid, yy, xx, rockw, sandw, topw)
     r = np.hypot(xx - centroid[0], yy - centroid[1]) / R
     vig = 1 - P["vignette_strength"] * smoothstep(P["vignette_falloff_start"], 1.0, r)
     lin_o = lin_o * vig[..., None] * (2.0 ** (P["subject_vignette_comp_ev"] * S))[..., None]
-    # black point 0.02 linear (soft), identical every frame
+    # black point ~0.02 linear: everything below it is crushed into a short toe that ends at a 0.004
+    # linear floor, so blacks are crushed but never clipped to 0. Identical every frame.
     bp = P["black_point_lin"]
-    lin_o = (lin_o - bp) / (1 - bp)
-    lin_o = 0.5 * (lin_o + np.sqrt(lin_o * lin_o + 1e-5)) - 0.5 * np.sqrt(1e-5)   # crushed, not clipped
+    t = smoothstep(0.0, 2 * bp, lin_o)
+    lin_o = lin_o * t + 0.004 * (1 - t)
     out = lin_to_srgb(lin_o)
     cap = P["bg_highlight_cap"]                                          # background highlights below 98%
     over = np.maximum(out - 0.90, 0)
@@ -309,7 +314,7 @@ def run(video, mask_dir, ref, out, work, nframes, P):
     sandw = smoothstep(0.40, 0.60, xx / w) * smoothstep(0.10, 0.30, yy / h)   # static: right sand
     topw = smoothstep(0.85, 0.05, yy / h)                  # texture reduction stronger toward the top
     params = dict(P)
-    params.update(reference_box_px=list(bshape), reference_mean_oklab=mu_t.tolist(), reference_std_oklab=sd_t.tolist(),
+    params.update(reference_box_px=list(bshape[0]), reference_lion_pixel_fraction=bshape[1], reference_mean_oklab=mu_t.tolist(), reference_std_oklab=sd_t.tolist(),
                   subject_src_mean_oklab=mu_s.tolist(), subject_src_std_oklab=sd_s.tolist(),
                   video=str(video), reference=str(ref), frames_processed=nframes, total_frames=n,
                   mask_note=(mask_dir / "meta.json").read_text() if (mask_dir / "meta.json").exists() else "")
