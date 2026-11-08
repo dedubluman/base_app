@@ -120,13 +120,13 @@ def read_frames(video, w, h, limit=None):
 
 
 class Encoder:
-    def __init__(self, video, out, w, h, fps, P):
+    def __init__(self, video, out, w, h, fps, P, shortest=False):
         cmd = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb48le", "-s", f"{w}x{h}",
                "-r", fps, "-i", "-", "-i", str(video), "-map", "0:v:0", "-map", "1:a?", "-c:a", "copy",
                "-vf", "scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd+full_chroma_int,format=" + P["pix_fmt"],
                "-c:v", P["codec"], "-preset", P["preset"], "-crf", str(P["crf"]),
                "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv",
-               "-movflags", "+faststart", "-shortest", str(out)]
+               "-movflags", "+faststart"] + (["-shortest"] if shortest else []) + [str(out)]
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
     def write(self, rgb):
@@ -374,7 +374,7 @@ def run(video, mask_dir, ref, out, work, nframes, P, encode_frames=None, save_fr
                   mask_note=(mask_dir / "meta.json").read_text() if (mask_dir / "meta.json").exists() else "")
     (work / "params_used.json").write_text(json.dumps(params, indent=1, default=str))
     ne = nframes if encode_frames is None else encode_frames
-    enc = Encoder(video, out, w, h, fps, P) if ne > 0 else None
+    enc = Encoder(video, out, w, h, fps, P, shortest=ne < n) if ne > 0 else None   # -shortest only for partial test clips
     prev, cen = None, None
     outs, srcs, regions = [], [], []
     st = dict(L=[], clip=[])
