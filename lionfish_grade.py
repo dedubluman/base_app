@@ -365,25 +365,44 @@ def grade_lion(rgb, air, veil, a_lion, bg, scene, vig):
     # translucent membrane stays at the water's own level (it simply shows the water),
     # the rays and bands go darker than the water (dark brown/black) and the accents go
     # lighter (near-white): organic transmission instead of paint.
-    j = dehaze(rgb, air, min(veil + 0.05, 0.6), 1.0)
-    Y = cv2.GaussianBlur(luma(j), (0, 0), 0.6)
+    # raw luminance, NOT the dehazed one: subtracting the veil clips the dark fin zones to
+    # zero and throws their ray structure away before any tone mapping can see it
+    Y = cv2.GaussianBlur(luma(rgb), (0, 0), 0.6)
     excl = (1 - cv2.dilate(a_lion, np.ones((31, 31), np.uint8))).astype(np.float32)
     water = norm_blur(Y, excl, 40)
     r = (Y - water) / (water + 0.05)
     r = r + 0.5 * (r - cv2.GaussianBlur(r, (0, 0), 2.5))         # crisp rays, restrained
     Lbg = norm_blur(luma(bg), excl, 40)                          # graded water level here
-    L = Lbg * (1 + np.where(r < 0, 1.0 * r, 2.4 * r))
-    ln = np.log(Y + 0.03)                                         # open the body's own mid-tones
-    dln = np.clip(ln - cv2.GaussianBlur(ln, (0, 0), 3.0), -0.35, 0.35)
-    L = L * (1 + 1.6 * dln * (L < 0.2))
-    L = np.where(L > 0.42, 0.42 + (L - 0.42) * 0.5, L)           # accents roll off softly
-    L = np.clip(L, 0.058, 0.62)
-    warm = np.array([1.12, 1.00, 0.78], np.float32); warm = warm / luma(warm)
+    # base level (slow) + local contrast ratio (fast): the ray / band structure is shown
+    # relative to the fin's own local brightness, so dark proximal fin zones keep their
+    # cream-and-brown stripes instead of collapsing into one dark mass
+    # equalise the LOCAL contrast of the fin zone (fixed window: no per-frame jitter) so the
+    # faint rays of the dark proximal fin become readable; used for the detail signal only
+    x0, y0, sz = 155, 850, 640
+    mm = a_lion > 0.5
+    ys = cv2.GaussianBlur(luma(rgb), (0, 0), 0.9)
+    win = np.where(mm, ys, np.median(ys[mm]))[y0:y0 + sz, x0:x0 + sz]
+    wlo, whi = np.percentile(win, [0.5, 99.5])
+    w8 = (np.clip((win - wlo) / max(whi - wlo, 1e-3), 0, 1) * 255).astype(np.uint8)
+    eq = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(w8).astype(np.float32) / 255
+    Yc = np.full_like(Y, 0.5)
+    Yc[y0:y0 + sz, x0:x0 + sz] = eq
+    Yb = cv2.GaussianBlur(Y, (0, 0), 3.0)
+    Ycb = cv2.GaussianBlur(Yc, (0, 0), 3.0)
+    D = np.clip(np.log((Yc + 0.05) / (Ycb + 0.05)), -0.9, 0.9)
+    rb = (Yb - water) / (water + 0.05)
+    B = Lbg * (1.45 + np.where(rb < 0, 0.60 * rb, 2.3 * rb))      # lit presence: membrane a little lighter than the water
+    L = B * np.exp(1.75 * D)
+    L = np.where(L > 0.45, 0.45 + (L - 0.45) * 0.55, L)          # accents roll off softly
+    L = np.clip(L, 0.055, 0.70)
+    L = 0.70 * (L / 0.70) ** 1.22                                # deeper dark bands, crisp light ones
+    L = np.clip(L, 0.045, 0.70)
+    warm = np.array([1.20, 1.00, 0.70], np.float32); warm = warm / luma(warm)
     cool = np.array([1.00, 1.00, 0.95], np.float32); cool = cool / luma(cool)
-    wt = smoothstep(0.22, 0.45, L)[..., None]
+    wt = smoothstep(0.17, 0.38, L)[..., None]
     col_t = np.clip((warm * (1 - wt) + cool * wt) * L[..., None], 0, 1)    # sepia shade -> near-white accents
-    o = smoothstep(0.05, 0.30, np.abs(r))
-    o = cv2.GaussianBlur((0.15 + 0.85 * o).astype(np.float32), (0, 0), 1.0)
+    o = smoothstep(0.05, 0.28, np.maximum(np.abs(r), 0.7 * np.abs(D)))
+    o = cv2.GaussianBlur((0.32 + 0.68 * o).astype(np.float32), (0, 0), 1.0)
     scene_nv = scene / np.maximum(vig, 0.3)[..., None]           # the vignette is applied once, below
     col = scene_nv * (1 - o[..., None]) + col_t * o[..., None]
     t = np.clip(L / 0.5, 0, 1)
