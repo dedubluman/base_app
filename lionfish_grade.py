@@ -364,37 +364,28 @@ def grade_lion(rgb, air, veil, a_lion, bg, scene, vig):
     m = a_lion > 0.5
     if m.sum() < 500:
         return scene
-    # Natural lionfish: ONE smooth tone curve on the fish's own (lightly denoised) light.
-    # No local-contrast equalisation, no unsharp, no detail amplification: the existing
-    # stripes and rays are simply lifted in the mid-tones and given highlight gain, so
-    # they read clearly without any crunchy texture. Membrane close to the water's own
-    # level stays see-through.
+    # Natural lionfish: ONE smooth tone curve on the footage's own, untouched pixels.
+    # No blur, no denoise, no sharpening, no local contrast: the existing stripes and rays
+    # are lifted (gamma) and given highlight gain. Only the OPACITY map is smoothed, never
+    # the fish's colour/detail: membrane close to the water's level shows the water.
+    Y = luma(rgb).astype(np.float32)
     mm = a_lion > 0.5
-    ys = luma(rgb).astype(np.float32)
-    u8 = (np.clip(ys, 0, 1) * 255).astype(np.uint8)
-    x0, y0, sz = 155, 850, 640                                   # fixed window around the fish
-    dn = u8.copy()
-    dn[y0:y0 + sz, x0:x0 + sz] = cv2.fastNlMeansDenoising(u8[y0:y0 + sz, x0:x0 + sz], None, 6, 5, 15)
-    Y = cv2.GaussianBlur(dn.astype(np.float32) / 255, (0, 0), 0.8)   # clean, smooth
     excl = (1 - cv2.dilate(a_lion, np.ones((31, 31), np.uint8))).astype(np.float32)
     water = norm_blur(Y, excl, 40)
-    Lbg = norm_blur(luma(bg), excl, 40)                          # graded water level here
-    # tone: percentile anchors smoothed over time (no per-frame pumping)
     lo_n, hi_n = np.percentile(Y[mm], [1.0, 99.5])
     st = _LION_STATE.get("a")
     st = (lo_n, hi_n) if st is None else (0.9 * st[0] + 0.1 * lo_n, 0.9 * st[1] + 0.1 * hi_n)
-    _LION_STATE["a"] = st
+    _LION_STATE["a"] = st                                        # anchors smoothed over time: no pumping
     Yn = np.clip((Y - st[0]) / max(st[1] - st[0], 1e-3), 0, 1)
-    Yn = np.clip(0.34 + (Yn - 0.34) * 1.22, 0, 1)                # one global S-curve: wider tonal separation, no local filter
-    L = 0.080 + (0.66 - 0.080) * Yn ** 0.68                      # clean mid-tone lift, strong highlights
-    L = np.where(L > 0.50, 0.50 + (L - 0.50) * 0.7, L)           # soft highlight roll-off (no clipping)
+    L = 0.075 + (0.72 - 0.075) * Yn ** 0.66                      # clean gamma lift + highlight gain
+    L = np.where(L > 0.50, 0.50 + (L - 0.50) * 0.7, L)           # soft highlight roll-off, no clipping
     warm = np.array([1.16, 1.00, 0.74], np.float32); warm = warm / luma(warm)
-    cool = np.array([1.00, 1.00, 0.95], np.float32); cool = cool / luma(cool)
+    cool = np.array([1.06, 1.00, 0.84], np.float32); cool = cool / luma(cool)      # cream-white accents
     wt = smoothstep(0.20, 0.42, L)[..., None]
     col_t = np.clip((warm * (1 - wt) + cool * wt) * L[..., None], 0, 1)    # sepia body -> cream/white accents
-    r = cv2.GaussianBlur((Y - water) / (water + 0.05), (0, 0), 1.5)
-    o = smoothstep(0.05, 0.28, np.abs(r))
-    o = cv2.GaussianBlur((0.45 + 0.55 * o).astype(np.float32), (0, 0), 1.2)
+    r = cv2.GaussianBlur((Y - water) / (water + 0.05), (0, 0), 1.0)
+    o = smoothstep(0.04, 0.26, np.abs(r))
+    o = cv2.GaussianBlur((0.14 + 0.86 * o).astype(np.float32), (0, 0), 1.2)   # smoothed opacity map only
     scene_nv = scene / np.maximum(vig, 0.3)[..., None]           # the vignette is applied once, below
     col = scene_nv * (1 - o[..., None]) + col_t * o[..., None]
     t = np.clip(L / 0.5, 0, 1)
@@ -406,8 +397,8 @@ def grade_lion(rgb, air, veil, a_lion, bg, scene, vig):
     #    colour of the surrounding water (stronger in the shade of the body)
     amb = norm_blur(bg, excl, 30)
     shade = (1 - t)[..., None]
-    col = col * np.array([0.90, 0.96, 1.00], np.float32)
-    v = 0.12 + 0.12 * shade
+    col = col * np.array([0.95, 0.98, 1.00], np.float32)
+    v = 0.07 + 0.10 * shade
     col = col * (1 - v) + np.clip(amb * 1.25, 0, 1) * v
     # 3) the scene's own light falloff (vignette) and depth darkening
     yy = np.linspace(0, 1, col.shape[0], dtype=np.float32)[:, None, None]
@@ -417,7 +408,7 @@ def grade_lion(rgb, air, veil, a_lion, bg, scene, vig):
     d = cv2.distanceTransform(m.astype(np.uint8), cv2.DIST_L2, 3)
     wrap = (np.exp(-d / 4.5) * 0.88)[..., None]
     col = col * (1 - wrap) + bg * wrap                         # the rim IS the water: no seam
-    return np.clip(cv2.GaussianBlur(col, (0, 0), 0.9), 0, 1)    # match the footage's optical softness
+    return np.clip(col, 0, 1)
 
 
 def grade_fish(rgb, air, a_other, ids, state, bg, scene):
@@ -474,11 +465,11 @@ def process(rgb, am, al, ids, air, veil, vig, noise, state, grain=0.006):
     fish = grade_fish(rgb, air, a_oth, ids, state, bg, scene)
     # foreground colour = weighted by the SAME soft masks that make the alpha, normalised:
     # never multiplied by a fractional alpha, so no dark rim at the boundary
-    wl = cv2.GaussianBlur(a_lion, (0, 0), 1.3) + 1e-4
-    wf = cv2.GaussianBlur(a_oth, (0, 0), 1.3) + 1e-4
+    wl = cv2.GaussianBlur(a_lion, (0, 0), 0.7) + 1e-4
+    wf = cv2.GaussianBlur(a_oth, (0, 0), 0.7) + 1e-4
     fg = (lion * wl[..., None] + fish * wf[..., None]) / (wl + wf)[..., None]
     # soft, sub-pixel edge: slight feather (colour is already decontaminated)
-    af = np.clip(cv2.GaussianBlur(a_all, (0, 0), 1.3) * 1.10, 0, 1)
+    af = np.clip(cv2.GaussianBlur(a_all, (0, 0), 0.7) * 1.06, 0, 1)
     # fin membrane is translucent: let some water show through toward the rim
     dl = cv2.distanceTransform((a_lion > 0.5).astype(np.uint8), cv2.DIST_L2, 3)
     edge_t = 0.55 + 0.45 * smoothstep(0.0, 7.0, dl)
