@@ -28,10 +28,11 @@ PARAMS = dict(
     # subject
     reinhard_strength=1.0, subject_ev=0.25, subject_highlight_knee=0.80,
     subject_unsharp_sigma=2.0, subject_unsharp_amount=0.4, subject_red_chroma=0.12,
-    # fish
+    # fish: mask disabled -> the small fish are graded as part of the background (they sink into the water colour)
+    fish_mask_enabled=False,
     fish_gamma_L=1.15, fish_unsharp_sigma=1.5, fish_unsharp_amount=0.25,
     # background
-    bg_hue_rotate_deg=20.0, bg_chroma=0.55, bg_blur_sigma=1.0,
+    bg_hue_rotate_deg=40.0, bg_chroma=0.55, bg_blur_sigma=1.0,
     sand_L=0.87, sand_midtone_contrast=0.90,
     rock_L=0.80, rock_texture_reduce=0.60,
     haze_strength=0.22, haze_lab=(0.55, -0.03, -0.035),
@@ -290,6 +291,8 @@ def build_alphas(lion_p, fish_p, P, prev):
     fish = cv2.imread(str(fish_p), 0).astype(np.float32) / 255
     S = np.clip(gauss(lion, P["feather_subject_px"]), 0, 1)
     Fr = np.clip(gauss(fish, P["feather_fish_px"]), 0, 1) * (1 - S)
+    if not P["fish_mask_enabled"]:
+        Fr = np.zeros_like(Fr)                             # fish stay in BACKGROUND
     if prev is not None:                                   # temporal EMA on alpha only, no trails
         c = P["mask_ema_current"]
         S = c * S + (1 - c) * prev[0]
