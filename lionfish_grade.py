@@ -377,12 +377,9 @@ def grade_lion(rgb, air, veil, a_lion, bg, scene, vig):
     st = (lo_n, hi_n) if st is None else (0.9 * st[0] + 0.1 * lo_n, 0.9 * st[1] + 0.1 * hi_n)
     _LION_STATE["a"] = st                                        # anchors smoothed over time: no pumping
     Yn = np.clip((Y - st[0]) / max(st[1] - st[0], 1e-3), 0, 1)
-    L = 0.075 + (0.72 - 0.075) * Yn ** 0.66                      # clean gamma lift + highlight gain
+    L = 0.050 + (0.74 - 0.050) * Yn ** 0.86                      # modest lift (shadow noise is not amplified) + highlight gain
     L = np.where(L > 0.50, 0.50 + (L - 0.50) * 0.7, L)           # soft highlight roll-off, no clipping
-    warm = np.array([1.16, 1.00, 0.74], np.float32); warm = warm / luma(warm)
-    cool = np.array([1.06, 1.00, 0.84], np.float32); cool = cool / luma(cool)      # cream-white accents
-    wt = smoothstep(0.20, 0.42, L)[..., None]
-    col_t = np.clip((warm * (1 - wt) + cool * wt) * L[..., None], 0, 1)    # sepia body -> cream/white accents
+    col_t = np.clip(np.stack([L, L, L], -1) * np.array([1.0, 1.0, 1.0], np.float32), 0, 1)   # strictly monochrome: black / grey / white
     r = cv2.GaussianBlur((Y - water) / (water + 0.05), (0, 0), 1.0)
     o = smoothstep(0.04, 0.26, np.abs(r))
     o = cv2.GaussianBlur((0.14 + 0.86 * o).astype(np.float32), (0, 0), 1.2)   # smoothed opacity map only
@@ -398,7 +395,7 @@ def grade_lion(rgb, air, veil, a_lion, bg, scene, vig):
     amb = norm_blur(bg, excl, 30)
     shade = (1 - t)[..., None]
     col = col * np.array([0.95, 0.98, 1.00], np.float32)
-    v = 0.07 + 0.10 * shade
+    v = (0.07 + 0.10 * shade) * (1 - 0.85 * smoothstep(0.25, 0.50, L)[..., None])   # white accents stay white, shade takes the water's colour
     col = col * (1 - v) + np.clip(amb * 1.25, 0, 1) * v
     # 3) the scene's own light falloff (vignette) and depth darkening
     yy = np.linspace(0, 1, col.shape[0], dtype=np.float32)[:, None, None]
