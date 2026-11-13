@@ -47,12 +47,12 @@ class Params:
     keep_skin: float = 0.75
     keep_shorts: float = 0.25
     water_chroma_gain: float = 1.0
-    rock_chroma_gain: float = 1.0
+    rock_chroma_gain: float = 0.85
     rock_shadow_cool: float = 0.65   # share of deep-shadow rock pushed to the blue-black water ramp
     refl_start: float = 52.0      # L* where reflection highlights start to lose water chroma
     refl_end: float = 80.0
-    refl_chroma: float = 5.0
-    refl_hue: float = 75.0
+    refl_chroma: float = 3.5
+    refl_hue: float = 65.0
     shadow_lift: float = 0.0      # added L* in the deepest tones (keeps shadows from crushing)
     # ---- skin / shorts targets
     skin_hue: float = 56.0

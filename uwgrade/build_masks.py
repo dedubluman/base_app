@@ -60,17 +60,27 @@ def stage_env(frames, base: Path, kfdir: Path, log=print):
         P[t] = env.p_rock(clf, np.asarray(frames[t]))
         if t % 100 == 0:
             log(f"[env] p_rock {t}/{T} ({time.time() - t0:.0f}s)")
+    np.save(base / "p_rock_raw_q.npy", (P * 255).astype(np.uint8))
+    env_alpha(base, P, log=log)
+
+
+def env_alpha(base: Path, P: np.ndarray | None = None, lo: float = 0.12, hi: float = 0.88, sigma_q: float = 3.0, log=print):
+    """Raw rock probability (T,h,w) -> soft rock alpha. Wide transition + blur (12 px at full res) because the
+    real water/rock boundary is haze, not an edge: distant rocks fade into the water column."""
+    from scipy.ndimage import convolve1d
+
+    if P is None:
+        P = np.load(base / "p_rock_raw_q.npy").astype(np.float32) / 255.0
+    T = len(P)
     k = np.array([1, 2, 3, 2, 1], np.float32)
     k /= k.sum()
-    from scipy.ndimage import convolve1d
     Ps = convolve1d(P, k, axis=0, mode="nearest")
-    A = smoothstep(0.30, 0.70, Ps)
+    A = smoothstep(lo, hi, Ps)
     (base / "rock").mkdir(parents=True, exist_ok=True)
     for t in range(T):
-        write_a(base / "rock", t, cv2.GaussianBlur(A[t], (0, 0), 1.2))
-    np.save(base / "p_rock_raw_q.npy", (P * 255).astype(np.uint8))
-    log(f"[env] wrote {T} rock alphas; mean raw frame-to-frame |dP| {np.abs(np.diff(P, axis=0)).mean():.4f}, "
-        f"smoothed {np.abs(np.diff(Ps, axis=0)).mean():.4f}")
+        write_a(base / "rock", t, cv2.GaussianBlur(A[t], (0, 0), sigma_q))
+    log(f"[env] wrote {T} rock alphas (smoothstep {lo}-{hi}, blur {sigma_q} px at 1/{env.DS} res); "
+        f"mean raw frame-to-frame |dP| {np.abs(np.diff(P, axis=0)).mean():.4f}, smoothed {np.abs(np.diff(Ps, axis=0)).mean():.4f}")
 
 
 def stage_diver(frames, base: Path, sdir: Path, log=print):
