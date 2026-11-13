@@ -18,6 +18,7 @@ python -m uwgrade.build_masks   --video inputs/player_export.mov --stage parts  
 python -m uwgrade.calibrate     --video inputs/player_export.mov --out uwgrade/params_player_export.json
 python -m uwgrade.render        --video inputs/player_export.mov --params uwgrade/params_player_export.json --out-dir output/underwater_grade --h264
 python -m uwgrade.qc            sheet|masks|metrics|palette|stills ...
+python -m uwgrade.deliver       --master <prores.mov> --out <name>.mp4 [--canvas 1920x1080]   # 1080p H.264 copies from the master
 ```
 
 Install: Python 3.12 venv, CPU torch 2.10, `pip install -e sam3/ einops scikit-learn -r requirements_three_shades.txt`
