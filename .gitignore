@@ -15,3 +15,6 @@ output/
 masks/
 .cache/
 *.log
+
+# Reference photographs for the uwgrade pipeline (personal media, kept local)
+references/
