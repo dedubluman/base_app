@@ -84,8 +84,11 @@ def env_alpha(base: Path, P: np.ndarray | None = None, lo: float = 0.12, hi: flo
 
 
 def stage_diver(frames, base: Path, sdir: Path, log=print):
-    meta = dv.build(frames, sdir, base / "diver", stride=2, log=log)
-    return meta
+    sdirs = {0: sdir}
+    odd = sdir.parent / (sdir.name + "o1")
+    if odd.exists():
+        sdirs[1] = odd
+    return dv.build(frames, sdirs, base / "diver", stride=2, log=log)
 
 
 def stage_parts(frames, base: Path, kfdir: Path, log=print):

@@ -43,11 +43,12 @@ class Params:
     cal: dict = field(default_factory=dict)
     # ---- node behaviour
     keep_water: float = 0.35      # share of the source's local colour variation kept
-    keep_rock: float = 0.45
+    keep_rock: float = 0.35
     keep_skin: float = 0.75
     keep_shorts: float = 0.25
     water_chroma_gain: float = 1.0
-    rock_chroma_gain: float = 0.85
+    rock_chroma_gain: float = 0.80
+    rock_hue_clamp: list = field(default_factory=lambda: [46.0, 82.0])
     rock_shadow_cool: float = 0.65   # share of deep-shadow rock pushed to the blue-black water ramp
     refl_start: float = 52.0      # L* where reflection highlights start to lose water chroma
     refl_end: float = 80.0
@@ -98,13 +99,18 @@ def quantile_curve(src_q, tgt_q, shadow_lift: float = 0.0) -> Curve:
             sq[i] = sq[i - 1] + 0.05
         if tq[i] <= tq[i - 1] + 0.02:
             tq[i] = tq[i - 1] + 0.02
+    sq = np.minimum(sq, 99.0 + 0.001 * np.arange(len(sq)))          # no knot beyond L*=100
     s0 = max(0.5, min(3.0, (tq[1] - tq[0]) / (sq[1] - sq[0])))
     x_lo = max(sq[0] - tq[0] / s0, 0.0)
     xs = [x_lo, *sq]
     ys = [0.0 if x_lo > 0 else max(tq[0] - s0 * sq[0], 0.0), *tq]
-    x_hi = sq[-1] + (100.0 - tq[-1])
-    xs += [min(x_hi, 100.0)] if x_hi > sq[-1] + 1 else []
-    ys += [min(100.0, tq[-1] + (xs[-1] - sq[-1]))] if x_hi > sq[-1] + 1 else []
+    x_hi = min(sq[-1] + (100.0 - tq[-1]), 100.0)
+    if x_hi > sq[-1] + 1:
+        xs.append(x_hi)
+        ys.append(min(100.0, tq[-1] + (x_hi - sq[-1])))
+    xs, ys = np.asarray(xs), np.asarray(ys)
+    keep = np.concatenate([[True], (np.diff(xs) > 1e-3) & (np.diff(ys) > -1e-6)])   # strictly increasing x
+    xs, ys = xs[keep], ys[keep]
     return Curve(xs, ys)
 
 
@@ -139,7 +145,7 @@ class Grader:
         Lk, ak, bk = self.src_ab[key]
         return np.interp(L, Lk, ak).astype(np.float32), np.interp(L, Lk, bk).astype(np.float32)
 
-    def _colorize(self, lab, key, C_fn, H_fn, keep, gain=1.0, refl=False, refl_w=1.0, shadow_cool=0.0):
+    def _colorize(self, lab, key, C_fn, H_fn, keep, gain=1.0, refl=False, refl_w=1.0, shadow_cool=0.0, hue_clamp=None):
         p = self.p
         L = lab[..., 0]
         Lo = self.curves[key](L)
@@ -165,7 +171,18 @@ class Grader:
             w = shadow_cool * (1.0 - smoothstep(2.0, 16.0, Lo))
             wa, wb = polar(C.WATER_C(Lo) * 0.9, C.WATER_H(Lo))
             ta, tb = ta * (1 - w) + wa * w, tb * (1 - w) + wb * w
-        return np.stack([Lo, ta + keep * ra, tb + keep * rb], -1)
+        oa, ob = ta + keep * ra, tb + keep * rb
+        if hue_clamp is not None:
+            # keep lit-tone hue inside the reference's range (no red/orange tail from the kept source variation);
+            # blue-black shadows (below L~14) are left alone
+            h = hue_deg(oa, ob)
+            c = np.hypot(oa, ob)
+            mid = 0.5 * (hue_clamp[0] + hue_clamp[1])
+            d = ((h - mid + 180.0) % 360.0) - 180.0
+            dc = np.clip(d, hue_clamp[0] - mid, hue_clamp[1] - mid)
+            wgt = smoothstep(14.0, 24.0, Lo)
+            oa, ob = polar(c, mid + d + wgt * (dc - d))
+        return np.stack([Lo, oa, ob], -1)
 
     def node_water(self, lab, surface_w=None):
         p = self.p
@@ -181,7 +198,7 @@ class Grader:
     def node_rock(self, lab):
         p = self.p
         return self._colorize(lab, "rock", C.ROCK_C, C.ROCK_H, p.keep_rock, p.rock_chroma_gain,
-                              shadow_cool=p.rock_shadow_cool)
+                              shadow_cool=p.rock_shadow_cool, hue_clamp=tuple(p.rock_hue_clamp))
 
     def node_skin(self, lab):
         p = self.p
@@ -208,7 +225,7 @@ class Grader:
         """Hair, snorkel, fins: deep neutral-cool blacks with their shape kept."""
         p = self.p
         L = lab[..., 0]
-        Lo = np.interp(L, [0, 8, 20, 35, 60, 100], [0, 2.5, 8.0, 18.0, 40.0, 80.0]).astype(np.float32)
+        Lo = np.interp(L, [0, 8, 20, 35, 60, 100], [0, 3.5, 11.0, 22.0, 44.0, 82.0]).astype(np.float32)
         ta, tb = polar(np.full_like(Lo, p.gear_chroma), p.gear_hue)
         return np.stack([Lo, ta, tb], -1)
 

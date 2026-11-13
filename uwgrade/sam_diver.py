@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""SAM 3.1 video tracking of the diver on every ``--stride``-th frame.
+"""SAM 3.1 video tracking of the diver on every ``--stride``-th frame (``--offset`` picks which).
 
-SAM 3.1 costs ~13 s/frame on 4 CPU cores, so the diver is tracked on every
-2nd frame (15 fps) and interpolated to the other frames in ``masks.py`` (flow
-warp + edge snap). Chunked and resumable (shades.masking.run_sam31).
+SAM 3.1 costs ~13 s/frame on 4 CPU cores, so each pass is split into a stride-2 stream (even frames,
+then odd frames). Chunked and resumable (shades.masking.run_sam31).
 
-    python -m uwgrade.sam_diver --input inputs/player_export.mov --stride 2
+    python -m uwgrade.sam_diver --input inputs/player_export.mov --stride 2 --offset 0   # even frames
+    python -m uwgrade.sam_diver --input inputs/player_export.mov --stride 2 --offset 1   # odd frames
+
+Interpolating the odd frames from the even ones (optical flow) was measured and rejected: leave-one-out
+IoU only ~0.90 and ~15 px errors on the fast-moving head. All frames are therefore SAM-segmented.
 """
 from __future__ import annotations
 
@@ -21,12 +24,12 @@ import shades.masking as M  # noqa: E402
 from shades.config import Masking  # noqa: E402
 
 
-def stride_proxy(src: Path, stride: int) -> Path:
-    dst = REPO / ".cache" / f"{src.stem}_s{stride}.mp4"
+def stride_proxy(src: Path, stride: int, offset: int = 0) -> Path:
+    dst = REPO / ".cache" / (f"{src.stem}_s{stride}.mp4" if offset == 0 else f"{src.stem}_s{stride}o{offset}.mp4")
     if not dst.exists():
         dst.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src), "-an", "-vf",
-                        f"select='not(mod(n,{stride}))'", "-fps_mode", "passthrough",
+                        f"select='eq(mod(n,{stride}),{offset})'", "-fps_mode", "passthrough",
                         "-c:v", "libx264", "-crf", "2", "-preset", "veryfast",
                         "-pix_fmt", "yuv420p", str(dst)], check=True)
     return dst
@@ -36,11 +39,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", type=Path, required=True)
     ap.add_argument("--stride", type=int, default=2)
+    ap.add_argument("--offset", type=int, default=0, help="track source frames n with n %% stride == offset")
     ap.add_argument("--text", default="person")
     ap.add_argument("--det-thresh", type=float, default=0.3,
                     help="lower than SAM's 0.4/0.65 so the small, hazy diver at the end of the clip is still picked up")
     a = ap.parse_args()
-    proxy = stride_proxy(a.input, a.stride)
+    proxy = stride_proxy(a.input, a.stride, a.offset)
 
     orig = M._build_predictor
 
@@ -52,7 +56,8 @@ def main() -> int:
 
     M._build_predictor = build
     cfg = Masking(text_prompt=a.text, parts={}, chunk_frames=32, chunk_overlap=4, max_num_objects=4)
-    mdir = REPO / "masks" / f"{a.input.stem}__{a.text.replace(' ', '_')}_s{a.stride}"
+    tag = f"s{a.stride}" if a.offset == 0 else f"s{a.stride}o{a.offset}"
+    mdir = REPO / "masks" / f"{a.input.stem}__{a.text.replace(' ', '_')}_{tag}"
     M.run_sam31(proxy, mdir, cfg, REPO, REPO / ".cache")
     return 0
 

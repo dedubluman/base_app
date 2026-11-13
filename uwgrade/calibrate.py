@@ -57,16 +57,19 @@ def main() -> int:
     frames = video.frame_cache(a.video, REPO / ".cache" / "frames_u8.npy")
     rng = np.random.default_rng(0)
 
-    env_px, per = [], []
+    env_px, all_px = [], []
     data = {k: [] for k in ("water", "rock", "surf", "skin", "shorts")}
     # pass 1: node-1 levels from non-diver pixels
     for t in KF:
         rgb = np.asarray(frames[t], np.float32)[::2, ::2] / 255.0
         D = read_a(base / "diver", t)[::2, ::2] > 0.2
         env_px.append(rgb[~D])
+        all_px.append(rgb)
     E = np.concatenate(env_px)
+    # black point from the environment (that is where the veil is); white point from ALL pixels, so the
+    # white shorts anchor it and nothing on the subject is clipped by the levels stretch
     bp = np.percentile(E, 0.5, axis=0)
-    wp = np.percentile(E, 99.8, axis=0)
+    wp = np.percentile(np.concatenate([x.reshape(-1, 3) for x in all_px]), 99.9, axis=0)
     p = Params(l1_black=[float(x) for x in bp], l1_white=[float(x) for x in wp], l1_strength=a.l1_strength)
     print("node-1 levels black", np.round(bp, 3), "white", np.round(wp, 3))
     from uwgrade.grade import Grader

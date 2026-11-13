@@ -1,12 +1,13 @@
 """Diver alpha for every frame from the stride-2 SAM 3.1 tracking.
 
-* even source frames: SAM 3.1 mask used directly
-* odd source frames: both SAM neighbours are warped onto the frame with dense
-  optical flow (DIS), averaged, thresholded
+* every frame SAM 3.1 segmented (even stream + odd stream): mask used directly
 * every frame: edge snap with a guided filter on the image luminance, kept in
-  a narrow band around the SAM / warped boundary (no feather, no halo)
+  a narrow band around the SAM boundary (no feather, no halo)
 * frames where SAM lost the diver (empty / sudden area jump) are rebuilt from
-  the nearest good neighbours the same way
+  the nearest good SAM frames by dense optical flow (DIS), then snapped
+
+Flow interpolation of whole frames was measured and rejected (leave-one-out IoU ~0.90,
+~15 px error on the fast-moving head), hence SAM on every frame.
 """
 from __future__ import annotations
 
@@ -69,34 +70,43 @@ def snap(raw: np.ndarray, rgb01: np.ndarray, r_in: int = 4, r_out: int = 1) -> n
     return np.minimum(cv2.GaussianBlur(a, (0, 0), 0.7), outer).astype(np.float32)
 
 
-def load_sam(sdir: Path, n_proxy: int, shape: tuple[int, int]) -> list[np.ndarray | None]:
-    out: list[np.ndarray | None] = []
-    for i in range(n_proxy):
-        f = sdir / "subject" / f"{i:05d}.png"
-        m = cv2.imread(str(f), cv2.IMREAD_GRAYSCALE) if f.exists() else None
-        out.append(None if m is None else (m > 127))
+def load_all(sdirs: dict, T: int, stride: int) -> list:
+    """Per-source-frame SAM masks from the stride streams: {offset: dir}, proxy index i <-> frame stride*i+offset."""
+    out: list = [None] * T
+    for off, d in sdirs.items():
+        i = 0
+        while stride * i + off < T:
+            f = Path(d) / "subject" / f"{i:05d}.png"
+            if f.exists():
+                out[stride * i + off] = cv2.imread(str(f), cv2.IMREAD_GRAYSCALE) > 127
+            i += 1
     return out
 
 
-def good_flags(masks: list[np.ndarray | None], jump: float = 2.2, min_frac: float = 0.0008) -> np.ndarray:
+def good_flags(masks: list, jump: float = 2.2, min_frac: float = 0.0008) -> np.ndarray:
     area = np.array([0 if m is None else int(m.sum()) for m in masks], np.float64)
     h, w = next(m for m in masks if m is not None).shape
     ok = area > min_frac * h * w
-    med = np.array([np.median(area[max(0, i - 3):i + 4][ok[max(0, i - 3):i + 4]]) if ok[max(0, i - 3):i + 4].any() else 0
-                    for i in range(len(area))])
+    med = np.zeros(len(area))
+    for i in range(len(area)):
+        win = slice(max(0, i - 4), i + 5)
+        sel = ok[win]
+        med[i] = np.median(area[win][sel]) if sel.any() else 0
     ok &= (area < jump * np.maximum(med, 1)) & (area > np.maximum(med, 1) / jump)
     return ok
 
 
-def build(frames_u8, sdir: Path, out_dir: Path, stride: int = 2, log=print) -> dict:
-    """Write out_dir/<t:05d>.png (uint8 alpha) for every source frame t."""
+def build(frames_u8, sdirs: dict, out_dir: Path, stride: int = 2, log=print, only=None) -> dict:
+    """Write out_dir/<t:05d>.png (uint8 alpha) for every source frame t (or only those in `only`).
+
+    Every frame SAM 3.1 segmented is used directly (+ edge snap). A frame SAM lost (empty / area jump) or that
+    was not segmented is rebuilt by flow-warping the nearest good SAM frames onto it (+ wider edge snap)."""
     T, H, W = frames_u8.shape[:3]
-    n_proxy = (T + stride - 1) // stride
-    sam = load_sam(sdir, n_proxy, (H, W))
+    sam = load_all(sdirs, T, stride)
     ok = good_flags(sam)
-    log(f"[diver] SAM proxy frames {n_proxy}, usable {int(ok.sum())}, lost {n_proxy - int(ok.sum())}")
+    log(f"[diver] frames {T}: SAM-direct {int(ok.sum())}, rebuilt from neighbours {T - int(ok.sum())}")
     out_dir.mkdir(parents=True, exist_ok=True)
-    grays = {}
+    grays: dict = {}
 
     def g(t):
         if t not in grays:
@@ -105,34 +115,23 @@ def build(frames_u8, sdir: Path, out_dir: Path, stride: int = 2, log=print) -> d
                 grays.pop(next(iter(grays)))
         return grays[t]
 
-    def first_ok(rng):
-        for j in rng:
-            if ok[j]:
-                return j
-        return None
-
     meta = {}
-    for t in range(T):
+    for t in (range(T) if only is None else only):
         rgb01 = np.asarray(frames_u8[t], np.float32) / 255.0
-        if t % stride == 0 and ok[t // stride]:
-            raw = sam[t // stride]
+        if ok[t]:
+            a = snap(sam[t], rgb01, 4, 1)
             src = "sam"
-            a = snap(raw, rgb01, 4, 1)
         else:
-            i = t // stride
-            # nearest usable SAM frame at or before t, and at or after t
-            lo = first_ok(range(i, -1, -1))
-            hi = first_ok(range(i if t % stride == 0 else i + 1, n_proxy))
+            lo = next((j for j in range(t - 1, -1, -1) if ok[j]), None)
+            hi = next((j for j in range(t + 1, T) if ok[j]), None)
             cands = [j for j in (lo, hi) if j is not None]
             acc, wsum = np.zeros((H, W), np.float32), 0.0
             for j in cands:
-                s = j * stride
-                fl = flow(g(t), g(s))
-                wj = 1.0 / (abs(t - s) + 1e-3) if t != s else 1e3
-                acc += wj * warp(sam[j].astype(np.float32), fl)
+                wj = 1.0 / abs(t - j)
+                acc += wj * warp(sam[j].astype(np.float32), flow(g(t), g(j)))
                 wsum += wj
             raw = (acc / max(wsum, 1e-6)) > 0.5 if cands else np.zeros((H, W), bool)
-            src = "interp"
+            src = "rebuilt"
             a = snap(raw, rgb01, 5, 4)
         cv2.imwrite(str(out_dir / f"{t:05d}.png"), (np.clip(a, 0, 1) * 255 + 0.5).astype(np.uint8))
         meta[t] = {"src": src, "area": float(a.sum())}
