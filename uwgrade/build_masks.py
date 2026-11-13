@@ -83,15 +83,15 @@ def env_alpha(base: Path, P: np.ndarray | None = None, lo: float = 0.12, hi: flo
         f"mean raw frame-to-frame |dP| {np.abs(np.diff(P, axis=0)).mean():.4f}, smoothed {np.abs(np.diff(Ps, axis=0)).mean():.4f}")
 
 
-def stage_diver(frames, base: Path, sdir: Path, log=print):
+def stage_diver(frames, base: Path, sdir: Path, log=print, only=None):
     sdirs = {0: sdir}
     odd = sdir.parent / (sdir.name + "o1")
     if odd.exists():
         sdirs[1] = odd
-    return dv.build(frames, sdirs, base / "diver", stride=2, log=log)
+    return dv.build(frames, sdirs, base / "diver", stride=2, log=log, only=only)
 
 
-def stage_parts(frames, base: Path, kfdir: Path, log=print):
+def stage_parts(frames, base: Path, kfdir: Path, log=print, only=None):
     T = len(frames)
     dd = base / "diver"
     dfn = lambda t: read_a(dd, t)
@@ -101,7 +101,7 @@ def stage_parts(frames, base: Path, kfdir: Path, log=print):
 
     clf, (X, y, g) = parts.train(frames, dfn, sfn, KF, log=log)
     parts.loo_accuracy(X, y, g, log=log)
-    for t in range(T):
+    for t in (range(T) if only is None else only):
         D = dfn(t)
         P = parts.classify(clf, np.asarray(frames[t]), D)
         for k, name in enumerate(("skin", "gear", "shorts")):
@@ -114,17 +114,22 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", type=Path, required=True)
     ap.add_argument("--stage", choices=["env", "diver", "parts", "all"], default="all")
+    ap.add_argument("--frames", default=None, help="subset for diver/parts, e.g. 0:452:6 (default: every frame)")
     a = ap.parse_args()
+    only = None
+    if a.frames:
+        from uwgrade.sam_keyframes import parse_frames
+        only = parse_frames(a.frames)
     stem = a.video.stem
     base, kfdir, sdir = paths(stem)
     base.mkdir(parents=True, exist_ok=True)
     frames = video.frame_cache(a.video, REPO / ".cache" / "frames_u8.npy")
     if a.stage in ("diver", "all"):
-        stage_diver(frames, base, sdir)
+        stage_diver(frames, base, sdir, only=only)
     if a.stage in ("env", "all"):
         stage_env(frames, base, kfdir)
     if a.stage in ("parts", "all"):
-        stage_parts(frames, base, kfdir)
+        stage_parts(frames, base, kfdir, only=only)
     return 0
 
 
