@@ -1,0 +1,44 @@
+{
+ "frames": 453,
+ "water": {
+  "mean_Lab": [
+   20.8,
+   -5.2,
+   -16.0
+  ],
+  "frame_to_frame_dE_mean": 0.25493998391747236,
+  "frame_to_frame_dE_p99": 1.355324210188271,
+  "frame_to_frame_dE_max": 2.4297678984826376,
+  "worst_frame": 18
+ },
+ "rock": {
+  "mean_Lab": [
+   23.1,
+   1.7,
+   -1.5
+  ],
+  "frame_to_frame_dE_mean": 0.14427447694559087,
+  "frame_to_frame_dE_p99": 0.9471933046710884,
+  "frame_to_frame_dE_max": 1.4400654187225537,
+  "worst_frame": 435
+ },
+ "diver": {
+  "mean_Lab": [
+   48.5,
+   1.8,
+   2.0
+  ],
+  "frame_to_frame_dE_mean": 0.7095216028896657,
+  "frame_to_frame_dE_p99": 2.7116507076480802,
+  "frame_to_frame_dE_max": 6.182481563327042,
+  "worst_frame": 90
+ },
+ "alpha_flicker_mean_abs_diff": {
+  "diver": 0.003938927696229668,
+  "rock": 0.00480617737537662
+ },
+ "alpha_flicker_max_abs_diff": {
+  "diver": 0.015953054651618004,
+  "rock": 0.02145504206418991
+ }
+}

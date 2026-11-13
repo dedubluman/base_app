@@ -26,7 +26,7 @@ sys.path.insert(0, str(REPO))
 from uwgrade import env, video  # noqa: E402
 from uwgrade.build_masks import KF, paths, read_a  # noqa: E402
 from uwgrade.color import rgb2lab  # noqa: E402
-from uwgrade.grade import Q_LEVELS, Params, save_params  # noqa: E402
+from uwgrade.grade import Q_LEVELS, Params, haze_dc, save_params  # noqa: E402
 
 
 def ab_ramp(L, a, b, lo, hi, width=3.0, min_n=150):
@@ -74,15 +74,20 @@ def main() -> int:
     print("node-1 levels black", np.round(bp, 3), "white", np.round(wp, 3))
     from uwgrade.grade import Grader
     g0 = Grader(p)
+    hz = []
     # pass 2: region statistics after node 1
     for t in KF:
         rgb = np.asarray(frames[t], np.float32) / 255.0
-        lab = rgb2lab(g0.node1(rgb))[::2, ::2]
+        lab = rgb2lab(g0.node1(rgb, read_a(base / "diver", t)))[::2, ::2]
         D = read_a(base / "diver", t)[::2, ::2]
-        R = read_a(base / "rock", t)[::2, ::2]
+        R = cv2.resize(read_a(base / "rock", t), (lab.shape[1], lab.shape[0]), interpolation=cv2.INTER_CUBIC)
         sd = env.seeds(kfdir, t, frames.shape[1:3])
         S = sd["surf"][::2, ::2]
         envm = D < 0.05
+        dc = haze_dc(rgb, read_a(base / "diver", t))
+        Rq = cv2.resize(read_a(base / "rock", t), (dc.shape[1], dc.shape[0]))
+        Dq = cv2.resize(read_a(base / "diver", t), (dc.shape[1], dc.shape[0]))
+        hz.append(dc[(Rq > 0.8) & (Dq < 0.05)])
         sets = {"rock": envm & (R > 0.85), "water": envm & (R < 0.15), "surf": envm & S & (R < 0.5)}
         for k in ("skin", "shorts"):
             P = read_a(base / k, t)[::2, ::2]
@@ -104,6 +109,9 @@ def main() -> int:
         cal[k] = {"n": int(len(px)), "L_q": [float(x) for x in Lq], "ab_ramp": ab_ramp(px[:, 0], px[:, 1], px[:, 2], lo, hi)}
         print(f"{k:7s} n={len(px):7d} L_q={np.round(Lq, 1).tolist()}  mean ab=({px[:, 1].mean():.1f}, {px[:, 2].mean():.1f})")
     p.cal = cal
+    hz = np.concatenate(hz)
+    p.haze_lo, p.haze_hi = [float(x) for x in np.percentile(hz, [5, 95])]
+    print(f"haze (underwater dark channel over rock pixels): p5 {p.haze_lo:.3f}  p95 {p.haze_hi:.3f}")
     save_params(p, a.out)
     print("wrote", a.out)
     return 0

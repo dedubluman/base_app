@@ -6,8 +6,9 @@
 * frames where SAM lost the diver (empty / sudden area jump) are rebuilt from
   the nearest good SAM frames by dense optical flow (DIS), then snapped
 
-Flow interpolation of whole frames was measured and rejected (leave-one-out IoU ~0.90,
-~15 px error on the fast-moving head), hence SAM on every frame.
+Flow interpolation of an odd frame from its even neighbours was measured against real SAM odd frames: mean IoU
+0.967, mean boundary displacement 0.9 px (p90 1.4 px), worst case 11 px (frame 87). Good on average, but the
+outliers would flicker at the subject's edge, hence SAM on every frame and flow only as a fallback.
 """
 from __future__ import annotations
 
@@ -96,13 +97,20 @@ def good_flags(masks: list, jump: float = 2.2, min_frac: float = 0.0008) -> np.n
     return ok
 
 
-def build(frames_u8, sdirs: dict, out_dir: Path, stride: int = 2, log=print, only=None) -> dict:
+def build(frames_u8, sdirs: dict, out_dir: Path, stride: int = 2, log=print, only=None, patch_dir=None) -> dict:
     """Write out_dir/<t:05d>.png (uint8 alpha) for every source frame t (or only those in `only`).
 
     Every frame SAM 3.1 segmented is used directly (+ edge snap). A frame SAM lost (empty / area jump) or that
     was not segmented is rebuilt by flow-warping the nearest good SAM frames onto it (+ wider edge snap)."""
     T, H, W = frames_u8.shape[:3]
     sam = load_all(sdirs, T, stride)
+    if patch_dir is not None and Path(patch_dir).exists():      # SAM-prompted accessory repairs (see patches.py)
+        for f in sorted(Path(patch_dir).glob("*.png")):
+            t = int(f.stem)
+            add = cv2.imread(str(f), cv2.IMREAD_GRAYSCALE) > 127
+            if sam[t] is not None and add.any():
+                sam[t] = sam[t] | add
+        log(f"[diver] applied accessory patches from {Path(patch_dir).name}")
     ok = good_flags(sam)
     log(f"[diver] frames {T}: SAM-direct {int(ok.sum())}, rebuilt from neighbours {T - int(ok.sum())}")
     out_dir.mkdir(parents=True, exist_ok=True)

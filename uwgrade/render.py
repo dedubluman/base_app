@@ -73,6 +73,7 @@ def main() -> int:
     stem = a.video.stem
     base, _, _ = paths(stem)
     a.out_dir.mkdir(parents=True, exist_ok=True)
+    (a.out_dir / "grade_params_effective.json").write_text(load_params(a.params).effective_json())
 
     if a.stills:
         wanted = [int(x) for x in a.stills.split(",")]

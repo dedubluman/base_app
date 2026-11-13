@@ -63,6 +63,21 @@ def sheet(src: Path, graded: Path, frames: list[int], out: Path, w: int = 460):
     cv2.imwrite(str(out), cv2.cvtColor(img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 90])
 
 
+def stills_sheet(stills: Path, frames: list[int], out: Path, w: int = 430, cols: int = 1):
+    """source | graded pairs from render --stills PNGs, plus the two references."""
+    rows = []
+    for n in frames:
+        a = cv2.cvtColor(cv2.imread(str(stills / f"source_{n:05d}.png")), cv2.COLOR_BGR2RGB)
+        b = cv2.cvtColor(cv2.imread(str(stills / f"graded_{n:05d}.png")), cv2.COLOR_BGR2RGB)
+        rows.append(np.hstack([_label(_fit(a, w), f"source f{n}"), _label(_fit(b, w), f"graded f{n}")]))
+    left = np.vstack(rows)
+    refs = [_label(_fit(cv2.cvtColor(cv2.imread(str(r)), cv2.COLOR_BGR2RGB), w), f"REFERENCE {i + 1}") for i, r in enumerate(REFS)]
+    col = np.vstack(refs)
+    H = left.shape[0]
+    col = np.vstack([col, np.zeros((max(H - col.shape[0], 0), col.shape[1], 3), np.uint8)])[:H]
+    cv2.imwrite(str(out), cv2.cvtColor(np.hstack([left, col]), cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 90])
+
+
 def masks_sheet(src: Path, frames: list[int], out: Path, w: int = 460):
     base, _, _ = paths(src.stem)
     tiles = []
@@ -125,9 +140,42 @@ def metrics(src: Path, graded: Path, out: Path):
     print(json.dumps(res, indent=1))
 
 
+def palette(src: Path, graded: Path, out: Path, step: int = 15):
+    """Region-wise Lab statistics of the rendered master (every `step`-th frame) next to the reference targets."""
+    base, _, _ = paths(src.stem)
+    acc = {k: [] for k in ("water", "rock_lit", "rock_all", "skin", "shorts", "gear")}
+    for i, g in video.decode(graded, 8):
+        if i % step:
+            continue
+        lab = rgb2lab(g.astype(np.float32) / 255)[::2, ::2]
+        D = read_a(base / "diver", i)[::2, ::2]
+        R = cv2.resize(read_a(base / "rock", i), (lab.shape[1], lab.shape[0]), interpolation=cv2.INTER_CUBIC)
+        sk, ge, sh = (read_a(base / k, i)[::2, ::2] for k in ("skin", "gear", "shorts"))
+        tot = np.maximum(sk + ge + sh, 1e-3)
+        env = D < 0.05
+        sets = {"water": env & (R < 0.15), "rock_all": env & (R > 0.85), "rock_lit": env & (R > 0.85) & (lab[..., 0] > 32),
+                "skin": (D > 0.9) & (sk / tot > 0.8), "shorts": (D > 0.9) & (sh / tot > 0.8), "gear": (D > 0.9) & (ge / tot > 0.8)}
+        for k, m in sets.items():
+            if m.sum() > 300:
+                acc[k].append(lab[m])
+    ref = {"water": "REF water L p5/p50/p95 3.1/18.6/38.0, ab (-4.4..-5.2, -15.7..-17.7), hue 253-259",
+           "rock_lit": "REF warm rock (L 28-50) hue 47-81, chroma 8-16",
+           "skin": "REF1 (63.7, 5.2, 11.6)  REF2 (58.9, 9.8, 9.4)",
+           "shorts": "REF1 (79.4, -6.0, -12.3) lit; REF2 (59.6, -3.5, -12.3) shade"}
+    rows, res = [], {}
+    for k, v in acc.items():
+        px = np.concatenate(v)
+        a, b = float(px[:, 1].mean()), float(px[:, 2].mean())
+        hue = float(np.degrees(np.arctan2(b, a)) % 360)
+        res[k] = {"n_px": int(len(px)), "L_p5_p50_p95": [round(float(x), 1) for x in np.percentile(px[:, 0], [5, 50, 95])],
+                  "mean_ab": [round(a, 1), round(b, 1)], "hue": round(hue), "chroma": round(float(np.hypot(a, b)), 1), "reference": ref.get(k, "")}
+    Path(out).write_text(json.dumps(res, indent=1))
+    print(json.dumps(res, indent=1))
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["sheet", "masks", "metrics"])
+    ap.add_argument("cmd", choices=["sheet", "masks", "metrics", "stills", "palette"])
     ap.add_argument("--video", type=Path, required=True)
     ap.add_argument("--graded", type=Path)
     ap.add_argument("--frames", default="5,225,445")
@@ -136,6 +184,10 @@ def main():
     fr = [int(x) for x in a.frames.split(",")]
     if a.cmd == "sheet":
         sheet(a.video, a.graded, fr, a.out)
+    elif a.cmd == "palette":
+        palette(a.video, a.graded, a.out)
+    elif a.cmd == "stills":
+        stills_sheet(a.graded, fr, a.out)
     elif a.cmd == "masks":
         masks_sheet(a.video, fr, a.out)
     else:

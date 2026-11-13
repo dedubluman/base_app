@@ -68,7 +68,7 @@ class Curve:
         xs = np.asarray(xs, np.float64)
         ys = np.asarray(ys, np.float64)
         self.x = np.linspace(lo, hi, n, dtype=np.float32)
-        self.y = PchipInterpolator(xs, ys, extrapolate=True)(self.x).astype(np.float32)
+        self.y = np.clip(PchipInterpolator(xs, ys, extrapolate=True)(self.x), 0.0, 100.0).astype(np.float32)
 
     def __call__(self, v: np.ndarray) -> np.ndarray:
         return np.interp(v, self.x, self.y).astype(np.float32)
@@ -88,12 +88,12 @@ def ramp(xs, ys):
 # little chroma; the mid water is petrol blue (hue ~255-260), the lit water
 # near the surface drifts toward cyan (hue ~232) and loses chroma.
 WATER_C = ramp([0, 4, 11, 17, 24, 33, 44, 60, 100], [4.0, 8.5, 13.7, 16.0, 21.0, 23.5, 20.5, 17.0, 8.0])
-WATER_H = ramp([0, 10, 30, 38, 46, 60, 100], [262, 260, 255, 245, 235, 228, 225])
+WATER_H = ramp([0, 10, 30, 38, 46, 60, 100], [257, 255, 251, 243, 234, 228, 225])
 
 # rocks: warm brown. Hue goes olive-brown in the shadows -> bronze/copper in the
 # lit tones; chroma stays low (muted), never orange.
-ROCK_C = ramp([0, 4, 11, 17, 24, 33, 44, 60, 100], [2.5, 4.0, 6.5, 7.8, 9.0, 11.0, 13.0, 14.0, 8.0])
-ROCK_H = ramp([0, 12, 25, 40, 60, 100], [74, 70, 62, 55, 52, 50])
+ROCK_C = ramp([0, 4, 11, 17, 24, 33, 44, 60, 100], [2.5, 4.0, 6.5, 7.8, 9.0, 11.0, 13.5, 15.0, 9.0])
+ROCK_H = ramp([0, 12, 25, 40, 60, 100], [66, 63, 60, 56, 54, 52])
 
 
 def polar(C, H_deg):

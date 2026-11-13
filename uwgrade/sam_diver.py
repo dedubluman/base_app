@@ -7,8 +7,11 @@ then odd frames). Chunked and resumable (shades.masking.run_sam31).
     python -m uwgrade.sam_diver --input inputs/player_export.mov --stride 2 --offset 0   # even frames
     python -m uwgrade.sam_diver --input inputs/player_export.mov --stride 2 --offset 1   # odd frames
 
-Interpolating the odd frames from the even ones (optical flow) was measured and rejected: leave-one-out
-IoU only ~0.90 and ~15 px errors on the fast-moving head. All frames are therefore SAM-segmented.
+Why the odd frames are SAM-segmented too (measured afterwards against these SAM odd frames):
+flow interpolation of an odd frame from its two even neighbours would have scored mean IoU 0.967, mean boundary
+displacement 0.9 px (p90 1.4 px) -- fine on average -- but with a worst case of 11 px (frame 87, IoU 0.70) on the
+fast-moving head. Single-frame errors like that flicker at the subject's edge, so every frame is SAM-direct and
+interpolation is kept only as a fallback for frames SAM loses.
 """
 from __future__ import annotations
 

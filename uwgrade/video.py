@@ -88,7 +88,7 @@ class ProResWriter:
                "-vf", "scale=out_range=tv:out_color_matrix=bt709:flags=accurate_rnd+full_chroma_int+bicubic,format=yuv422p10le",
                "-c:v", "prores_ks", "-profile:v", "3", "-vendor", "apl0", "-bits_per_mb", "8000",
                "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv",
-               "-shortest", "-movflags", "+write_colr", str(out)]
+               "-movflags", "+write_colr", str(out)]   # no -shortest: it trimmed the last video frame (video is 2 ms longer than the audio)
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
     def write(self, rgb16: np.ndarray):

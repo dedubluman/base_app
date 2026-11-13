@@ -29,11 +29,17 @@ from uwgrade import env, parts, video  # noqa: E402
 from uwgrade.color import smoothstep  # noqa: E402
 
 KF = list(range(0, 451, 30))
+MIN_BLOB = 600   # quarter-resolution px (~9600 full-resolution px)
 
 
 def paths(stem: str):
     base = REPO / "masks" / f"{stem}__final"
     return base, REPO / "masks" / f"{stem}__keyframes", REPO / "masks" / f"{stem}__person_s2"
+
+
+def parse_range(spec: str) -> tuple[int, int]:
+    a, b = spec.split(":")[:2]
+    return int(a), int(b)
 
 
 def read_a(d: Path, t: int) -> np.ndarray:
@@ -77,7 +83,17 @@ def env_alpha(base: Path, P: np.ndarray | None = None, lo: float = 0.12, hi: flo
     Ps = convolve1d(P, k, axis=0, mode="nearest")
     A = smoothstep(lo, hi, Ps)
     (base / "rock").mkdir(parents=True, exist_ok=True)
+    removed = 0
     for t in range(T):
+        # isolated rock specks in the water (reflection / particle blobs) and tiny water holes in the rock are
+        # classifier noise, not structure: drop components under MIN_BLOB quarter-resolution pixels
+        b = (Ps[t] > 0.5).astype(np.uint8)
+        for val in (1, 0):
+            n, lab, st, _ = cv2.connectedComponentsWithStats(b if val else 1 - b)
+            small = np.isin(lab, [i for i in range(1, n) if st[i, 4] < MIN_BLOB])
+            if small.any():
+                removed += int(small.any())
+                A[t][small] = float(1 - val)
         write_a(base / "rock", t, cv2.GaussianBlur(A[t], (0, 0), sigma_q))
     log(f"[env] wrote {T} rock alphas (smoothstep {lo}-{hi}, blur {sigma_q} px at 1/{env.DS} res); "
         f"mean raw frame-to-frame |dP| {np.abs(np.diff(P, axis=0)).mean():.4f}, smoothed {np.abs(np.diff(Ps, axis=0)).mean():.4f}")
@@ -88,10 +104,13 @@ def stage_diver(frames, base: Path, sdir: Path, log=print, only=None):
     odd = sdir.parent / (sdir.name + "o1")
     if odd.exists():
         sdirs[1] = odd
-    return dv.build(frames, sdirs, base / "diver", stride=2, log=log, only=only)
+    pdir = sdir.parent / (sdir.name.split("__")[0] + "__patch")
+    return dv.build(frames, sdirs, base / "diver", stride=2, log=log, only=only, patch_dir=pdir if pdir.exists() else None)
 
 
 def stage_parts(frames, base: Path, kfdir: Path, log=print, only=None):
+    """Classify skin / gear / shorts inside the diver for every frame, then smooth the probabilities over time
+    (3-tap [.25 .5 .25], rolling window): the parts move with the diver, a 1-2 frame blotch is a classifier glitch."""
     T = len(frames)
     dd = base / "diver"
     dfn = lambda t: read_a(dd, t)
@@ -101,13 +120,32 @@ def stage_parts(frames, base: Path, kfdir: Path, log=print, only=None):
 
     clf, (X, y, g) = parts.train(frames, dfn, sfn, KF, log=log)
     parts.loo_accuracy(X, y, g, log=log)
-    for t in (range(T) if only is None else only):
-        D = dfn(t)
-        P = parts.classify(clf, np.asarray(frames[t]), D)
+    order = list(range(T)) if only is None else list(only)
+    consecutive = all(b - a == 1 for a, b in zip(order, order[1:]))
+    win: dict = {}
+
+    def emit(t, nbrs):
+        w = {i: (0.5 if i == t else 0.25) for i in nbrs}
+        tot = sum(w.values())
+        acc = sum(w[i] / tot * win[i] for i in nbrs)
         for k, name in enumerate(("skin", "gear", "shorts")):
-            write_a(base / name, t, P[k] * D)
-        if t % 100 == 0:
-            log(f"[parts] {t}/{T}")
+            write_a(base / name, t, acc[k])
+
+    for n, t in enumerate(order):
+        D = dfn(t)
+        win[t] = parts.classify(clf, np.asarray(frames[t]), D) * D[None]
+        if not consecutive:
+            emit(t, [t])
+        else:
+            if n >= 1:
+                c = order[n - 1]
+                emit(c, [i for i in (c - 1, c, c + 1) if i in win])
+                win.pop(c - 1, None)
+        if n % 100 == 0:
+            log(f"[parts] {n}/{len(order)}")
+    if consecutive:
+        c = order[-1]
+        emit(c, [i for i in (c - 1, c) if i in win])
 
 
 def main() -> int:
