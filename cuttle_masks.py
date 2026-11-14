@@ -45,6 +45,9 @@ def main() -> int:
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--end", type=int, default=None)
     ap.add_argument("--max-objects", type=int, default=8)
+    ap.add_argument("--det-thresh", type=float, default=None,
+                    help="override SAM's detection/new-object score thresholds (0.4/0.65 by default); "
+                         "lower it for dark or low-contrast animals")
     ap.add_argument("--crop-y", type=int, default=None,
                     help="feed SAM a square WxW crop starting at this row (no aspect squash, "
                          "small animals stay larger); masks are pasted back at full frame")
@@ -74,6 +77,9 @@ def main() -> int:
 
     t0 = time.time()
     pred, on_gpu = _build_predictor(cfg, REPO, cache)
+    if a.det_thresh is not None:
+        pred.model.score_threshold_detection = a.det_thresh
+        pred.model.new_det_thresh = a.det_thresh
     print(f"[sam] SAM 3.1 multiplex loaded on {'CUDA' if on_gpu else 'CPU'} "
           f"in {time.time() - t0:.0f}s", flush=True)
 
