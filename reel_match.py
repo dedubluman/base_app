@@ -183,7 +183,7 @@ def grade_diver(x, y_ref, p=DV, depth=None, parts=None):
         return a is not None and float(a.sum()) > 40
 
     # -- class weights (priority fins > hair > shorts > skin; sum to 1) --
-    w_fins = parts["fins"] if has("fins") else (k_dark if not has("hair") else 0 * k_dark)
+    w_fins = np.clip(parts["fins"], 0, 1) if has("fins") else k_dark
     w_hair = np.clip(parts["hair"] if has("hair") else 0 * k_dark, 0, 1) * (1 - w_fins)
     w_short = np.clip(parts["shorts"] if has("shorts") else k_short, 0, 1) * (1 - w_fins) * (1 - w_hair)
     w_skin = np.clip(1 - w_fins - w_hair - w_short, 0, 1)
@@ -202,6 +202,10 @@ def grade_diver(x, y_ref, p=DV, depth=None, parts=None):
     # a little of the water's light so he sits in the scene
     out = out * (1 - p["ambient"]) + luma(out)[..., None] * p["ambient_rgb"] * p["ambient"] * 2.0
     return np.clip(out, 0, 1).astype(np.float32)
+
+
+# largest plausible share of the diver mask for each part (tracker-drift guard)
+PART_MAX_FRAC = {"fins": 0.30, "hair": 0.08, "shorts": 0.40}
 
 
 # ------------------------------------------------------------- pipeline --
@@ -250,7 +254,7 @@ def _main():
           f"{len(missing)} without {missing[:10]}", flush=True)
     # separate SAM 3.1 masks for the diver's parts (diver_parts.py): fins may
     # leave the "person" mask, hair and shorts are clipped to it
-    part_raw = {}
+    part_raw, part_rejected = {}, {}
     for name in ("fins", "hair", "shorts"):
         d = repo / "masks" / f"{stem}__{name}" / "subject"
         if not d.exists():
@@ -260,11 +264,19 @@ def _main():
             m = read_mask(d, i, (h, w))
             g = 201 if name == "fins" else 5
             near = cv2.dilate(raw[i].astype(np.uint8), np.ones((g, g), np.uint8)) > 0
-            part_raw[name][i] = m & near
+            m = m & near
+            # a tracked part can swell over the whole body when the tracker
+            # loses it (fins leaving the frame): reject it, fall back to a key
+            if m.sum() > PART_MAX_FRAC[name] * max(int(raw[i].sum()), 1):
+                m = np.zeros_like(m)
+                part_rejected.setdefault(name, []).append(i)
+            part_raw[name][i] = m
     for name, fr in part_raw.items():
         have = [i for i in idx if fr[i].any()]
         miss = [i for i in idx if not fr[i].any()]
+        rej = part_rejected.get(name, [])
         print(f"[parts] {name}: SAM 3.1 mask on {len(have)}/{len(idx)} frames"
+              + (f" ({len(rej)} rejected as swollen: {rej[0]}-{rej[-1]})" if rej else "")
               + (f", fallback key on {miss[:12]}{'...' if len(miss) > 12 else ''}" if miss else ""), flush=True)
     pmed = {}
     for name, fr in part_raw.items():
