@@ -51,6 +51,12 @@ def iou(a, b):
 
 
 class SamB(Sam):
+    def __init__(self, frames_dir, cache):
+        super().__init__(frames_dir, cache)
+        # hotstart (delay 15, unmatch 8) deleted objects the tracker still held whenever the text
+        # detector did not re-find them in the next frames (shorts above the water line, f46 seed)
+        self.pred.model.hotstart_delay = 0
+
     def text_box(self, sid, cs, f, text, boxes):
         norm = [[x0 / W, y0 / H, (x1 - x0) / W, (y1 - y0) / H] for x0, y0, x1, y1 in boxes]
         r = self.pred.handle_request({"type": "add_prompt", "session_id": sid, "frame_index": f - cs,
@@ -100,7 +106,7 @@ def box_track(sam, a, b, seed_f, text, boxes, targets, tag, log):
     return [res.get(c, {}) if c is not None else {} for c in chosen]
 
 
-def chain(sam, name, text_alts, seed_f, seed_m, end_f, person, A_ok, area_bounds, log):
+def chain(sam, name, text_alts, seed_f, seed_m, end_f, person, A_ok, area_bounds, log, raw_min=0, rawlog=None):
     """Chain 6-frame windows from seed_f toward end_f. A_ok(clipped mask)->bool is the success
     test (SHORTS: >= 50 % of the f0 area). The box and the swelling guard use the RAW SAM mask
     (the whole object, also its part above the water line); the result is clipped to the
@@ -125,14 +131,17 @@ def chain(sam, name, text_alts, seed_f, seed_m, end_f, person, A_ok, area_bounds
                 if f == cur_f:
                     continue
                 raw_a = int(m.sum())
+                if rawlog is not None:
+                    rawlog.setdefault(f, []).append(raw_a)
                 if raw_a == 0 or raw_a > area_bounds[1] * max(int(cur_m.sum()), 800):
                     continue                                       # empty / swollen: tracker lost it
                 frames[f] = (m, m & dil(person[f], 3))             # water line: only the underwater part
             score = sum(int(c.sum()) for _, c in frames.values())
             if best is None or score > best[0]:
                 best = (score, frames)
-            if frames and len(frames) == abs(nxt - cur_f) and all(A_ok(c) for _, c in frames.values()):
-                break                                              # window fully successful
+            lost = len(frames) != abs(nxt - cur_f) or any(m.sum() < raw_min for m, _ in frames.values())
+            if frames and not lost:
+                break                                              # tracked every frame, whole object seen
         frames = best[1] if best else {}
         for f in range(min(cur_f, nxt), max(cur_f, nxt) + 1):
             if f == cur_f:
@@ -165,11 +174,12 @@ def sam_stage(a_input: Path, log):
     log(f"[v3] SHORTS f0 area {A0} (failure below {A0 // 2}), f46 area {int(s46.sum())}")
     A_ok = lambda m: m.sum() >= 0.5 * A0
     alts = [(10, "shorts"), (24, "white swim shorts")]
-    fw, ff = chain(sam, "shF", alts, 0, s0, 46, person, A_ok, (0, 2.4), log)
+    rawA = {"F": {}, "B": {}}
+    fw, ff = chain(sam, "shF", alts, 0, s0, 46, person, A_ok, (0, 2.4), log, raw_min=0.5 * A0, rawlog=rawA["F"])
     log(f"[v3] SHORTS forward done ({time.time() - t0:.0f}s); failed frames {ff}")
-    bw, fb = chain(sam, "shB", alts, 46, s46, 0, person, A_ok, (0, 2.4), log)
+    bw, fb = chain(sam, "shB", alts, 46, s46, 0, person, A_ok, (0, 2.4), log, raw_min=0.5 * A0, rawlog=rawA["B"])
     log(f"[v3] SHORTS backward done ({time.time() - t0:.0f}s); failed frames {fb}")
-    raw["SHORTS_fwd"], raw["SHORTS_bwd"] = fw, bw
+    raw["SHORTS_fwd"], raw["SHORTS_bwd"], raw["SHORTS_rawA"] = fw, bw, rawA
 
     # ---- HAIR gap f42-f55: f41 forward, f56 backward -----------------------------
     h41, h56 = pv("HAIR", 41), pv("HAIR", 56)
@@ -220,18 +230,9 @@ def sam_stage(a_input: Path, log):
     raw["FINS28"] = got28
     log(f"[v3] FINS windows done ({time.time() - t0:.0f}s); f28 instances {[int(m.sum()) for m in got28.values()]}")
 
-    # ---- WATCH: "wristwatch" on a few frames ------------------------------------------
-    watch = {}
-    for f in (12, 46, 70):
-        sid = sam.start(max(0, f - 2), f + 3, f"w{f}")
-        ids, ms = sam.text_only(sid, max(0, f - 2), f, "wristwatch")
-        sam.pred.handle_request({"type": "close_session", "session_id": sid})
-        good = [m for m in ms if 30 <= m.sum() <= 900 and (m & dil(person[f], 4)).sum() / max(m.sum(), 1) > 0.8]
-        log(f"  [wristwatch] f{f}: {len(ids)} inst, usable {len(good)}")
-        if good:
-            watch[f] = good[0]
-    raw["WATCH"] = watch
-    pickle.dump(raw, open(REPO / "masks" / f"{stem}__cls" / "sam_raw_v3.pkl", "wb"))
+    old = REPO / "masks" / f"{stem}__cls" / "sam_raw_v3.pkl"
+    raw["WATCH"] = pickle.load(open(old, "rb")).get("WATCH", {}) if old.exists() else {}
+    pickle.dump(raw, open(REPO / "masks" / f"{stem}__cls" / "sam_raw_v4.pkl", "wb"))
     log(f"[v3] SAM stage finished in {time.time() - t0:.0f}s")
     return raw
 
@@ -270,7 +271,8 @@ def post_stage(a_input: Path, log):
     person = {f: read_mask(REPO / "masks" / f"{stem}__fwd" / "subject", f) for f in range(N)}
     imgs = {f: cv2.imread(str(frames / f"{f:05d}.jpg")) for f in range(N)}
     pv = lambda c, f: read_mask(prev / c, f)
-    raw = pickle.load(open(cdir / "sam_raw_v3.pkl", "rb"))
+    v4 = cdir / "sam_raw_v4.pkl"
+    raw = pickle.load(open(v4 if v4.exists() else cdir / "sam_raw_v3.pkl", "rb"))
     z = np.zeros((H, W), bool)
 
     A0 = int(pv("SHORTS", 0).sum())
@@ -485,6 +487,16 @@ def post_stage(a_input: Path, log):
         lines.append(f"{f}," + ",".join(str(areas[c][f]) for c in CLASSES) + "," + ";".join(flags.get(f, [])))
     (qc / "class_areas.csv").write_text("\n".join(lines) + "\n")
     (qc / "shorts_failed.txt").write_text(" ".join(map(str, shorts_fail)))
+    # which of the failures are a lost track and which are only the water line (whole shorts seen, underwater part small)
+    rawA = raw.get("SHORTS_rawA", {"F": {}, "B": {}})
+    lost, wl = [], []
+    for f in shorts_fail:
+        vals = rawA["F"].get(f, []) + rawA["B"].get(f, [])
+        if f == 0 or f >= 46:
+            vals = vals + [int(pv("SHORTS", f).sum())]
+        (wl if vals and max(vals) >= 0.5 * A0 else lost).append(f)
+    (qc / "shorts_failed_split.txt").write_text(f"lost: {lost}\nwaterline: {wl}\n")
+    log(f"[v3] SHORTS failures: {len(lost)} lost track {lost}; {len(wl)} water-line limited {wl}")
     (qc / "mask_deleted.txt").write_text("\n".join(f"f{f}: {a} px ({why})" for f, a, why in deleted_mask))
     log(f"[v3] overlap pixels {overlap}; SHORTS f0 area {A0}; failed frames (<50 %): {shorts_fail}")
     log(f"[v3] deleted MASK parts: {len(deleted_mask)}")
