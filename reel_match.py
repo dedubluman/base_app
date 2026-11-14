@@ -140,40 +140,63 @@ DV = dict(
     shorts_rel=(1.12, 1.35), # ... and light shorts
     shorts_chroma=0.16,      # shorts must also be near-neutral after balance
     shorts_rgb=np.array([0.99, 1.00, 1.03], np.float32),
+    fins_rgb=np.array([0.90, 1.00, 1.10], np.float32),    # neutral, faintly blue black
+    hair_rgb=np.array([1.12, 0.96, 0.85], np.float32),    # natural dark brown (1 : 0.86 : 0.76), luma-normalised
+    hair_lift=0.85,          # hair stays darker than the skin
     depth_mix=0.20,          # share of the scene's vertical darkening
     ambient=0.05,            # share of ambient blue-cyan light
     ambient_rgb=np.array([0.35, 0.62, 0.78], np.float32),
 )
 
 
-def grade_diver(x, y_ref, p=DV, depth=None):
+def grade_diver(x, y_ref, p=DV, depth=None, parts=None):
     """x: raw float RGB frame; y_ref: median balanced luma of the diver in
-    this frame (scalar, temporally smoothed by the caller). Returns the
-    graded diver colours for every pixel (use through the alpha)."""
+    this frame (scalar, temporally smoothed by the caller); depth: the scene's
+    vertical weighting; parts: optional {"hair"|"shorts"|"fins": float alpha
+    HxW from its own SAM 3.1 mask}. Returns the graded diver colours for every
+    pixel (use through the diver alpha).
+
+    Each class gets its own colour and the class weights sum to 1 per pixel,
+    so no class's colour reaches a neighbour:
+      skin   -> flesh tone (H~20, S~0.3), own shading kept
+      shorts -> clean off-white, fold contrast kept
+      fins   -> neutral, faintly blue black
+      hair   -> natural dark brown, contrast kept, none of the skin's warmth
+    A class whose SAM 3.1 mask is empty on a frame falls back to a colour key
+    for that frame (shorts: cool + bright, fins/hair: dark)."""
     xb = np.clip(x * p["gains"], 0, 1.5)
     yb = luma(xb)
     rel = yb / max(y_ref, 1e-3)
     chroma = (xb.max(-1) - xb.min(-1)) / np.maximum(xb.max(-1), 1e-3)
+    parts = parts or {}
+
+    # -- keys, used only where a class has no SAM 3.1 mask on this frame --
     k_dark = 1 - smoothstep(*p["dark_rel"], rel)
-    # black fins read as brown once the red is boosted; the absolute raw
-    # luma catches them even when the diver's own median is low
     k_dark = np.maximum(k_dark, 1 - smoothstep(0.17, 0.27, luma(np.clip(x, 0, 1))))
-    # light fabric reflects the water's blue, so after white balance it is
-    # cool (B>R) while skin stays warm (R>G>B); very bright neutral fabric
-    # (specular, foam on it) is caught by the luminance key
     cool = (xb[..., 2] - xb[..., 0]) / np.maximum(yb, 1e-3)
     k_cool = smoothstep(0.05, 0.15, cool) * smoothstep(0.55, 0.80, rel)
     k_bright = smoothstep(*p["shorts_rel"], rel) * (1 - smoothstep(p["shorts_chroma"] * 0.6, p["shorts_chroma"], chroma))
     k_short = np.clip(np.maximum(k_cool, k_bright) * (1 - k_dark), 0, 1)
-    k_skin = np.clip(1 - k_dark - k_short, 0, 1)
+
+    def has(name):
+        a = parts.get(name)
+        return a is not None and float(a.sum()) > 40
+
+    # -- class weights (priority fins > hair > shorts > skin; sum to 1) --
+    w_fins = parts["fins"] if has("fins") else (k_dark if not has("hair") else 0 * k_dark)
+    w_hair = np.clip(parts["hair"] if has("hair") else 0 * k_dark, 0, 1) * (1 - w_fins)
+    w_short = np.clip(parts["shorts"] if has("shorts") else k_short, 0, 1) * (1 - w_fins) * (1 - w_hair)
+    w_skin = np.clip(1 - w_fins - w_hair - w_short, 0, 1)
 
     yd = np.clip(yb * p["lift"], 0, 1)[..., None]
     skin = yd * p["skin_rgb"]
     skin = xb * (1 - p["skin_pull"]) + skin * p["skin_pull"]
     shorts = yd * p["shorts_rgb"]
-    # fins / snorkel / hair: neutral, faintly blue black (not the red-boosted brown)
-    dark = yb[..., None] * 0.80 * np.array([0.90, 1.00, 1.10], np.float32)
-    out = skin * k_skin[..., None] + shorts * k_short[..., None] + dark * k_dark[..., None]
+    fins = yb[..., None] * 0.80 * p["fins_rgb"]
+    hair_y = (yb * p["hair_lift"])[..., None]
+    hair = hair_y * p["hair_rgb"]
+    out = (skin * w_skin[..., None] + shorts * w_short[..., None]
+           + fins * w_fins[..., None] + hair * w_hair[..., None])
     if depth is not None:
         out = out * (1 + (depth - 1) * p["depth_mix"])
     # a little of the water's light so he sits in the scene
@@ -225,6 +248,29 @@ def _main():
     missing = [i for i in idx if not raw[i].any()]
     print(f"[mask] frames {f0}-{f1 - 1}: {len(idx) - len(missing)} with a SAM 3.1 mask, "
           f"{len(missing)} without {missing[:10]}", flush=True)
+    # separate SAM 3.1 masks for the diver's parts (diver_parts.py): fins may
+    # leave the "person" mask, hair and shorts are clipped to it
+    part_raw = {}
+    for name in ("fins", "hair", "shorts"):
+        d = repo / "masks" / f"{stem}__{name}" / "subject"
+        if not d.exists():
+            continue
+        part_raw[name] = {}
+        for i in idx:
+            m = read_mask(d, i, (h, w))
+            g = 201 if name == "fins" else 5
+            near = cv2.dilate(raw[i].astype(np.uint8), np.ones((g, g), np.uint8)) > 0
+            part_raw[name][i] = m & near
+    for name, fr in part_raw.items():
+        have = [i for i in idx if fr[i].any()]
+        miss = [i for i in idx if not fr[i].any()]
+        print(f"[parts] {name}: SAM 3.1 mask on {len(have)}/{len(idx)} frames"
+              + (f", fallback key on {miss[:12]}{'...' if len(miss) > 12 else ''}" if miss else ""), flush=True)
+    pmed = {}
+    for name, fr in part_raw.items():
+        u8 = {i: fr[i].astype(np.uint8) * 255 for i in idx}
+        pmed[name] = {i: np.median(np.stack([u8[max(f0, i - 1)], u8[i], u8[min(f1 - 1, i + 1)]]), 0).astype(np.uint8)
+                      for i in idx}
     alpha, yd = {}, {}
     for k, x in enumerate(iter_frames(a.input, info)):
         i = k
@@ -254,7 +300,7 @@ def _main():
     enc = Encoder(a.input, a.output, out_info, Encode(crf=16, preset=a.preset))
     qc_every = int(round(2 * float(info.fps)))
     qc_ids = sorted({f0, f1 - 1} | {i for i in idx if (i - f0) % qc_every == 0})
-    keep = {}
+    keep, keep_parts = {}, {}
     g_col = vertical_weight(h, w)
     for k, x in enumerate(iter_frames(a.input, info)):
         i = k
@@ -263,12 +309,17 @@ def _main():
         if i >= f1:
             break
         bg = grade_background(x)
-        dv = grade_diver(x, yref[i], depth=g_col[..., None])
-        al = (cv2.GaussianBlur(med[i].astype(np.float32) / 255, (0, 0), 0.8))[..., None]
+        parts = {nm: cv2.GaussianBlur(pm[i].astype(np.float32) / 255, (0, 0), 0.8) for nm, pm in pmed.items()}
+        dv = grade_diver(x, yref[i], depth=g_col[..., None], parts=parts)
+        al = cv2.GaussianBlur(med[i].astype(np.float32) / 255, (0, 0), 0.8)
+        if "fins" in parts:                       # fins outside the person mask are still the diver
+            al = np.maximum(al, parts["fins"])
+        al = al[..., None]
         out = bg * (1 - al) + dv * al
         enc.write(out)
         if i in qc_ids:
             keep[i] = (x.copy(), out.copy(), med[i].copy())
+            keep_parts[i] = {nm: pm[i].copy() for nm, pm in pmed.items()}
     enc.close()
 
     # QC sheets: mask overlay and before/after, scaled
@@ -293,6 +344,11 @@ def _main():
         edge = mm ^ (cv2.erode(mm.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0)
         t[mm] = (0.6 * t[mm] + 0.4 * np.array([255, 40, 40])).astype(np.uint8)
         t[edge] = (255, 255, 0)
+        for nm, col in (("hair", (60, 255, 60)), ("shorts", (60, 120, 255)), ("fins", (255, 60, 255))):
+            pmk = keep_parts[i].get(nm)
+            if pmk is not None:
+                q = cv2.resize(pmk, (t.shape[1], t.shape[0])) > 127
+                t[q] = (0.35 * t[q] + 0.65 * np.array(col)).astype(np.uint8)
         cv2.putText(t, f"f{i}", (6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         return t
     def ba(i):
