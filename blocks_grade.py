@@ -210,11 +210,15 @@ def split_classes(x, y_hi, mask=None, p=DV):
     return 1 - k_dark, k_dark, y
 
 
-def grade_diver(x, y_hi, dist, plate_rgb, mask=None, p=DV):
+def grade_diver(x, y_hi, dist, plate_rgb, mask=None, p=DV, force=None):
     """Graded colours for every pixel (use through the diver alpha).
     y_hi: his lit-skin luma level; dist: 0 (near, large) .. 1 (far, small);
     plate_rgb: the graded water behind him."""
     w_skin, w_gear, y = split_classes(x, y_hi, mask, p)
+    if force == "skin":            # class masks decide, not luminance
+        w_skin, w_gear = np.ones_like(w_skin), np.zeros_like(w_gear)
+    elif force == "gear":
+        w_skin, w_gear = np.zeros_like(w_skin), np.ones_like(w_gear)
     ease = 1 - p["far_ease"] * dist
     ys = np.clip(p["skin_off"] + p["skin_gain"] * y, 0, 1) * ease
     skin = ys[..., None] * np.array(p["skin_rgb"], np.float32)
