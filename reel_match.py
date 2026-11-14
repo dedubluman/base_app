@@ -149,7 +149,7 @@ DV = dict(
 )
 
 
-def grade_diver(x, y_ref, p=DV, depth=None, parts=None):
+def grade_diver(x, y_ref, p=DV, depth=None, parts=None, strict=False):
     """x: raw float RGB frame; y_ref: median balanced luma of the diver in
     this frame (scalar, temporally smoothed by the caller); depth: the scene's
     vertical weighting; parts: optional {"hair"|"shorts"|"fins": float alpha
@@ -183,9 +183,15 @@ def grade_diver(x, y_ref, p=DV, depth=None, parts=None):
         return a is not None and float(a.sum()) > 40
 
     # -- class weights (priority fins > hair > shorts > skin; sum to 1) --
-    w_fins = np.clip(parts["fins"], 0, 1) if has("fins") else k_dark
-    w_hair = np.clip(parts["hair"] if has("hair") else 0 * k_dark, 0, 1) * (1 - w_fins)
-    w_short = np.clip(parts["shorts"] if has("shorts") else k_short, 0, 1) * (1 - w_fins) * (1 - w_hair)
+    if strict:      # the class masks decide; no colour-key fallbacks
+        z = 0 * k_dark
+        w_fins = np.clip(parts.get("fins", z), 0, 1)
+        w_hair = np.clip(parts.get("hair", z), 0, 1) * (1 - w_fins)
+        w_short = np.clip(parts.get("shorts", z), 0, 1) * (1 - w_fins) * (1 - w_hair)
+    else:
+        w_fins = np.clip(parts["fins"], 0, 1) if has("fins") else k_dark
+        w_hair = np.clip(parts["hair"] if has("hair") else 0 * k_dark, 0, 1) * (1 - w_fins)
+        w_short = np.clip(parts["shorts"] if has("shorts") else k_short, 0, 1) * (1 - w_fins) * (1 - w_hair)
     w_skin = np.clip(1 - w_fins - w_hair - w_short, 0, 1)
 
     yd = np.clip(yb * p["lift"], 0, 1)[..., None]
@@ -228,6 +234,8 @@ def _main():
     ap.add_argument("--frames", default=None, help="START:END (END exclusive)")
     ap.add_argument("--preset", default="slow")
     ap.add_argument("--qc", type=Path, default=repo / "output" / "qc_reel")
+    ap.add_argument("--height", type=int, default=0, help="output height (1080 = 1080p), 0 = native")
+    ap.add_argument("--crf", type=int, default=16)
     a = ap.parse_args()
 
     info = probe(a.input)
@@ -254,8 +262,12 @@ def _main():
           f"{len(missing)} without {missing[:10]}", flush=True)
     # separate SAM 3.1 masks for the diver's parts (diver_parts.py): fins may
     # leave the "person" mask, hair and shorts are clipped to it
+    cdir = repo / "masks" / f"{stem}__cls"
+    use_cls = (cdir / "SKIN").exists()
+    if use_cls:
+        print(f"[classes] using the four SAM 3.1 class masks in {cdir} (+ hair, watch)", flush=True)
     part_raw, part_rejected = {}, {}
-    for name in ("fins", "hair", "shorts"):
+    for name in (() if use_cls else ("fins", "hair", "shorts")):
         d = repo / "masks" / f"{stem}__{name}" / "subject"
         if not d.exists():
             continue
@@ -283,6 +295,14 @@ def _main():
         u8 = {i: fr[i].astype(np.uint8) * 255 for i in idx}
         pmed[name] = {i: np.median(np.stack([u8[max(f0, i - 1)], u8[i], u8[min(f1 - 1, i + 1)]]), 0).astype(np.uint8)
                       for i in idx}
+    if use_cls:
+        def rd(nm, i):
+            im = cv2.imread(str(cdir / nm / f"{i:05d}.png"), cv2.IMREAD_GRAYSCALE)
+            return np.zeros((h, w), np.uint8) if im is None else im
+        pmed = {"shorts": {i: rd("SHORTS", i) for i in idx},
+                "hair": {i: rd("HAIR", i) for i in idx},
+                # mask + snorkel, fins and the watch strap share the neutral dark colour
+                "fins": {i: np.maximum(np.maximum(rd("FINS", i), rd("MASK", i)), rd("WATCH", i)) for i in idx}}
     alpha, yd = {}, {}
     for k, x in enumerate(iter_frames(a.input, info)):
         i = k
@@ -309,7 +329,32 @@ def _main():
     # pass 2: grade + composite + encode
     out_info = dataclasses.replace(info, has_audio=False)
     a.output.parent.mkdir(parents=True, exist_ok=True)
-    enc = Encoder(a.input, a.output, out_info, Encode(crf=16, preset=a.preset))
+    if a.height:
+        import subprocess
+        ow = int(round(info.width * a.height / info.height / 2)) * 2
+        rng = np.random.default_rng(1234)
+        cmd = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb48le",
+               "-s", f"{info.width}x{info.height}", "-r", str(info.fps), "-i", "-",
+               "-vf", f"scale={ow}:{a.height}:flags=lanczos+accurate_rnd+full_chroma_int:"
+                      "out_color_matrix=bt709:out_range=tv,format=yuv420p",
+               "-c:v", "libx264", "-profile:v", "high", "-preset", a.preset, "-crf", str(a.crf),
+               "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+               "-color_range", "tv", "-movflags", "+faststart", "-an", str(a.output)]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+        class _Enc:
+            def write(self, rgb):
+                n = (rng.random(rgb.shape[:2] + (1,), np.float32) - rng.random(rgb.shape[:2] + (1,), np.float32)) / 255.0
+                proc.stdin.write((np.clip(rgb + n, 0, 1) * 65535.0 + 0.5).astype(np.uint16).tobytes())
+
+            def close(self):
+                proc.stdin.close()
+                if proc.wait() != 0:
+                    raise RuntimeError("ffmpeg encode failed")
+        enc = _Enc()
+        print(f"[encode] H.264 High, {ow}x{a.height}, CRF {a.crf}", flush=True)
+    else:
+        enc = Encoder(a.input, a.output, out_info, Encode(crf=a.crf, preset=a.preset))
     qc_every = int(round(2 * float(info.fps)))
     qc_ids = sorted({f0, f1 - 1} | {i for i in idx if (i - f0) % qc_every == 0})
     keep, keep_parts = {}, {}
@@ -322,7 +367,7 @@ def _main():
             break
         bg = grade_background(x)
         parts = {nm: cv2.GaussianBlur(pm[i].astype(np.float32) / 255, (0, 0), 0.8) for nm, pm in pmed.items()}
-        dv = grade_diver(x, yref[i], depth=g_col[..., None], parts=parts)
+        dv = grade_diver(x, yref[i], depth=g_col[..., None], parts=parts, strict=use_cls)
         al = cv2.GaussianBlur(med[i].astype(np.float32) / 255, (0, 0), 0.8)
         if "fins" in parts:                       # fins outside the person mask are still the diver
             al = np.maximum(al, parts["fins"])

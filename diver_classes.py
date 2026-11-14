@@ -585,6 +585,15 @@ def main() -> int:
             wfb += 1
     print(f"[cls] wrist watch: SAM on {sum(1 for f in helper['WATCH'] if helper['WATCH'][f].sum() >= 10)} frames, "
           f"dark-band fallback on {wfb}", flush=True)
+    # a class that shows up on a single frame with empty neighbours is a tracker
+    # blip, not the object: drop it (reported in the log)
+    blips = []
+    for c in CLASSES:
+        for f in sorted(raw[c]):
+            if raw[c][f].sum() > 0 and raw[c].get(f - 1) is None and raw[c].get(f + 1) is None:
+                blips.append((c, f, int(raw[c][f].sum())))
+                del raw[c][f]
+    print(f"[cls] isolated single-frame blips dropped: {blips}", flush=True)
     fin = finish(raw, person, hair, watch, range(N))
 
     # ---- write masks (soft, exclusive) -----------------------------------
@@ -596,6 +605,11 @@ def main() -> int:
         for c in CLASSES:
             cv2.imwrite(str(out_dir / c / f"{f:05d}.png"), (al[c] * 255 + 0.5).astype(np.uint8))
             areas[c].append(int(fin[c][f].sum()))
+    # helper classes kept out of SKIN, saved for the grade (binary)
+    for nm, src in (("HAIR", hair), ("WATCH", watch)):
+        (out_dir / nm).mkdir(parents=True, exist_ok=True)
+        for f in range(N):
+            cv2.imwrite(str(out_dir / nm / f"{f:05d}.png"), src[f].astype(np.uint8) * 255)
     # overlap check: no pixel in two classes
     bad = 0
     for f in range(N):
