@@ -74,6 +74,7 @@ BG = dict(
     hi_lo=0.42, hi_hi=0.85,
     # light ripples / surface light pop
     clarity=0.45, clarity_sigma=7.0, clarity_lo=0.20, clarity_hi=0.55,
+    mid_lift=0.13,           # background mid tones +10-15 % so the diver does not look pasted on
 )
 
 
@@ -118,6 +119,9 @@ def grade_background(x, p=BG):
         blur = cv2.GaussianBlur(yl, (0, 0), p["clarity_sigma"])
         k = smoothstep(p["clarity_lo"], p["clarity_hi"], yl)
         out = out + ((yl - blur) * p["clarity"] * k)[..., None]
+    if p.get("mid_lift", 0) > 0:
+        bell = np.exp(-(((luma(out) - 0.26) / 0.16) ** 2))
+        out = out * (1 + p["mid_lift"] * bell)[..., None]
     return np.clip(out, 0, 1)
 
 
@@ -149,7 +153,7 @@ DV = dict(
 )
 
 
-def grade_diver(x, y_ref, p=DV, depth=None, parts=None, strict=False):
+def grade_diver(x, y_ref, p=DV, depth=None, parts=None, strict=False, skin_rgb=None):
     """x: raw float RGB frame; y_ref: median balanced luma of the diver in
     this frame (scalar, temporally smoothed by the caller); depth: the scene's
     vertical weighting; parts: optional {"hair"|"shorts"|"fins": float alpha
@@ -201,6 +205,16 @@ def grade_diver(x, y_ref, p=DV, depth=None, parts=None, strict=False):
     fins = yb[..., None] * 0.80 * p["fins_rgb"]
     hair_y = (yb * p["hair_lift"])[..., None]
     hair = hair_y * p["hair_rgb"]
+    if skin_rgb is not None:
+        # Part 2: the skin colour is final (Lab pipeline, no further mixing);
+        # shorts are neutral white (no warmth, no water tint); fins, mask and
+        # hair keep their treatment (depth falloff + a little ambient light).
+        dscale = 1.0 if depth is None else (1 + (depth - 1) * p["depth_mix"])
+        shorts_n = yd * np.array([1.0, 1.0, 1.0], np.float32) * dscale
+        others = (fins * w_fins[..., None] + hair * w_hair[..., None]) * dscale
+        others = others * (1 - p["ambient"]) + luma(others)[..., None] * p["ambient_rgb"] * p["ambient"] * 2.0
+        out = skin_rgb * w_skin[..., None] + shorts_n * w_short[..., None] + others
+        return np.clip(out, 0, 1).astype(np.float32)
     out = (skin * w_skin[..., None] + shorts * w_short[..., None]
            + fins * w_fins[..., None] + hair * w_hair[..., None])
     if depth is not None:
