@@ -41,7 +41,7 @@ BG = dict(
     # clip. Per-frame V p1/p50/p99 is 0.59/0.74/0.83; the cube face reaches 0.86.
     bp=0.550, wp=0.925, toe=0.05,
     # Step 1  Darken: tone curve + vertical weighting (screen space, fixed)
-    gamma_top=1.60, gamma_bot=1.45,
+    gamma_top=1.60, gamma_bot=1.25,
     g_top=0.88, g_bot=1.00, g_y0=0.10, g_y1=0.88,
     shoulder=0.78, peak=0.90,          # highlights roll off above `shoulder`, never past `peak`
     floor=0.050,                       # luminance floor: foam never clips to flat black
@@ -55,7 +55,7 @@ BG = dict(
     shade_sat=0.70, shade_lo=0.020, shade_hi=0.060,
     # local contrast (on the de-hazed value): structures and sand texture
     clar_large=1.10, clar_large_sigma=28.0, clar_small=0.65, clar_small_sigma=3.0,
-    clar_neg=0.50,                     # shaded sides get half the boost: blue-grey, not black
+    clar_neg=0.25,                     # shaded sides get half the boost: blue-grey, not black
     clar_y0=0.15, clar_y1=0.60,        # the haze is in the lower half: more clarity there
     # banding: reconstruct the large-scale gradient, core away <= 1 LSB wiggle
     deband_sigma=9.0, deband_core=0.0090,
@@ -579,9 +579,11 @@ def cmd_qc(a):
         near = cv2.dilate(m.astype(np.uint8), np.ones((51, 51), np.uint8)) > 0
         nb = areas[max(0, k - 3):k + 4]
         med = float(np.median(np.delete(nb, min(3, k) if k < 3 else 3))) if len(nb) > 1 else float(areas[k])
+        near25 = cv2.dilate(m.astype(np.uint8), np.ones((31, 31), np.uint8)) > 0
         rows[i] = dict(area=int(areas[k]), jump=round(float(areas[k] / max(med, 1) - 1), 2),
-                       dark_out=int(((y < 0.34) & near & ~m).sum()), mode=rep[i])
-    bad = {i: r for i, r in rows.items() if abs(r["jump"]) > 0.25 or r["dark_out"] > 150 or r["area"] == 0
+                       dark_out=int(((y < 0.34) & near & ~m).sum()),
+                       bright_out=int(((y > 0.60) & near25 & ~m).sum()), mode=rep[i])
+    bad = {i: r for i, r in rows.items() if abs(r["jump"]) > 0.25 or r["dark_out"] > 150 or r["bright_out"] > 250 or r["area"] == 0
            or "rejected" in r["mode"] or r["mode"] not in ("tracker", "tracker+fins")}
     print(f"[qc] frames {idx[0]}-{idx[-1]}: {len(idx)} masks, area {int(areas.min())}-{int(areas.max())}, "
           f"{len(bad)} flagged")
