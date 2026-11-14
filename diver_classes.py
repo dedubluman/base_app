@@ -277,7 +277,7 @@ def valid_mask(cls, m, person, img):
     return True
 
 
-DARK_THR = {"FINS": 0.32, "MASK": 0.34, "HAIR": 0.34}
+DARK_THR = {"FINS": 0.20, "MASK": 0.28, "HAIR": 0.28}
 
 
 def refine_dark(cls, m, img):
@@ -290,18 +290,24 @@ def refine_dark(cls, m, img):
     return cv2.morphologyEx(r.astype(np.uint8), cv2.MORPH_CLOSE, k) > 0
 
 
-def grow_dark(img_bgr, person, pts, thr=0.30):
-    """Connected dark pixels (the black fins) containing each user point."""
+def grow_dark(img_bgr, person, pts, lo=6000, hi=24000):
+    """Connected dark pixels (the black fins) containing each user point. The
+    threshold adapts until the grown region is fin-sized: a fixed one leaks
+    into dark water."""
     g = luma01(img_bgr)
-    dark = (g < thr) & dil(person, 25)
-    num, cc, _, _ = cv2.connectedComponentsWithStats(dark.astype(np.uint8), 8)
-    out = np.zeros_like(dark)
-    for x, y in pts:
-        win = cc[max(0, y - 10):y + 11, max(0, x - 10):x + 11]
-        ids = win[win > 0]
-        if len(ids):
-            out |= cc == np.bincount(ids).argmax()
-    return out
+    near = dil(person, 25)
+    for thr in (0.16, 0.14, 0.12, 0.10, 0.18, 0.20, 0.08):
+        dark = (g < thr) & near
+        num, cc, _, _ = cv2.connectedComponentsWithStats(dark.astype(np.uint8), 8)
+        out = np.zeros_like(dark)
+        for x, y in pts:
+            win = cc[max(0, y - 10):y + 11, max(0, x - 10):x + 11]
+            ids = win[win > 0]
+            if len(ids):
+                out |= cc == np.bincount(ids).argmax()
+        if lo <= out.sum() <= hi:
+            return out
+    return np.zeros_like(near)
 
 
 def seed_events(m, user=()):
