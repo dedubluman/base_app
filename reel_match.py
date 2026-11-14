@@ -69,7 +69,7 @@ BG = dict(
     floor=0.040,             # luminance floor so surface light never clips to flat black
     # Step 3  Blue/white: hue to the reference's graded 195-210, less saturation
     hue_target=205.0, hue_pull=0.75,
-    sat_water=0.72,          # S x this (0.8 -> ~0.57)
+    sat_water=0.64,          # S x this (0.8 -> ~0.5)
     sat_hi=0.55,             # extra desaturation of bright areas toward blue-white
     hi_lo=0.42, hi_hi=0.85,
     # light ripples / surface light pop
@@ -131,16 +131,17 @@ def grade_background(x, p=BG):
 #   * light shorts stay a clean off-white; fins/snorkel/hair stay dark
 DV = dict(
     gains=np.array([1.90, 1.00, 1.02], np.float32),
-    # flesh ratio R:G:B for H20 S0.29, normalised to luminance 1
-    skin_rgb=np.array([1.19, 0.96, 0.844], np.float32),
-    skin_pull=0.85,          # 0 = white balance only, 1 = flat flesh colour
-    lift=1.10,               # diver a touch brighter than the dark water
+    # flesh ratio R:G:B for H20 S~0.34 (a little over the target 0.29: the
+    # ambient mix and the depth falloff take some back), normalised to luma 1
+    skin_rgb=np.array([1.24, 0.95, 0.80], np.float32),
+    skin_pull=0.92,          # 0 = white balance only, 1 = flat flesh colour
+    lift=1.45,               # the reference diver is the brightest thing in frame
     dark_rel=(0.42, 0.62),   # luma relative to the diver's median: dark parts
     shorts_rel=(1.12, 1.35), # ... and light shorts
     shorts_chroma=0.16,      # shorts must also be near-neutral after balance
     shorts_rgb=np.array([0.99, 1.00, 1.03], np.float32),
-    depth_mix=0.35,          # share of the scene's vertical darkening
-    ambient=0.10,            # share of ambient blue-cyan light
+    depth_mix=0.20,          # share of the scene's vertical darkening
+    ambient=0.05,            # share of ambient blue-cyan light
     ambient_rgb=np.array([0.35, 0.62, 0.78], np.float32),
 )
 
@@ -154,14 +155,24 @@ def grade_diver(x, y_ref, p=DV, depth=None):
     rel = yb / max(y_ref, 1e-3)
     chroma = (xb.max(-1) - xb.min(-1)) / np.maximum(xb.max(-1), 1e-3)
     k_dark = 1 - smoothstep(*p["dark_rel"], rel)
-    k_short = smoothstep(*p["shorts_rel"], rel) * (1 - smoothstep(p["shorts_chroma"] * 0.6, p["shorts_chroma"], chroma))
+    # black fins read as brown once the red is boosted; the absolute raw
+    # luma catches them even when the diver's own median is low
+    k_dark = np.maximum(k_dark, 1 - smoothstep(0.17, 0.27, luma(np.clip(x, 0, 1))))
+    # light fabric reflects the water's blue, so after white balance it is
+    # cool (B>R) while skin stays warm (R>G>B); very bright neutral fabric
+    # (specular, foam on it) is caught by the luminance key
+    cool = (xb[..., 2] - xb[..., 0]) / np.maximum(yb, 1e-3)
+    k_cool = smoothstep(0.05, 0.15, cool) * smoothstep(0.55, 0.80, rel)
+    k_bright = smoothstep(*p["shorts_rel"], rel) * (1 - smoothstep(p["shorts_chroma"] * 0.6, p["shorts_chroma"], chroma))
+    k_short = np.clip(np.maximum(k_cool, k_bright) * (1 - k_dark), 0, 1)
     k_skin = np.clip(1 - k_dark - k_short, 0, 1)
 
     yd = np.clip(yb * p["lift"], 0, 1)[..., None]
     skin = yd * p["skin_rgb"]
     skin = xb * (1 - p["skin_pull"]) + skin * p["skin_pull"]
     shorts = yd * p["shorts_rgb"]
-    dark = xb * 0.85
+    # fins / snorkel / hair: neutral, faintly blue black (not the red-boosted brown)
+    dark = yb[..., None] * 0.80 * np.array([0.90, 1.00, 1.10], np.float32)
     out = skin * k_skin[..., None] + shorts * k_short[..., None] + dark * k_dark[..., None]
     if depth is not None:
         out = out * (1 + (depth - 1) * p["depth_mix"])
@@ -300,7 +311,7 @@ def _main():
             return None
         m = np.median(px, 0)
         hh, ss, vv = colorsys.rgb_to_hsv(*m)
-        return dict(rgb=[int(round(c * 255)) for c in m], hue=round(hh * 360), sat=round(ss, 2), val=round(vv, 2))
+        return dict(rgb=[int(round(c * 255)) for c in m], hue=int(round(hh * 360)), sat=round(float(ss), 2), val=round(float(vv), 2))
     roles = {"top_water": (0.02, 0.40, 0.03, 0.17), "mid_water": (0.02, 0.40, 0.31, 0.46),
              "bottom_water": (0.02, 0.40, 0.75, 0.95)}
     table = {}
