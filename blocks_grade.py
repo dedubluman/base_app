@@ -191,7 +191,7 @@ DV = dict(
     # Y' = max(0, gear_gain * (Y - gear_black)) + gear_floor
     gear_rgb=(0.80, 1.00, 1.14),       # neutral, faintly blue
     gear_black=0.20, gear_gain=0.95, gear_floor=0.030,
-    size_near=360.0, size_far=215.0,   # bbox diagonal (px) -> distance 0..1
+    size_near=410.0, size_far=220.0,   # bbox diagonal (px) -> distance 0..1
     rim_px=3,                          # edge pixels take their colour from the inside
 )
 
@@ -263,6 +263,19 @@ def drop_specks(m, keep=0.05):
     return np.isin(lab, 1 + np.nonzero(areas >= keep * areas.max())[0])
 
 
+_LUMA_CACHE = {}
+
+
+def frame_luma(i):
+    """Luma of the extracted SAM frame (JPEG), cached; guard computations only."""
+    if i not in _LUMA_CACHE:
+        if len(_LUMA_CACHE) > 12:
+            _LUMA_CACHE.pop(next(iter(_LUMA_CACHE)))
+        x = cv2.cvtColor(cv2.imread(str(REPO / ".cache" / f"sam_frames_{STEM}_bwd" / f"{i:05d}.jpg")), cv2.COLOR_BGR2RGB)
+        _LUMA_CACHE[i] = luma(x.astype(np.float32) / 255)
+    return _LUMA_CACHE[i]
+
+
 def merged_masks(idx, shape):
     """Per frame: the tracker mask of the nearest seed (primary) with the extra
     fin objects unioned in; the alternate candidate of the overlapping chunk
@@ -271,10 +284,17 @@ def merged_masks(idx, shape):
     d = REPO / "masks" / f"{STEM}__diver" / "subject"
     alt = REPO / "masks" / f"{STEM}__diver_alt" / "subject"
     fd = REPO / "masks" / f"{STEM}__fins" / "subject"
+    ad = REPO / "masks" / f"{STEM}__a" / "subject"
     lo, hi = min(idx) - 4, max(idx) + 4
     raw, fins, alts = {}, {}, {}
     for i in range(lo, hi + 1):
-        raw[i], fins[i], alts[i] = read_png(d, i), read_png(fd, i), read_png(alt, i)
+        # plan (a) (detector + tracker on every frame) is primary where it ran;
+        # plan (b) masks (+ their fin objects) cover the spans where (b) passed QC
+        ma = read_png(ad, i)
+        if ma is not None:
+            raw[i], fins[i], alts[i] = ma, None, None
+        else:
+            raw[i], fins[i], alts[i] = read_png(d, i), read_png(fd, i), read_png(alt, i)
     area = {i: (int(drop_specks(m).sum()) if m is not None else 0) for i, m in raw.items()}
     out, rep = {}, {}
     for i in idx:
@@ -297,7 +317,17 @@ def merged_masks(idx, shape):
         f = fins[i]
         if f is not None and f.any():
             near = cv2.dilate(m.astype(np.uint8), np.ones((201, 201), np.uint8)) > 0
-            if f.sum() <= 0.35 * max(m.sum(), 1) and (f & near).sum() >= 0.8 * f.sum():
+            add = f & ~m
+            ok = f.sum() <= 1.0 * max(m.sum(), 1) and (f & near).sum() >= 0.8 * f.sum()
+            if ok and add.sum() > 300:
+                # drift guard: what the fin object adds must be dark gear, not water
+                ring = (cv2.dilate(f.astype(np.uint8), np.ones((51, 51), np.uint8)) > 0) & \
+                       ~(cv2.dilate(f.astype(np.uint8), np.ones((17, 17), np.uint8)) > 0) & ~m
+                y = frame_luma(i)
+                if ring.sum() > 100 and np.percentile(y[add], 35) > 0.85 * np.median(y[ring]):
+                    ok = False
+                    mode += "+fins rejected (drift)"
+            if ok:
                 m = m | f
                 mode += "+fins"
         out[i], rep[i] = m, mode
@@ -530,7 +560,8 @@ def cmd_qc(a):
     from shades.io import probe
     n = probe(VIDEO).n_frames
     d = REPO / "masks" / f"{STEM}__diver" / "subject"
-    have = [i for i in range(n) if (d / f"{i:05d}.png").exists()]
+    ad = REPO / "masks" / f"{STEM}__a" / "subject"
+    have = [i for i in range(n) if (d / f"{i:05d}.png").exists() or (ad / f"{i:05d}.png").exists()]
     if not have:
         print("no masks yet")
         return
@@ -551,7 +582,7 @@ def cmd_qc(a):
         rows[i] = dict(area=int(areas[k]), jump=round(float(areas[k] / max(med, 1) - 1), 2),
                        dark_out=int(((y < 0.34) & near & ~m).sum()), mode=rep[i])
     bad = {i: r for i, r in rows.items() if abs(r["jump"]) > 0.25 or r["dark_out"] > 150 or r["area"] == 0
-           or r["mode"] not in ("tracker", "tracker+fins")}
+           or "rejected" in r["mode"] or r["mode"] not in ("tracker", "tracker+fins")}
     print(f"[qc] frames {idx[0]}-{idx[-1]}: {len(idx)} masks, area {int(areas.min())}-{int(areas.max())}, "
           f"{len(bad)} flagged")
     for i, r in list(bad.items())[:60]:

@@ -161,9 +161,9 @@ def track_chunk(pred, cs, ce, seed, log_prefix="", want_fins=True, tag="b", want
     inside = [float((c & diver).sum() / c.sum()) for c in fins]
     info["fins_found"] = len(fins)
     info["fin_inside_diver"] = [round(v, 2) for v in inside]
-    # rule 4: fins the "person" mask already holds ride along with the diver
-    # object; a fin that falls outside it becomes its own tracker object
-    fins = [c for c, v in zip(fins, inside) if v < 0.9]
+    # rule 4: both fins are tracked as their own SAM 3.1 objects and unioned with
+    # the person mask. The seed frame's person mask holds them (89-99 %), but the
+    # person object drops a fin a few frames later (measured on 244-250, 264).
     info["n_fin_obj"] = len(fins)
     head = head_object(pred, sid, dseed - cs, diver, log=info) if want_head else np.zeros(diver.shape, bool)
     pts, lab = prompts_from_mask(diver, n_pos=6, n_neg=6)
@@ -328,6 +328,109 @@ def cmd_headtest(a):
     return 0
 
 
+def cmd_atest(a):
+    """Plan (a) on [start, end): text prompt on the first frame, SAM 3.1 detector +
+    tracker on every frame. Prints mask areas and dark pixels left outside."""
+    pred, on_gpu, set_mode = load_predictor()
+    set_mode(False)
+    cs, ce = map(int, a.frames.split(":"))
+    cdir = chunk_dir(cs, ce, "atest")
+    sid = pred.handle_request({"type": "start_session", "resource_path": str(cdir)})["session_id"]
+    pred.handle_request({"type": "add_prompt", "session_id": sid, "frame_index": 0, "text": "person"})
+    out = REPO / "work" / "atest"
+    out.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    for resp in pred.handle_stream_request({"type": "propagate_in_video", "session_id": sid}):
+        fi = cs + int(resp["frame_index"])
+        o = resp["outputs"]
+        ms = [np.asarray(m) > 0 for m in o["out_binary_masks"]]
+        m = np.any(ms, 0) if ms else np.zeros((1078, 1232), bool)
+        cv2.imwrite(str(out / f"{fi:05d}.png"), m.astype(np.uint8) * 255)
+        print(f"[atest] f{fi}: {len(ms)} object(s), area {int(m.sum())}, dark px outside {dark_outside(fi, m)}, "
+              f"{time.time() - t0:.0f}s", flush=True)
+    pred.handle_request({"type": "close_session", "session_id": sid})
+    return 0
+
+
+def cmd_arun(a):
+    """Plan (a), resumable, for any span: per chunk one session, text prompt "person"
+    on the chunk's first frame, SAM 3.1 detector + tracker on every frame (this is
+    what shades.masking.run_sam31 does, with a span and per-chunk resume)."""
+    if not (FRAMES / "00000.jpg").exists():
+        extract_jpeg_frames(VIDEO, FRAMES, 2)
+    n = len(list(FRAMES.glob("*.jpg")))
+    s0, s1 = map(int, a.frames.split(":"))
+    s1 = min(s1, n)
+    mdir = REPO / "masks" / f"{STEM}__a"
+    sdir = mdir / "subject"
+    sdir.mkdir(parents=True, exist_ok=True)
+    mf = mdir / "meta.json"
+    meta = json.loads(mf.read_text()) if mf.exists() else {"chunks": {}}
+    step = a.chunk - a.overlap
+    chunks, s = [], s0
+    while True:
+        e = min(s1, s + a.chunk)
+        chunks.append((s, e))
+        if e == s1:
+            break
+        s += step
+    pred, on_gpu, set_mode = load_predictor()
+    set_mode(False)
+    for ci, (cs, ce) in enumerate(chunks):
+        key = f"{cs}-{ce - 1}"
+        if meta["chunks"].get(key, {}).get("ok"):
+            continue
+        t0 = time.time()
+        cdir = chunk_dir(cs, ce, "arun")
+        sid = pred.handle_request({"type": "start_session", "resource_path": str(cdir)})["session_id"]
+        pred.handle_request({"type": "add_prompt", "session_id": sid, "frame_index": 0, "text": "person"})
+        per_obj = {}
+        for resp in pred.handle_stream_request({"type": "propagate_in_video", "session_id": sid}):
+            fi = cs + int(resp["frame_index"])
+            o = resp["outputs"]
+            for oid, m in zip(o["out_obj_ids"], o["out_binary_masks"]):
+                per_obj.setdefault(int(oid), {})[fi] = np.asarray(m) > 0
+        pred.handle_request({"type": "close_session", "session_id": sid})
+        if not per_obj:
+            meta["chunks"][key] = {"ok": False, "reason": "no object"}
+            print(f"[arun] chunk {key}: NO OBJECT", flush=True)
+            mf.write_text(json.dumps(meta, indent=1))
+            continue
+
+        def score(oid):
+            fr = per_obj[oid]
+            prev = [i for i in range(cs, ce) if (sdir / f"{i:05d}.png").exists() and i in fr]
+            if prev:
+                tot = []
+                for i in prev:
+                    old = cv2.imread(str(sdir / f"{i:05d}.png"), 0) > 127
+                    tot.append(float((old & fr[i]).sum() / max((old | fr[i]).sum(), 1)))
+                return float(np.mean(tot))
+            areas = [m.sum() for m in fr.values() if m.any()]
+            return len(areas) * float(np.median(areas)) if areas else 0.0
+
+        chosen = max(per_obj, key=score)
+        areas = {}
+        for i in range(cs, ce):
+            m = per_obj[chosen].get(i)
+            if m is None:
+                continue
+            p = sdir / f"{i:05d}.png"
+            if p.exists():                       # chunk overlap: union keeps the seam stable
+                m = m | (cv2.imread(str(p), 0) > 127)
+            cv2.imwrite(str(p), m.astype(np.uint8) * 255)
+            areas[i] = int(m.sum())
+        meta["chunks"][key] = {"ok": True, "objects": sorted(per_obj), "chosen": chosen,
+                               "seconds": round(time.time() - t0, 1),
+                               "area_min": min(areas.values()), "area_max": max(areas.values())}
+        mf.write_text(json.dumps(meta, indent=1))
+        print(f"[arun] chunk {ci + 1}/{len(chunks)} {key}: objects {sorted(per_obj)} -> {chosen}, "
+              f"area {min(areas.values())}-{max(areas.values())}, {time.time() - t0:.0f}s "
+              f"= {(time.time() - t0) / (ce - cs):.1f} s/frame", flush=True)
+    print("[arun] done", flush=True)
+    return 0
+
+
 def cmd_run(a):
     if not (FRAMES / "00000.jpg").exists():
         extract_jpeg_frames(VIDEO, FRAMES, 2)
@@ -406,6 +509,14 @@ def main():
     t.add_argument("--no-fins", action="store_true")
     t.set_defaults(fn=cmd_timing)
     sub.add_parser("headtest").set_defaults(fn=cmd_headtest)
+    ar = sub.add_parser("arun")
+    ar.add_argument("--frames", required=True)
+    ar.add_argument("--chunk", type=int, default=32)
+    ar.add_argument("--overlap", type=int, default=2)
+    ar.set_defaults(fn=cmd_arun)
+    at = sub.add_parser("atest")
+    at.add_argument("--frames", default="280:296")
+    at.set_defaults(fn=cmd_atest)
     r = sub.add_parser("run")
     r.add_argument("--frames", default=None, help="start:end (end exclusive)")
     r.add_argument("--chunk", type=int, default=32)
