@@ -370,6 +370,25 @@ def run_chunk(sam: Sam, ci: int, person: dict, imgs: dict, done: dict, log):
     return out
 
 
+def find_watch(img_bgr, person, avoid, tips):
+    """Fallback when the detector finds no wrist watch: the strap is a small,
+    very dark band next to the hand. Dark connected component (40-900 px)
+    inside the diver, outside the other classes, closest to a hand tip."""
+    g = luma01(img_bgr)
+    cand = person & (g < 0.20) & ~dil(avoid, 6)
+    num, lab, st, cen = cv2.connectedComponentsWithStats(cand.astype(np.uint8), 8)
+    best, bd = None, 1e9
+    for k in range(1, num):
+        a = st[k, cv2.CC_STAT_AREA]
+        if not 40 <= a <= 900:
+            continue
+        for t in tips:
+            d = float(np.hypot(cen[k][0] - t[0], cen[k][1] - t[1]))
+            if d < 170 and d < bd:
+                best, bd = k, d
+    return (lab == best) if best is not None else np.zeros_like(person)
+
+
 # ------------------------------------------------------------ postprocess --
 def clean(m, p=POST):
     m = m.astype(np.uint8)
@@ -487,6 +506,20 @@ def main() -> int:
     # helpers: SAM hair/watch plus the earlier SAM hair masks
     hair = {f: helper["HAIR"].get(f, np.zeros_like(person[f])) | read_mask(hdir, f) for f in range(N)}
     watch = {f: helper["WATCH"].get(f, np.zeros_like(person[f])) for f in range(N)}
+    wfb = 0
+    for f in range(N):
+        if watch[f].sum() >= 10:
+            continue
+        avoid = hair[f].copy()
+        for c in ("FINS", "SHORTS", "MASK"):
+            if raw[c].get(f) is not None:
+                avoid |= raw[c][f]
+        w = find_watch(imgs[f], person[f], avoid, hand_tips(person[f], avoid))
+        if w.sum() >= 10:
+            watch[f] = w
+            wfb += 1
+    print(f"[cls] wrist watch: SAM on {sum(1 for f in helper['WATCH'] if helper['WATCH'][f].sum() >= 10)} frames, "
+          f"dark-band fallback on {wfb}", flush=True)
     fin = finish(raw, person, hair, watch, range(N))
 
     # ---- write masks (soft, exclusive) -----------------------------------
