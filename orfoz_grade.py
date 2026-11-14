@@ -72,6 +72,7 @@ P = dict(
     fish_erode=2, fish_feather=4.0,
     fish_glow=0.75,         # extra stops on the fish itself
     fade_frames=10,
+    seam_step=0.08, seam_radius=6,
 )
 
 
@@ -216,6 +217,16 @@ class Grader:
         pad = np.pad(pres, k, mode="edge")
         self.presence = np.convolve(pad, np.ones(2 * k + 1) / (2 * k + 1), "valid")
         self.area = area
+        # SAM runs in overlapping chunks and each chunk draws the black body /
+        # black crevice boundary a little differently, so the mask area steps
+        # (often 15-40 %) at chunk seams. Real fish never change area that fast,
+        # so cross-fade the mask over +-seam_radius frames around every such step.
+        self.radius = np.full(self.n, 1, int)
+        ratio = np.abs(area[1:] / np.maximum(area[:-1], 1) - 1)
+        self.seams = [int(j) + 1 for j in np.flatnonzero((ratio > p["seam_step"]) & (area[1:] > 0) & (area[:-1] > 0))]
+        for sj in self.seams:
+            lo, hi = max(sj - p["seam_radius"], 0), min(sj + p["seam_radius"] + 1, self.n)
+            self.radius[lo:hi] = p["seam_radius"]
 
     def denoise(self, x):
         p = self.p
@@ -335,8 +346,11 @@ class Grader:
 
     def refine_alpha(self, i, guide):
         p = self.p
-        lo, hi = max(i - 1, 0), min(i + 1, self.n - 1)
-        mf = (0.25 * self.masks[lo] + 0.5 * self.masks[i] + 0.25 * self.masks[hi]).astype(np.float32)
+        r = int(self.radius[i])
+        ks = [k for k in range(-r, r + 1) if 0 <= i + k < self.n]
+        wts = np.array([r + 1 - abs(k) for k in ks], np.float32)
+        mf = sum(w * self.masks[i + k] for w, k in zip(wts, ks)) / wts.sum()
+        mf = mf.astype(np.float32)
         m8 = (mf > 0.5).astype(np.uint8)
         if p["fish_erode"]:
             m8 = cv2.erode(m8, np.ones((3, 3), np.uint8), iterations=p["fish_erode"])
@@ -419,6 +433,7 @@ def main() -> int:
     gain = estimate_fish_gain(list(range(0, n, 20)), a.input, info, masks, have)
     print(f"[grade] veil {veil.round(4)} fish WB gain {gain.round(3)}", flush=True)
     g = Grader(P, masks, have, veil, gain)
+    print(f"[grade] mask area steps (SAM chunk seams) cross-faded at frames {g.seams}", flush=True)
 
     want = None
     if a.frames:
