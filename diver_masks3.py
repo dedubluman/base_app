@@ -298,11 +298,12 @@ def post_stage(a_input: Path, log):
         base = pv("FINS", f)
         ps = raw["FINS"].get(f)
         v3 = (ps[0] | ps[1]) if ps is not None else z.copy()
+        both = ps is not None and ps[0].sum() >= 150 and ps[1].sum() >= 150
         m = base.copy()
         src = "SAM (earlier)" if base.sum() >= 150 else ""
-        if v3.sum() >= 150 and (base.sum() < 150 or 0.7 * base.sum() <= v3.sum() <= 1.3 * base.sum()):
+        if v3.sum() >= 150:                               # the per-paddle box chain is the primary mask
             m = m | v3
-            src = "SAM (box chain)" if base.sum() < 150 else "SAM (both)"
+            src = "SAM (box chain, both paddles)" if both else "SAM (box chain, one paddle)"
         if m.sum() < 150 and f >= 1:                       # no SAM mask: the dark paddle next to the previous one
             pc = centroid(fn[f - 1]) if fn[f - 1].sum() else (1100, 560)
             for thr in (0.20, 0.24, 0.28, 0.32):
