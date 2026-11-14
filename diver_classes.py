@@ -277,6 +277,33 @@ def valid_mask(cls, m, person, img):
     return True
 
 
+DARK_THR = {"FINS": 0.32, "MASK": 0.34, "HAIR": 0.34}
+
+
+def refine_dark(cls, m, img):
+    """Fins, mask and hair are the darkest things on the diver: a SAM mask that
+    swelled over a bright leg is cut back to its dark pixels."""
+    if cls not in DARK_THR:
+        return m
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    r = m & (luma01(img) < DARK_THR[cls])
+    return cv2.morphologyEx(r.astype(np.uint8), cv2.MORPH_CLOSE, k) > 0
+
+
+def grow_dark(img_bgr, person, pts, thr=0.30):
+    """Connected dark pixels (the black fins) containing each user point."""
+    g = luma01(img_bgr)
+    dark = (g < thr) & dil(person, 25)
+    num, cc, _, _ = cv2.connectedComponentsWithStats(dark.astype(np.uint8), 8)
+    out = np.zeros_like(dark)
+    for x, y in pts:
+        win = cc[max(0, y - 10):y + 11, max(0, x - 10):x + 11]
+        ids = win[win > 0]
+        if len(ids):
+            out |= cc == np.bincount(ids).argmax()
+    return out
+
+
 def seed_events(m, user=()):
     pts, lab = prompts_from_mask(m, n_pos=5, n_neg=5)
     ev = [(int(p[0] * 1232), int(p[1] * 1078), l) for p, l in zip(pts, lab)]
@@ -295,7 +322,7 @@ def grow_white(img_bgr, person, x, y):
     return (cc == k) if k > 0 else np.zeros_like(m)
 
 
-def run_chunk(sam: Sam, ci: int, person: dict, imgs: dict, done: dict, log):
+def run_chunk(sam: Sam, ci: int, person: dict, imgs: dict, done: dict, log, attempts=None):
     """Detect/seed the classes of chunk ci and track them both ways. `done`
     holds masks already produced on neighbouring chunks: [cls][frame]."""
     cs, ce = CHUNKS[ci]
@@ -304,7 +331,7 @@ def run_chunk(sam: Sam, ci: int, person: dict, imgs: dict, done: dict, log):
     got_n = {c: 0 for c in CLASSES + HELPERS}
     tried = set()
     t0 = time.time()
-    for cls, f, phrases in ATTEMPT.get(ci, []):
+    for cls, f, phrases in (ATTEMPT if attempts is None else attempts).get(ci, []):
         if got_n[cls] >= 2 or (cls, f) in tried:
             continue
         tried.add((cls, f))
@@ -335,9 +362,12 @@ def run_chunk(sam: Sam, ci: int, person: dict, imgs: dict, done: dict, log):
     ev: dict[tuple, list] = {}
     for (f, cls), m in seeds.items():
         ev[(f, cls)] = seed_events(m)
-    for f, per in USER.items():                  # fin anchors are real, dark blobs
+    for f, per in USER.items():                  # the user's fin anchors, grown to the dark blob
         if f in (12, 15, 20) and cs <= f < ce:
-            ev.setdefault((f, "FINS"), []).extend(per["FINS"])
+            g = grow_dark(imgs[f], person[f], [(x, y) for x, y, _ in per["FINS"]])
+            if g.sum() > 800:
+                ev[(f, "FINS")] = seed_events(g)
+                log(f"  [user  ] c{ci} f{f:02d} FINS: two fins grown from the anchors: {int(g.sum())}")
     if ci == 3 and not any(c == "MASK" for _, c in seeds):
         ev[(89, "MASK")] = [(822, 470, 1)]       # the user's reference spot, f89
         log("  [user  ] c3 f89 MASK: point (822,470)")
@@ -363,6 +393,7 @@ def run_chunk(sam: Sam, ci: int, person: dict, imgs: dict, done: dict, log):
     out = {c: {} for c in CLASSES + HELPERS}
     for c in CLASSES + HELPERS:
         for f, m in res[c].items():
+            m = refine_dark(c, m, imgs[f])
             if m.sum() > 0 and valid_mask(c, m, person[f], imgs[f]):
                 out[c][f] = m
         log(f"   {c:6s} valid {len(out[c]):3d}/{ce - cs}  areas " +
@@ -414,7 +445,13 @@ def finish(raw: dict, person: dict, hair: dict, watch: dict, frames):
         P = dil(person[f], 3)                   # water line / reflections: nothing above it
         cl = {}
         for c in CLASSES:
-            m = raw[c].get(f, np.zeros_like(P)) & P
+            if c == "SKIN":
+                oth = np.zeros_like(P)
+                for o in ("MASK", "FINS", "SHORTS"):
+                    oth |= raw[o].get(f, np.zeros_like(P))
+                m = person[f] & ~dil(oth, 1)
+            else:
+                m = raw[c].get(f, np.zeros_like(P)) & P
             if c == "SKIN":
                 hw = hair.get(f, np.zeros_like(P))
                 wt = watch.get(f, np.zeros_like(P))
@@ -457,6 +494,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", type=Path, required=True)
     ap.add_argument("--reuse", action="store_true", help="reuse cached SAM output")
+    ap.add_argument("--rerun", default="", help="chunks to re-run on top of the cache, e.g. 2,1,0")
     a = ap.parse_args()
     stem = a.input.stem
     cache = REPO / ".cache"
@@ -473,7 +511,28 @@ def main() -> int:
     pkl = out_dir / "sam_raw.pkl"
     log = lambda s: print(s, flush=True)
 
-    if a.reuse and pkl.exists():
+    if a.rerun and pkl.exists():
+        raw, helper = pickle.loads(pkl.read_bytes())
+        sam = Sam(frames, cache)
+        done = {c: dict(raw[c]) for c in CLASSES}
+        done.update({c: dict(helper[c]) for c in HELPERS})
+        quick = {2: [("SHORTS", 52, ["shorts"]), ("SHORTS", 66, ["shorts"])], 1: [],
+                 0: [("FINS", 0, ["swim fins"]), ("HAIR", 16, ["hair"])]}
+        for ci in [int(v) for v in a.rerun.split(",")]:
+            res = run_chunk(sam, ci, person, imgs, done, log, attempts=quick)
+            lo, hi = SPLITS[ci], SPLITS[ci + 1]
+            for c in CLASSES + HELPERS:
+                dst = raw if c in CLASSES else helper
+                for f in range(lo, hi):
+                    dst[c].pop(f, None)
+                    done[c].pop(f, None)
+                for f, m in res[c].items():
+                    if lo <= f < hi or f not in dst[c]:
+                        dst[c][f] = m
+                        done[c][f] = m
+            pkl.write_bytes(pickle.dumps((raw, helper)))
+        del sam
+    elif a.reuse and pkl.exists():
         raw, helper = pickle.loads(pkl.read_bytes())
     else:
         sam = Sam(frames, cache)
