@@ -234,64 +234,67 @@ def hull_trim(f, m, margin=26):
     return m & evidence(f, m, margin=margin)
 
 
+def sdf_half(m):
+    """Signed distance (px at half res), positive inside. Interpolating SDFs morphs a
+    shape smoothly; blending binary masks makes the area jump when the weight crosses 0.5."""
+    s = (cv2.resize(m.astype(np.uint8), (W // 2, H // 2), interpolation=cv2.INTER_AREA) > 0).astype(np.uint8)
+    return (cv2.distanceTransform(s, cv2.DIST_L2, 5) - cv2.distanceTransform(1 - s, cv2.DIST_L2, 5)).astype(np.float32)
+
+
 def stage_finish(a):
-    """tracked masks -> trims -> clean -> QC -> alpha (erode, feather, +-2 frames, exit fade)."""
-    tdir, adir = OUT / "track", OUT / "alpha"
-    shutil.rmtree(adir, ignore_errors=True)
-    adir.mkdir(parents=True)
-    raw = {}
+    """tracked masks -> clean -> exit fade -> temporal SDF median/mean until QC is clean
+    -> alpha (erode 0.2 % W, gaussian 0.7 % W, opacity fade)."""
+    t0 = time.time()
+    tdir, adir, bdir = OUT / "track", OUT / "alpha", OUT / "bin"
+    for d in (adir, bdir):
+        shutil.rmtree(d, ignore_errors=True)
+        d.mkdir(parents=True)
+    cl = {}
     for f in range(N):
-        p = tdir / f"{f:05d}.png"
-        raw[f] = (cv2.imread(str(p), 0) > 127) if p.exists() else np.zeros((H, W), bool)
-    # 1) leakage trims named by the user: 2-138 left shadow band + upper-right bulge
-    for f in range(0, 139):
-        if raw[f].any():
-            raw[f] = hull_trim(f, raw[f])
-    # 2) clean
-    cl = {f: (clean(raw[f]) if raw[f].any() else raw[f]) for f in range(N)}
-    # 3) exit: first frame (after the peak) whose area < 25 % of the peak; freeze shape, fade opacity
+        m = cv2.imread(str(tdir / f"{f:05d}.png"), 0) > 127
+        if a.hull_trim and f < 139 and m.any():
+            m = hull_trim(f, m)
+        cl[f] = clean(m) if m.any() else m
     area = np.array([cl[f].sum() for f in range(N)], float)
-    peak = float(area.max())
+    peak = float(np.median(np.sort(area)[-20:]))          # peak area, robust to a one-frame spike
     f0 = next((f for f in range(a.exit_from, N) if area[f] < 0.25 * peak), None)
     fade = np.ones(N, np.float32)
     if f0 is not None:
         for f in range(f0, N):
-            cl[f] = cl[f0 - 1]
+            cl[f] = cl[f0 - 1]                             # freeze the shape, do not chase fragments
             fade[f] = max(0.0, 1.0 - (f - f0 + 1) / 10.0)
-    print(f"[finish] peak area {peak:.0f}; exit fade starts at frame {f0}", flush=True)
-    # 4) QC on the binary masks (shape only; fade frames hold a frozen shape), widen smoothing until clean
-    win = 0
+    print(f"[finish] cleaned in {time.time() - t0:.0f}s; peak area {peak:.0f}; exit fade from frame {f0}", flush=True)
+    sd = np.stack([sdf_half(cl[f]) for f in range(N)])
+    # one-frame spikes (e.g. the anchor frame) die in a +-2 temporal median of the SDF
+    med = np.stack([np.median(sd[max(0, f - 2):f + 3], axis=0) for f in range(N)])
+    win = a.smooth
     while True:
+        wts = np.array([win + 1 - abs(k) for k in range(-win, win + 1)], np.float32)
         sm = {}
         for f in range(N):
-            ks = [k for k in range(f - win, f + win + 1) if 0 <= k < N]
-            sm[f] = (sum(cl[k].astype(np.float32) for k in ks) / len(ks)) > 0.5 if win else cl[f]
+            ks = [k for k in range(-win, win + 1) if 0 <= f + k < N]
+            ww = np.array([win + 1 - abs(k) for k in ks], np.float32)
+            acc = sum(w * med[f + k] for w, k in zip(ww, ks)) / ww.sum()
+            m = cv2.resize(acc, (W, H), interpolation=cv2.INTER_LINEAR) > 0
+            sm[f] = clean(m) if m.any() else m
         bad = qc({f: sm[f] for f in range(2, N) if sm[f].any() and fade[f] == 1.0})
-        print(f"[qc] binary-mask smoothing window +-{win}: violations {len(bad)}", flush=True)
+        print(f"[qc] SDF smoothing +-{win} frames: violations {len(bad)}", flush=True)
         for b in bad[:30]:
             print("   frame %d area_change %.3f iou %.3f" % b, flush=True)
-        if not bad or win >= 6:
+        if not bad or win >= 8:
             break
         win += 1
-    # 5) alpha: erode 0.2 % W, gaussian 0.7 % W, +-2 frame smoothing, exit fade
     er = max(1, int(round(0.002 * W)))
     sig = 0.007 * W
-    soft = {}
-    for f in range(N):
-        m8 = cv2.erode(sm[f].astype(np.uint8), K(2 * er + 1)) if sm[f].any() else sm[f].astype(np.uint8)
-        soft[f] = cv2.GaussianBlur(m8.astype(np.float32), (0, 0), sig)
-    for f in range(N):
-        ks = [k for k in range(f - 2, f + 3) if 0 <= k < N]
-        al = sum(soft[k] for k in ks) / len(ks) * fade[f]
-        cv2.imwrite(str(adir / f"{f:05d}.png"), np.clip(al * 255 + 0.5, 0, 255).astype(np.uint8))
-    bdir = OUT / "bin"
-    shutil.rmtree(bdir, ignore_errors=True)
-    bdir.mkdir(parents=True)
     for f in range(N):
         cv2.imwrite(str(bdir / f"{f:05d}.png"), sm[f].astype(np.uint8) * 255)
+        m8 = cv2.erode(sm[f].astype(np.uint8), K(2 * er + 1)) if sm[f].any() else sm[f].astype(np.uint8)
+        al = cv2.GaussianBlur(m8.astype(np.float32), (0, 0), sig) * fade[f]
+        cv2.imwrite(str(adir / f"{f:05d}.png"), np.clip(al * 255 + 0.5, 0, 255).astype(np.uint8))
+    ar2 = [int(sm[f].sum()) for f in range(N)]
     (OUT / "finish.json").write_text(json.dumps(dict(peak=peak, exit_frame=f0, smoothing_window=win,
-                                                    violations=[list(b) for b in bad],
-                                                    area=[int(x) for x in area]), indent=1))
+                                                    violations=[list(b) for b in bad], area=ar2), indent=1))
+    print(f"[finish] done in {time.time() - t0:.0f}s; smoothing window +-{win}; remaining violations {len(bad)}", flush=True)
 
 
 if __name__ == "__main__":
@@ -301,6 +304,8 @@ if __name__ == "__main__":
     ap.add_argument("--chunk", type=int, default=40)
     ap.add_argument("--overlap", type=int, default=12)
     ap.add_argument("--exit-from", dest="exit_from", type=int, default=309)
+    ap.add_argument("--smooth", type=int, default=2, help="start half-window (frames) of the temporal SDF smoothing")
+    ap.add_argument("--hull-trim", dest="hull_trim", action="store_true", help="old pattern-hull trim of frames <139 (off: tracker is tight)")
     a = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     {"evid": stage_evid, "track": stage_track, "finish": stage_finish}[a.stage](a)
