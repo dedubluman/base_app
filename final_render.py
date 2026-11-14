@@ -109,11 +109,13 @@ def map_lab(Lc, ac, bc, P):
 
 
 def correct(xl, g_r, hw, strong):
-    """Linear RGB -> red-gain corrected, blue cast removed in the hands."""
-    gain = g_r * (1.0 + (HAND_R_STRONG if strong else HAND_R) * hw - hw)   # +15-20 % on the hands
+    """Linear RGB -> red-gain corrected; hands get 15-20 % more red gain and lose
+    their blue cast. xl: (..., 3); hw: (..., 1) hand weight 0..1."""
+    h0 = hw[..., 0]
+    k = HAND_R_STRONG if strong else HAND_R
     xc = xl.copy()
-    xc[..., 0] = xc[..., 0] * gain
-    xc[..., 2] = xc[..., 2] * (1.0 - (1.0 - HAND_B) * hw)
+    xc[..., 0] = xc[..., 0] * g_r * (1.0 + (k - 1.0) * h0)
+    xc[..., 2] = xc[..., 2] * (1.0 - (1.0 - HAND_B) * h0)
     return np.clip(xc, 0, 1)
 
 
@@ -206,7 +208,10 @@ def main() -> int:
     gr_raw = []
     for i in range(N):
         sk = A["SKIN"][i]
-        c = cv2.erode((sk > 0.9).astype(np.uint8), e3) > 0
+        oth = np.maximum.reduce([A[k][i] for k in ("SHORTS", "FINS", "MASK", "HAIR", "WATCH")])
+        c = cv2.erode(((sk > 0.98) & (oth < 0.01) & (al_final[i] > 0.98)).astype(np.uint8), e3, iterations=2) > 0
+        if c.sum() < 300:                                   # tiny skin area: fall back to the plain core
+            c = cv2.erode((sk > 0.9).astype(np.uint8), e3) > 0
         core[i] = c
         ys, xs = np.nonzero(dil(person[i], 20))
         bbox[i] = (xs.min(), ys.min(), xs.max() + 1, ys.max() + 1)
@@ -265,7 +270,7 @@ def main() -> int:
     g_col = R.vertical_weight(h, w)
 
     # ---- render --------------------------------------------------------------------
-    final_stats, outs, bg_ratio = {}, {}, []
+    final_stats, outs, bg_ratio, resolved = {}, {}, [], {}
     for i in range(N):
         x = frames[i]
         bg = R.grade_background(x)
@@ -274,9 +279,25 @@ def main() -> int:
         hw = hands[i][y0:y1, x0:x1][..., None]
         xc = correct(xl, g_r[i], hw, strong[i])
         lab = to_lab(delin(xc))
-        L, a_, b_ = map_lab(lab[..., 0], lab[..., 1], lab[..., 2], params[i])
+        core_b = core[i][y0:y1, x0:x1]
+        for it in range(5):                                 # re-solve off-target frames on the finished colours
+            L, a_, b_ = map_lab(lab[..., 0], lab[..., 1], lab[..., 2], params[i])
+            skin_box = to_rgb(np.stack([L, a_, b_], -1))
+            lc = to_lab(skin_box[core_b][None])[0]           # after gamut clipping
+            mm = measure(lc[:, 0], lc[:, 1], lc[:, 2])
+            if in_target(mm):
+                break
+            Pp = params[i]
+            Pp["kL"] += T["L"] - mm["L"]
+            Pp["kC"] *= T["C"] / max(float(np.hypot(mm["a"], mm["b"])), 1e-3)
+            Pp["kH"] += T["h"] - mm["hue"]
+            if mm["p5"] < 38.5:
+                Pp["p5"] -= (T["p5"] - mm["p5"]) * 0.6
+            if mm["Lmax"] > 75.5:
+                Pp["p95"] -= (mm["Lmax"] - 75.0) * 0.6
+        resolved[i] = it
         skin_full = np.zeros_like(x)
-        skin_full[y0:y1, x0:x1] = to_rgb(np.stack([L, a_, b_], -1))
+        skin_full[y0:y1, x0:x1] = skin_box
         parts = {"shorts": A["SHORTS"][i], "hair": A["HAIR"][i],
                  "fins": np.clip(np.maximum(np.maximum(A["FINS"][i], A["MASK"][i]), A["WATCH"][i]), 0, 1)}
         dv = R.grade_diver(x, yref[i], depth=g_col[..., None], parts=parts, strict=True, skin_rgb=skin_full)
@@ -320,7 +341,8 @@ def main() -> int:
         L_range=[min(Ls), max(Ls)],
         shorts_ab_max=float(np.nanmax([max(abs(final_stats[i].get("shorts_a", 0)), abs(final_stats[i].get("shorts_b", 0))) for i in range(N)])),
         bg_mid_ratio=float(np.mean(bg_ratio)) if bg_ratio else None,
-        off_target=[i for i in range(N) if not in_target(final_stats[i])])
+        off_target=[i for i in range(N) if not in_target(final_stats[i])],
+        resolved_frames=[i for i in range(N) if resolved.get(i, 0) > 0])
     (qc / "skin_summary.json").write_text(json.dumps(summary, indent=1))
     print("[skin] summary", json.dumps(summary), flush=True)
 
