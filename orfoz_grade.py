@@ -189,6 +189,14 @@ def load_masks(mdir: Path, objs: list[int], n: int, w: int, h: int, log=print):
             acc = per[src[0]].astype(np.float32)
         log(f"  repaired mask {i}: area {int(area[i])} -> {int((acc > .5).sum())}")
         per[i] = acc > 0.5
+    present = np.flatnonzero(per.reshape(n, -1).any(1))
+    for i in np.flatnonzero(~per.reshape(n, -1).any(1)):
+        if len(present):
+            j = int(present[np.argmin(np.abs(present - i))])
+            if abs(j - i) <= 8:
+                per[i] = per[j]
+                have[i] = True
+                log(f"  filled frame {i} from {j}")
     return per, have
 
 
@@ -323,12 +331,14 @@ class Grader:
             out = out + (up * band * p["fish_rim"])[..., None] * np.array([1.0, 0.86, 0.62], np.float32)
         return np.clip(out, 0, 1)
 
-    def refine_alpha(self, m, guide):
+    def refine_alpha(self, i, guide):
         p = self.p
-        m8 = m.astype(np.uint8)
+        lo, hi = max(i - 1, 0), min(i + 1, self.n - 1)
+        mf = (0.25 * self.masks[lo] + 0.5 * self.masks[i] + 0.25 * self.masks[hi]).astype(np.float32)
+        m8 = (mf > 0.5).astype(np.uint8)
         if p["fish_erode"]:
             m8 = cv2.erode(m8, np.ones((3, 3), np.uint8), iterations=p["fish_erode"])
-        a = gblur(m8.astype(np.float32), p["fish_feather"])
+        a = gblur(0.6 * m8.astype(np.float32) + 0.4 * mf, p["fish_feather"])
         a = guided(guide.astype(np.float32), a, 4, 1e-3)
         return np.clip(a, 0, 1)
 
@@ -338,7 +348,7 @@ class Grader:
         m = self.masks[i]
         bg = self.background(x)
         guide = np.clip(luma(lift_rgb(x, 1.8, 3.0)), 0, 1)
-        alpha = self.refine_alpha(m, guide) if m.any() else np.zeros((h, w), np.float32)
+        alpha = self.refine_alpha(i, guide) if m.any() else np.zeros((h, w), np.float32)
         S, f = self.spotlight(i, alpha, h, w)
         bg = self.apply_spot(bg, S, f)
         fish = self.fish(x, alpha)
@@ -412,11 +422,11 @@ def main() -> int:
         a.stills.mkdir(parents=True, exist_ok=True)
         last = want[-1]
     enc = None
-    if a.output and want is None:
+    if a.output:
         a.output.parent.mkdir(parents=True, exist_ok=True)
         enc = Encoder(a.input, a.output, info, Encode(crf=a.crf))
     for i, x in enumerate(iter_frames(a.input, info)):
-        if want is not None and i > last:
+        if want is not None and not a.output and i > last:
             break
         y = g.frame(i, x)           # temporal state needs every frame in order
         if want is not None and i in want:
