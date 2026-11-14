@@ -45,6 +45,9 @@ def main() -> int:
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--end", type=int, default=None)
     ap.add_argument("--max-objects", type=int, default=8)
+    ap.add_argument("--no-confirm", action="store_true",
+                    help="drop SAM's 3-consecutive-detection confirmation and 15-frame hotstart "
+                         "delay, so a weak, flickering detection still becomes a tracked object")
     ap.add_argument("--det-thresh", type=float, default=None,
                     help="override SAM's detection/new-object score thresholds (0.4/0.65 by default); "
                          "lower it for dark or low-contrast animals")
@@ -80,6 +83,9 @@ def main() -> int:
     if a.det_thresh is not None:
         pred.model.score_threshold_detection = a.det_thresh
         pred.model.new_det_thresh = a.det_thresh
+    if a.no_confirm:
+        pred.model.masklet_confirmation_enable = False
+        pred.model.hotstart_delay = 0
     print(f"[sam] SAM 3.1 multiplex loaded on {'CUDA' if on_gpu else 'CPU'} "
           f"in {time.time() - t0:.0f}s", flush=True)
 
