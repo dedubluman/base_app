@@ -50,11 +50,12 @@ P = dict(
     warm_hi=0.40,           # coral/gold in the brightest rock and sand
     black_lift=(0.010, 0.035, 0.045),
     contrast=1.02,
+    hi_tame=0.30,           # pull the brightest background rock/sand down so it cannot out-shine the fish
     clarity=0.14, clarity_sigma=9.0,
     # spotlight
-    spot_pool=0.90,         # stops of extra light inside the pool
-    spot_dim=-0.50,         # stops removed outside it
-    spot_sat=0.80,          # saturation outside the pool
+    spot_pool=0.40,         # stops of extra light inside the pool
+    spot_dim=-0.85,         # stops removed outside it
+    spot_sat=0.72,          # saturation outside the pool
     spot_inner=0.45,        # sigma of the pool core, x fish radius
     spot_outer=1.10,        # sigma of the wide skirt, x fish radius
     spot_warm=0.10,
@@ -66,10 +67,10 @@ P = dict(
              (0.62, "#c9b57f"), (0.80, "#f3e3b8"), (1.00, "#fff8e8")],
     fish_warm=(1.10, 1.00, 0.84),
     fish_detail=0.40, fish_detail_sigma=5.0,
-    fish_floor=0.14, fish_bilat=0.07, fish_volume=0.30, fish_top=0.28, fish_rim=0.18,
+    fish_floor=0.15, fish_bilat=0.07, fish_volume=0.30, fish_top=0.28, fish_rim=0.18,
     grain=0.010,            # luma grain, strongest in shadows: hides banding after the big lift
     fish_erode=2, fish_feather=4.0,
-    fish_glow=0.55,         # extra stops on the fish itself
+    fish_glow=0.75,         # extra stops on the fish itself
     fade_frames=10,
 )
 
@@ -254,6 +255,7 @@ class Grader:
         warm = smoothstep(0.50, 0.85, y)[..., None] * p["warm_hi"]
         out = out * (1 + warm * np.array([0.35, 0.05, -0.30], np.float32))
         out = np.maximum(out, 0) + np.array(p["black_lift"], np.float32)
+        out = out * (1 - p["hi_tame"] * smoothstep(0.50, 0.95, luma(np.clip(out, 0, 1))))[..., None]
         # clarity
         yb = luma(out)
         det = yb - gblur(yb, p["clarity_sigma"])
@@ -398,6 +400,8 @@ def main() -> int:
     ap.add_argument("--stills", type=Path)
     ap.add_argument("--params", help="JSON overrides for P")
     ap.add_argument("--crf", type=int, default=16)
+    ap.add_argument("--start", type=int, default=0, help="skip frames before this (8 warm-up frames kept)")
+    ap.add_argument("--metric", action="store_true", help="print grouper-vs-ring graded luma ratio")
     a = ap.parse_args()
     if a.params:
         P.update(json.loads(a.params))
@@ -422,13 +426,22 @@ def main() -> int:
         a.stills.mkdir(parents=True, exist_ok=True)
         last = want[-1]
     enc = None
+    ratios: list[float] = []
     if a.output:
         a.output.parent.mkdir(parents=True, exist_ok=True)
         enc = Encoder(a.input, a.output, info, Encode(crf=a.crf))
     for i, x in enumerate(iter_frames(a.input, info)):
         if want is not None and not a.output and i > last:
             break
+        if i < a.start - 8:
+            continue
         y = g.frame(i, x)           # temporal state needs every frame in order
+        if a.metric and i >= a.start and masks[i].any():
+            q = cv2.resize(luma(y), (w // 4, h // 4), interpolation=cv2.INTER_AREA)
+            mq = cv2.resize(masks[i].astype(np.uint8), (w // 4, h // 4), interpolation=cv2.INTER_NEAREST)
+            k3 = np.ones((3, 3), np.uint8)
+            ring = (cv2.dilate(mq, k3, iterations=4) > 0) & ~(cv2.dilate(mq, k3, iterations=1) > 0)
+            ratios.append(float(q[mq > 0].mean() / max(q[ring].mean(), 1e-4)))
         if want is not None and i in want:
             pair = np.concatenate([np.clip(lift_rgb(x, 1.6, 3.0), 0, 1), y], 1)
             bgr = (np.clip(y, 0, 1)[..., ::-1] * 255 + 0.5).astype(np.uint8)
@@ -439,6 +452,10 @@ def main() -> int:
             enc.write(y)
             if i % 25 == 0:
                 print(f"[grade] frame {i}/{n}", flush=True)
+    if ratios:
+        r = np.array(ratios)
+        print(f"[metric] fish/ring luma: median {np.median(r):.2f} min {r.min():.2f} "
+              f"max {r.max():.2f}  frames>1.0: {int((r > 1).sum())}/{len(r)}", flush=True)
     if enc is not None:
         enc.close()
         print(f"[grade] wrote {a.output}", flush=True)
