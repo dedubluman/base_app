@@ -284,8 +284,11 @@ def stage_finish(a):
         ks = [k for k in range(f - 2, f + 3) if 0 <= k < N]
         al = sum(soft[k] for k in ks) / len(ks) * fade[f]
         cv2.imwrite(str(adir / f"{f:05d}.png"), np.clip(al * 255 + 0.5, 0, 255).astype(np.uint8))
-        cv2.imwrite(str(adir.parent / "bin" / f"{f:05d}.png") if (adir.parent / "bin").exists() else str(adir / f"{f:05d}.png"),
-                    np.clip(al * 255 + 0.5, 0, 255).astype(np.uint8))
+    bdir = OUT / "bin"
+    shutil.rmtree(bdir, ignore_errors=True)
+    bdir.mkdir(parents=True)
+    for f in range(N):
+        cv2.imwrite(str(bdir / f"{f:05d}.png"), sm[f].astype(np.uint8) * 255)
     (OUT / "finish.json").write_text(json.dumps(dict(peak=peak, exit_frame=f0, smoothing_window=win,
                                                     violations=[list(b) for b in bad],
                                                     area=[int(x) for x in area]), indent=1))
