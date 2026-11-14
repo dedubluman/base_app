@@ -275,27 +275,55 @@ def post_stage(a_input: Path, log):
 
     A0 = int(pv("SHORTS", 0).sum())
     sh, hr, fn, wt, mk = {}, {}, {}, {}, {}
+    mk_prior = {f: pv("MASK", f) for f in range(N)}
     deleted_mask = []
     for f in range(N):
         Pd = dil(person[f], 3)
         # SHORTS (A): f0 and f46+ masks as they are, 1..45 the union of both chains
         if f == 0 or f >= 46:
             sh[f] = pv("SHORTS", f) & Pd
-        else:
-            sh[f] = (raw["SHORTS_fwd"].get(f, z) | raw["SHORTS_bwd"].get(f, z)) & Pd
+        else:                                              # forward U backward U the earlier SAM masks
+            sh[f] = (raw["SHORTS_fwd"].get(f, z) | raw["SHORTS_bwd"].get(f, z) | pv("SHORTS", f)) & Pd
         # HAIR: existing SAM masks where they exist, the chains in the gap f42-f55
         h = pv("HAIR", f)
         if 42 <= f <= 55:
             h = h | raw["HAIR_fwd"].get(f, z) | raw["HAIR_bwd"].get(f, z)
         hr[f] = h & dil(person[f], 6)
     # FINS (E): per-paddle SAM masks, f28 both paddles
+    from diver_fix import blob_near, grow_dark
+    fins_src = {}
     for f in range(0, 31):
+        base = pv("FINS", f)
         ps = raw["FINS"].get(f)
-        m = (ps[0] | ps[1]) if ps is not None else z.copy()
-        if f == 28:
-            for mm in raw["FINS28"].values():
-                m = m | mm
+        v3 = (ps[0] | ps[1]) if ps is not None else z.copy()
+        m = base.copy()
+        src = "SAM (earlier)" if base.sum() >= 150 else ""
+        if v3.sum() >= 150 and (base.sum() < 150 or 0.7 * base.sum() <= v3.sum() <= 1.3 * base.sum()):
+            m = m | v3
+            src = "SAM (box chain)" if base.sum() < 150 else "SAM (both)"
+        if m.sum() < 150 and f >= 1:                       # no SAM mask: the dark paddle next to the previous one
+            pc = centroid(fn[f - 1]) if fn[f - 1].sum() else (1100, 560)
+            for thr in (0.20, 0.24, 0.28, 0.32):
+                b = blob_near(imgs[f], person[f], pc, sh.get(f, z) | mk_prior.get(f, z), lo=120, hi=12000, r=220, thr=thr)
+                if b.sum() >= 120:
+                    m, src = b, "dark blob"
+                    break
         fn[f] = m
+        fins_src[f] = src
+    # f28: the second paddle's whole underwater part (both paddles, dark blobs at the two spots)
+    for pt in ((1160, 560), (1063, 568)):
+        for thr in (0.22, 0.26, 0.30):
+            gdark = (luma01(imgs[28]) < thr) & dil(person[28], 45)
+            num, cc, _, _ = cv2.connectedComponentsWithStats(gdark.astype(np.uint8), 8)
+            win = cc[pt[1] - 12:pt[1] + 13, pt[0] - 12:pt[0] + 13]
+            ids = win[win > 0]
+            if len(ids):
+                comp = cc == np.bincount(ids).argmax()
+                if 100 <= comp.sum() <= 14000:
+                    fn[28] = fn[28] | comp
+                    break
+    fins_src[28] = (fins_src.get(28, "") + " + dark blobs").strip()
+    log("[v3] FINS sources: " + ", ".join(f"{k}: {sum(1 for v in fins_src.values() if v == k)}" for k in sorted(set(fins_src.values()))))
     for f in range(N):
         fn.setdefault(f, z.copy())
     # MASK (B, C): no point prompts, empty f0-f40; f41+ the SAM masks, parts cleaned
@@ -307,7 +335,8 @@ def post_stage(a_input: Path, log):
             for j in range(1, num):
                 comp = lab == j
                 a = int(st[j, cv2.CC_STAT_AREA])
-                near = (dil(comp, 15) & hr[f]).any()
+                hair_here = hr[f].sum() >= 300
+                near = (dil(comp, 15) & hr[f]).any() if hair_here else True
                 if a < 300:
                     deleted_mask.append((f, a, "< 300 px"))
                 elif not near:
@@ -328,14 +357,28 @@ def post_stage(a_input: Path, log):
         w = raw["WATCH"].get(f)
         wt[f] = w if w is not None else find_watch2(imgs[f], person[f], avoid, tipsd[f])
     for f in range(N):
-        if wt[f].sum() < 30:
+        if not 60 <= wt[f].sum() <= 500:
+            wt[f] = z.copy()
+    for f in range(N):
+        if wt[f].sum() < 60:
             for g in (f - 1, f + 1, f - 2, f + 2, f - 3, f + 3):
-                if 0 <= g < N and wt[g].sum() >= 30:
-                    cand = dil(wt[g], 14) & person[f] & (luma01(imgs[f]) < 0.26)
-                    if cand.sum() >= 25:
+                if 0 <= g < N and 60 <= wt[g].sum() <= 500:
+                    cand = dil(wt[g], 6) & person[f] & (luma01(imgs[f]) < 0.26)
+                    if 60 <= cand.sum() <= 500:
                         wt[f] = cand
                         break
 
+    for f in range(N):                                    # still no strap: widen the search to +-6 frames
+        if wt[f].sum() < 60:
+            for d in range(1, 7):
+                for g in (f - d, f + d):
+                    if 0 <= g < N and 60 <= wt[g].sum() <= 500:
+                        cand = dil(wt[g], 8 + 2 * d) & person[f] & (luma01(imgs[f]) < 0.27)
+                        if 60 <= cand.sum() <= 500:
+                            wt[f] = cand
+                            break
+                if wt[f].sum() >= 60:
+                    break
     cls = {c: {} for c in CLASSES}
     k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
     for f in range(N):

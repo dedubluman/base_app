@@ -84,6 +84,9 @@ class Skin:
 
     def __init__(self, g, gE, mean_hc, mean_Cc):
         self.g, self.gE, self.mean_hc, self.mean_Cc = g, gE, mean_hc, mean_Cc
+        # tone centres (shadow, mid, highlight): hue and chroma; calibrated once for the whole clip
+        self.h_c = np.array([45.0, 51.0, 57.0])
+        self.C_c = np.array([24.0, 26.0, 17.0])
 
     def lab(self, xl, thick, tipw, water_ab):
         """xl: linear original RGB (..., 3) of skin pixels. thick: local limb thickness (px).
@@ -99,13 +102,13 @@ class Skin:
         w_sh = 1.0 - smoothstep(40.0, 50.0, L)
         w_hi = smoothstep(66.0, 74.0, L)
         w_mid = np.clip(1.0 - w_sh - w_hi, 0, 1)
-        h_t = w_sh * 45.0 + w_mid * 51.0 + w_hi * 57.0
-        C_t = w_sh * 24.0 + w_mid * 26.0 + w_hi * 17.0
+        h_t = w_sh * self.h_c[0] + w_mid * self.h_c[1] + w_hi * self.h_c[2]
+        C_t = w_sh * self.C_c[0] + w_mid * self.C_c[1] + w_hi * self.C_c[2]
         # natural variation from the corrected pixel (damped)
         dh = np.clip(wrap(hc - self.mean_hc), -18, 18)
         dC = np.clip(Cc / max(self.mean_Cc, 1e-3) - 1.0, -0.4, 0.4)
-        h = np.clip(h_t + K_H * dh, w_sh * 42 + w_mid * 48 + w_hi * 54, w_sh * 48 + w_mid * 54 + w_hi * 60)
-        C = np.clip(C_t * (1 + K_C * dC), w_sh * 22 + w_mid * 24 + w_hi * 14, w_sh * 26 + w_mid * 28 + w_hi * 20)
+        h = np.clip(h_t + K_H * dh, h_t - 6.0, h_t + 6.0)
+        C = np.clip(C_t * (1 + K_C * dC), C_t * 0.8, C_t * 1.2)
         a = C * np.cos(np.radians(h))
         b = C * np.sin(np.radians(h))
         # cool shadows: ~12 % water colour in the shadows (the target vector already contains it)
@@ -224,10 +227,8 @@ def main() -> int:
         lab = to_lab(bg[ring][None])[0]
         return float(np.median(lab[:, 1])), float(np.median(lab[:, 2]))
 
-    # ---- pass A: skin colour per frame, core statistics for the step limiter ---------------------------------
-    bgs = {}
-    stats0 = []
-    cache_skin = {}
+    # ---- inputs per frame (cached) ----------------------------------------------------------------------------
+    bgs, prep = {}, {}
     for i in rng_f:
         x = frames[i]
         bg = R.grade_background(x)                      # rule 9: one fixed setting for the whole clip
@@ -240,15 +241,51 @@ def main() -> int:
         for tx, ty in tips[i]:
             cv2.circle(tipw, (tx - x0, ty - y0), 55, 1.0, -1)
         tipw = cv2.GaussianBlur(tipw, (0, 0), 10) * sbin
-        wab = water_ab(i, bg)
+        prep[i] = (xl, thick, tipw, water_ab(i, bg), sbin, core[i][y0:y1, x0:x1])
+
+    def skin_frame(i):
+        xl, thick, tipw, wab, sbin, c = prep[i]
         L, a_, b_ = sk.lab(xl, thick, tipw, wab)
         a_, b_ = edge_chroma(a_, b_, sbin)             # 6 px band: blue out, colour from the interior
+        return L, a_, b_, c
+
+    def tone_stats(frames_):
+        acc = {k: [[], []] for k in ("sh", "mid", "hi")}
+        for i in frames_:
+            L, a_, b_, c = skin_frame(i)
+            Lc, ac, bc = L[c], a_[c], b_[c]
+            for k, m in (("sh", Lc < 45), ("mid", (Lc >= 45) & (Lc <= 70)), ("hi", Lc > 70)):
+                if m.sum() > 40:
+                    acc[k][0].append(ac[m])
+                    acc[k][1].append(bc[m])
+        out = {}
+        for k, (aa, bb) in acc.items():
+            if aa:
+                ma, mb = float(np.concatenate(aa).mean()), float(np.concatenate(bb).mean())
+                out[k] = (float(hue_of(ma, mb)), float(np.hypot(ma, mb)))
+        return out
+
+    # one-time, clip-wide calibration of the tone centres (7 frames spread over the clip)
+    cal = [f for f in (0, 12, 28, 46, 60, 70, 89) if f < nfr]
+    want = {"sh": (45.0, 24.0), "mid": (51.0, 26.0), "hi": (57.0, 17.0)}
+    for it in range(4):
+        st_ = tone_stats(cal)
+        for j, k in enumerate(("sh", "mid", "hi")):
+            if k in st_:
+                sk.h_c[j] += 0.9 * (want[k][0] - st_[k][0])
+                sk.C_c[j] += 0.9 * (want[k][1] - st_[k][1])
+    print(f"[skin] calibrated tone centres hue {np.round(sk.h_c, 1)} chroma {np.round(sk.C_c, 1)}; measured {tone_stats(cal)}", flush=True)
+
+    # ---- pass A: skin colour per frame, core statistics for the step limiter ---------------------------------
+    stats0 = []
+    cache_skin = {}
+    for i in rng_f:
+        L, a_, b_, c = skin_frame(i)
         cache_skin[i] = (L, a_, b_)
-        c = core[i][y0:y1, x0:x1]
         stats0.append([float(L[c].mean()), float(a_[c].mean()), float(b_[c].mean())])
     stats0 = np.array(stats0)
     # sudden steps only: L* 1.5, a* and b* 0.8 per frame
-    adj = np.stack([limit_steps(stats0[:, k], lim) for k, lim in enumerate((LIM["L"], LIM["a"], LIM["b"]))], 1)
+    adj = np.stack([limit_steps(stats0[:, k], lim * 0.93) for k, lim in enumerate((LIM["L"], LIM["a"], LIM["b"]))], 1)
     off = adj - stats0
     print(f"[skin] clip mean before limiter L {stats0[:, 0].mean():.2f} a {stats0[:, 1].mean():.2f} b {stats0[:, 2].mean():.2f}; "
           f"largest step L {np.abs(np.diff(stats0[:, 0])).max():.2f} a {np.abs(np.diff(stats0[:, 1])).max():.2f} "
@@ -295,7 +332,7 @@ def main() -> int:
         al = al_final[i]
         # rule 7: ~10 % water colour over the outer 4 px of the diver
         dist = cv2.distanceTransform((al > 0.5).astype(np.uint8), cv2.DIST_L2, 3)
-        wrap_w = (0.10 * np.clip(1 - dist / 4.0, 0, 1) * (al > 0.02))[..., None]
+        wrap_w = (0.10 * np.clip(1 - dist / 4.0, 0, 1) * (al > 0.02) * (1 - w_sh))[..., None]
         dv = dv * (1 - wrap_w) + bg * wrap_w
         out = bg * (1 - al[..., None]) + dv * al[..., None]
         # measurements on the finished frame, strict skin core
@@ -306,7 +343,7 @@ def main() -> int:
         Lorig = Y2L(lin(x) @ np.array([0.2126, 0.7152, 0.0722], np.float32)).astype(np.float32)
         tex = float(np.std(hf(lab_o[..., 0])[c]) / max(np.std(hf(Lorig)[c]), 1e-6))
         sh_m, hi_m = Lc < 45, Lc > 70
-        sm = cv2.erode((Af("SHORTS", i) > 0.9).astype(np.uint8), e3) > 0
+        sm = cv2.erode(((Af("SHORTS", i) > 0.9) & (al_final[i] > 0.98)).astype(np.uint8), e3, iterations=2) > 0
         rows.append(dict(frame=i, L=float(Lc.mean()), a=float(ac.mean()), b=float(bc.mean()),
                          spread=float(np.percentile(hh, 95) - np.percentile(hh, 5)),
                          hue_shadow=float(hue_of(ac[sh_m].mean(), bc[sh_m].mean())) if sh_m.sum() > 30 else float("nan"),
