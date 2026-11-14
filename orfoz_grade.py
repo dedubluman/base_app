@@ -37,38 +37,39 @@ P = dict(
     t_motion_thr=0.020,     # abs diff (0..1) at which the new frame wins fully
     t_shadow_only=0.45,     # luma above which temporal smoothing fades out
     chroma_sigma=2.2,       # chroma blur in dark areas (px)
+    shadow_bilat=0.028,     # bilateral sigmaColor on the dark, pre-lift frame (hides 8x8 codec blocks)
     # base exposure for the whole frame (stops, linear light)
-    bg_stops=1.55,
-    bg_white=2.6,           # shoulder white point (linear, after exposure)
+    bg_a=2.0, bg_g=0.80, bg_k=0.70,      # shadow-lift curve: (a*y)^g, soft knee at k
     veil=0.55,              # share of the clip's black floor to remove
     # aquarium look
-    hue_cyan=0.55,          # how far olive/green water is pushed to cyan
+    hue_cyan=1.35,          # how far olive/green water is pushed to cyan
     sat=1.45, vibrance=1.25,
-    gm_mix=0.55,            # luma gradient-map share
-    gm=[(0.00, "#03141a"), (0.18, "#06323d"), (0.36, "#0a6f7c"),
-        (0.55, "#27b9b4"), (0.72, "#8fe0c4"), (0.84, "#ffd7a0"), (1.00, "#fff2dc")],
-    warm_hi=0.30,           # coral/gold in the brightest rock and sand
+    gm_mix=0.70,            # luma gradient-map share
+    gm=[(0.00, "#03141a"), (0.15, "#05303b"), (0.32, "#09687a"), (0.48, "#18a7b5"),
+        (0.60, "#6fd3c4"), (0.70, "#f2c9a0"), (0.85, "#ffb98a"), (1.00, "#fff0e0")],
+    warm_hi=0.40,           # coral/gold in the brightest rock and sand
     black_lift=(0.010, 0.035, 0.045),
-    contrast=1.12,
-    clarity=0.30, clarity_sigma=9.0,
+    contrast=1.02,
+    clarity=0.14, clarity_sigma=9.0,
     # spotlight
-    spot_pool=0.55,         # stops of extra light inside the pool
-    spot_dim=-0.60,         # stops removed outside it
+    spot_pool=0.90,         # stops of extra light inside the pool
+    spot_dim=-0.50,         # stops removed outside it
     spot_sat=0.80,          # saturation outside the pool
-    spot_inner=0.55,        # sigma of the pool core, x fish radius
-    spot_outer=1.90,        # sigma of the wide skirt, x fish radius
+    spot_inner=0.45,        # sigma of the pool core, x fish radius
+    spot_outer=1.10,        # sigma of the wide skirt, x fish radius
     spot_warm=0.10,
     spot_ema=0.55,          # temporal smoothing of the pool map
     # grouper
-    fish_stops=2.35,
-    fish_white=1.8,
-    fish_gm_mix=0.72,
-    fish_gm=[(0.00, "#0a0a0b"), (0.14, "#1c1612"), (0.30, "#4a3626"), (0.48, "#8a6a47"),
-             (0.66, "#d0a56e"), (0.84, "#f6dcae"), (1.00, "#fff6e4")],
+    fish_a=6.5, fish_g=0.58, fish_k=0.78,
+    fish_gm_mix=0.55,
+    fish_gm=[(0.00, "#07100f"), (0.12, "#1a2a26"), (0.28, "#3d4632"), (0.44, "#7a7248"),
+             (0.62, "#c9b57f"), (0.80, "#f3e3b8"), (1.00, "#fff8e8")],
     fish_warm=(1.10, 1.00, 0.84),
-    fish_detail=0.65, fish_detail_sigma=5.0,
-    fish_erode=1, fish_feather=2.2,
-    fish_glow=0.15,         # extra stops on the fish itself
+    fish_detail=0.40, fish_detail_sigma=5.0,
+    fish_floor=0.14, fish_bilat=0.07, fish_volume=0.30, fish_top=0.28, fish_rim=0.18,
+    grain=0.010,            # luma grain, strongest in shadows: hides banding after the big lift
+    fish_erode=2, fish_feather=4.0,
+    fish_glow=0.55,         # extra stops on the fish itself
     fade_frames=10,
 )
 
@@ -105,6 +106,16 @@ def tone(y, stops, white):
     lin = np.power(np.maximum(y, 0), 2.2) * (2.0 ** stops)
     out = lin * (1 + lin / (white * white)) / (1 + lin)
     return np.power(out, 1 / 2.2)
+
+
+def curve_rgb(x, a, g, k, gain_cap=14.0):
+    """Shadow-lifting power curve on luma, (a*y)^g, with a tanh knee at k so
+    highlights roll off instead of clipping; applied as a per-pixel ratio."""
+    y = luma(x)
+    v = np.power(np.maximum(a * y, 0), g)
+    v = np.where(v < k, v, k + (1 - k) * np.tanh((v - k) / (1 - k)))
+    r = np.clip(v / np.maximum(y, 1e-4), 0, gain_cap)[..., None]
+    return x * r
 
 
 def lift_rgb(x, stops, white, gain_cap=7.0):
@@ -212,12 +223,18 @@ class Grader:
         y = luma(x)[..., None]
         ch = gblur(x - y, p["chroma_sigma"])
         wd = 1 - smoothstep(0.10, 0.45, y)
-        return y + (x - y) * (1 - wd) + ch * wd
+        x = y + (x - y) * (1 - wd) + ch * wd
+        if p["shadow_bilat"]:
+            xb = cv2.bilateralFilter(np.ascontiguousarray(x, dtype=np.float32), 9,
+                                     p["shadow_bilat"], 5)
+            wb = (1 - smoothstep(0.08, 0.30, luma(x)))[..., None]
+            x = x * (1 - wb) + xb * wb
+        return x
 
     def background(self, x):
         p = self.p
         x = np.clip((x - p["veil"] * self.veil) / (1 - p["veil"] * self.veil), 0, 1)
-        x = lift_rgb(x, p["bg_stops"], p["bg_white"])
+        x = curve_rgb(x, p["bg_a"], p["bg_g"], p["bg_k"])
         # olive/green -> turquoise, then vibrance
         xh = hue_push(np.clip(x, 0, 1), p["hue_cyan"])
         xh = sat(xh, p["sat"], p["vibrance"])
@@ -226,7 +243,7 @@ class Grader:
         # keep texture: gradient map carries the colour, source carries detail
         out = xh * (1 - p["gm_mix"]) + gm * p["gm_mix"] * (y / np.maximum(luma(gm), 1e-3))[..., None] ** 0.55
         # warm coral/gold in the brightest rock and sand
-        warm = smoothstep(0.58, 0.9, y)[..., None] * p["warm_hi"]
+        warm = smoothstep(0.50, 0.85, y)[..., None] * p["warm_hi"]
         out = out * (1 + warm * np.array([0.35, 0.05, -0.30], np.float32))
         out = np.maximum(out, 0) + np.array(p["black_lift"], np.float32)
         # clarity
@@ -272,14 +289,38 @@ class Grader:
         p = self.p
         x = x * self.fish_gain
         x = x * np.array(p["fish_warm"], np.float32)
-        x = lift_rgb(x, p["fish_stops"], p["fish_white"], gain_cap=9.0)
+        x = curve_rgb(x, p["fish_a"], p["fish_g"], p["fish_k"])
         y = np.clip(luma(x), 0, 1)
-        gm = gradient_map(y, p["fish_gm"])
-        out = x * (1 - p["fish_gm_mix"]) + gm * p["fish_gm_mix"] * (y / np.maximum(luma(gm), 1e-3))[..., None] ** 0.6
+        # the body is crushed to ~0 in the source: smooth codec noise, then
+        # float the black floor so the body reads as dark bronze, not holes
+        ys = cv2.bilateralFilter(y.astype(np.float32), 7, p["fish_bilat"], 3)
+        dk = 1 - smoothstep(0.08, 0.40, ys)
+        ys = ys * (1 - dk) + gblur(ys, 3.5) * dk
+        t = p["fish_floor"] + (1 - p["fish_floor"]) * ys
+        # soft key light from above: volume from the mask's own geometry
+        am = (alpha_soft > 0.5).astype(np.uint8)
+        dist = np.zeros(am.shape, np.float32)
+        if am.any():
+            dist = cv2.distanceTransform(am, cv2.DIST_L2, 5)
+            dn = np.clip(dist / max(float(dist.max()), 1.0), 0, 1) ** 0.6
+            rows = np.flatnonzero(am.any(1))
+            v = np.clip((np.arange(am.shape[0], dtype=np.float32) - rows[0])
+                        / max(rows[-1] - rows[0], 1), 0, 1)[:, None]
+            shade = 1 + p["fish_volume"] * (dn - 0.5) + p["fish_top"] * (0.5 - v)
+            t = np.clip(t * shade, 0, 1)
+        gm = gradient_map(t, p["fish_gm"])
+        out = x * (1 - p["fish_gm_mix"]) + gm * p["fish_gm_mix"] * (t / np.maximum(luma(gm), 1e-3))[..., None] ** 0.6
         yb = luma(out)
         det = yb - gblur(yb, p["fish_detail_sigma"])
         out = out + (det * p["fish_detail"])[..., None]
         out = out * (2.0 ** p["fish_glow"])
+        # rim light on the upward-facing edge detaches the fish from the rock
+        if am.any() and p["fish_rim"]:
+            a8 = gblur(am.astype(np.float32), 5.0)
+            gy = cv2.Sobel(a8, cv2.CV_32F, 0, 1, ksize=3)
+            up = np.clip(gy / max(float(np.abs(gy).max()), 1e-3) * 1.6, 0, 1)
+            band = (1 - smoothstep(0.0, 16.0, dist)) * (dist > 0)
+            out = out + (up * band * p["fish_rim"])[..., None] * np.array([1.0, 0.86, 0.62], np.float32)
         return np.clip(out, 0, 1)
 
     def refine_alpha(self, m, guide):
@@ -303,6 +344,10 @@ class Grader:
         fish = self.fish(x, alpha)
         a = (alpha * min(1.0, 0.0 + f * 1.0 + (1.0 if m.any() else 0.0)))[..., None]
         out = bg * (1 - a) + fish * a
+        if self.p["grain"]:
+            rng = np.random.default_rng(1000 + i)
+            gw = (1.0 - 0.6 * np.clip(luma(out), 0, 1))[..., None]
+            out = out + rng.standard_normal(out.shape[:2] + (1,), dtype=np.float32) * self.p["grain"] * gw
         return np.clip(out, 0, 1)
 
 
