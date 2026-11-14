@@ -235,122 +235,139 @@ def pick(cls, f, masks, person, user_pts):
 
 
 # ----------------------------------------------------------------- chunk --
-def run_chunk(sam: Sam, ci: int, person: dict, imgs: dict, hairdir: Path, carry: dict, log):
+CHUNKS = [(0, 30), (24, 54), (48, 78), (72, 90)]
+ORDER = [2, 1, 0, 3]            # start where the detector sees every class, carry outward
+SPLITS = [0, 27, 51, 75, 90]    # frame ranges owned by each chunk (middle of the overlaps)
+# detector attempts per chunk: (class, frame, [phrases tried in order]); the
+# user's phrase first, then the one-word phrase that worked on this clip before
+ATTEMPT = {
+    2: [("SHORTS", 52, ["white swim shorts", "shorts"]), ("SHORTS", 66, ["white swim shorts", "shorts"]),
+        ("FINS", 50, ["swim fins", "flipper"]), ("HAIR", 66, ["hair"]), ("HAIR", 56, ["hair"]),
+        ("MASK", 66, ["diving mask and snorkel", "snorkel"]), ("MASK", 72, ["diving mask and snorkel", "snorkel"]),
+        ("WATCH", 66, ["wrist watch", "watch"])],
+    3: [("SHORTS", 84, ["white swim shorts", "shorts"]), ("HAIR", 84, ["hair"]),
+        ("MASK", 84, ["diving mask and snorkel", "snorkel"]), ("MASK", 89, ["diving mask and snorkel", "snorkel", "diving mask"]),
+        ("FINS", 86, ["swim fins", "flipper"]), ("WATCH", 78, ["wrist watch", "watch"])],
+    1: [("SHORTS", 36, ["white swim shorts", "shorts"]), ("SHORTS", 46, ["white swim shorts", "shorts"]),
+        ("FINS", 30, ["swim fins", "flipper"]), ("FINS", 40, ["swim fins", "flipper"]),
+        ("HAIR", 36, ["hair"]), ("MASK", 46, ["diving mask and snorkel", "snorkel"]),
+        ("WATCH", 26, ["wrist watch", "watch"])],
+    0: [("FINS", 0, ["swim fins", "flipper"]), ("HAIR", 16, ["hair"]), ("WATCH", 12, ["wrist watch", "watch"]),
+        ("SHORTS", 8, ["white swim shorts", "shorts"])],
+}
+LIM = {"SKIN": (3000, 0.97), "SHORTS": (300, 0.45), "FINS": (200, 0.32), "MASK": (40, 0.06),
+       "HAIR": (40, 0.08), "WATCH": (10, 0.012)}
+DARK_ONLY = {"FINS": 0.28, "MASK": 0.30, "HAIR": 0.30}      # median raw luma ceiling
+
+
+def luma01(img_bgr):
+    return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255
+
+
+def valid_mask(cls, m, person, img):
+    pa = max(int(person.sum()), 1)
+    a = int(m.sum())
+    lo, hi = LIM[cls]
+    if a < lo or a > hi * pa:
+        return False
+    if (m & dil(person, 25 if cls == "FINS" else 4)).sum() / a < 0.8:
+        return False
+    if cls in DARK_ONLY and float(np.median(luma01(img)[m])) > DARK_ONLY[cls]:
+        return False
+    return True
+
+
+def seed_events(m, user=()):
+    pts, lab = prompts_from_mask(m, n_pos=5, n_neg=5)
+    ev = [(int(p[0] * 1232), int(p[1] * 1078), l) for p, l in zip(pts, lab)]
+    return ev + list(user)
+
+
+def grow_white(img_bgr, person, x, y):
+    """Colour region-grow around a user point (shorts on f0): pixels inside the
+    diver mask whose Lab colour is close to the point's colour."""
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    c = np.median(lab[y - 4:y + 5, x - 4:x + 5].reshape(-1, 3), 0)
+    d = np.linalg.norm(lab - c, axis=2)
+    m = (d < 16) & dil(person, 2)
+    num, cc, _, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), 8)
+    k = cc[y, x]
+    return (cc == k) if k > 0 else np.zeros_like(m)
+
+
+def run_chunk(sam: Sam, ci: int, person: dict, imgs: dict, done: dict, log):
+    """Detect/seed the classes of chunk ci and track them both ways. `done`
+    holds masks already produced on neighbouring chunks: [cls][frame]."""
     cs, ce = CHUNKS[ci]
-    ev: dict[tuple, list] = {}            # (frame, cls) -> [(x, y, label)]
-
-    def add(f, cls, pts):
-        ev.setdefault((f, cls), []).extend(pts)
-
-    # ---- pass 1: detection + user anchors -------------------------------
-    t0 = time.time()
-    sid = sam.start(cs, ce, "p1")
+    sid = sam.start(cs, ce, f"c{ci}")
     seeds: dict[tuple, np.ndarray] = {}
-    for cls, frames in DETECT[ci].items():
-        for f in frames:
-            ms = sam.text(sid, cs, f, TEXT[cls])
-            m = pick(cls, f, ms, person[f], USER.get(f, {}).get(cls, []))
-            log(f"  [detect] f{f:02d} {cls:6s}: {len(ms)} inst -> "
-                f"{'none' if m is None else int(m.sum())}")
-            if m is not None:
-                seeds[(f, cls)] = m
-    # SKIN seeds: the detection minus every other class seeded on that frame;
-    # if SKIN was not detected, the person mask minus them
-    for (f, cls) in [k for k in seeds if k[1] == "SKIN"] + \
-            [(f, "SKIN") for f in DETECT[ci]["SKIN"] if (f, "SKIN") not in seeds]:
-        others = [seeds[(f, c)] for c in CLASSES + HELPERS if c != "SKIN" and (f, c) in seeds]
-        base = seeds.get((f, "SKIN"), person[f])
-        for o in others:
-            base = base & ~dil(o, 2)
-        if base.sum() > 1500:
-            seeds[(f, "SKIN")] = base
-    for (f, cls), m in seeds.items():
-        pts, lab = prompts_from_mask(m, n_pos=4, n_neg=4)
-        add(f, cls, [(int(p[0] * 1232), int(p[1] * 1078), l) for p, l in zip(pts, lab)])
-    # carried-over seeds from the previous chunk (its last frames)
-    for (f, cls), m in carry.items():
-        if cs <= f < ce and m.sum() > 30:
-            pts, lab = prompts_from_mask(m, n_pos=4, n_neg=4)
-            add(f, cls, [(int(p[0] * 1232), int(p[1] * 1078), l) for p, l in zip(pts, lab)])
-    # user anchors (only where the class has a positive on that frame)
-    for f, per in USER.items():
-        for cls, pts in per.items():
-            if cs <= f < ce and any(l == 1 for _, _, l in pts) or (cs <= f < ce and (f, cls) in ev):
-                add(f, cls, pts)
-    for f, pts in NEG_ALL.items():
-        for cls in CLASSES:
-            if cs <= f < ce and (f, cls) in ev and any(l == 1 for *_, l in ev[(f, cls)]):
-                add(f, cls, [(x, y, 0) for x, y in pts])
-    prompted = sorted({f for f, _ in ev})
-    start = prompted[len(prompted) // 2] if prompted else cs + 1
-    start = min(max(start, cs + 1), ce - 2)
-    for (f, cls), pl in ev.items():
-        sam.points(sid, cs, f, cls, [(x, y) for x, y, _ in pl], [l for *_, l in pl])
-    m1 = sam.propagate(sid, cs, start)
-    log(f"[cls] chunk {ci + 1} pass 1 done in {time.time() - t0:.0f}s; start frame {start}")
-    areas = {c: {f: int(m.sum()) for f, m in m1[c].items()} for c in m1}
-    log("  pass-1 areas @ " + " ".join(f"f{f}" for f in range(cs, ce, 6)))
-    for c in CLASSES + HELPERS:
-        log(f"   {c:6s} " + " ".join(f"{areas[c].get(f, -1):6d}" for f in range(cs, ce, 6)))
-
-    # ---- pass 2: replay + corrections -----------------------------------
+    got_n = {c: 0 for c in CLASSES + HELPERS}
+    tried = set()
     t0 = time.time()
-    ev2 = {k: list(v) for k, v in ev.items()}
-
-    def add2(f, cls, pts):
-        ev2.setdefault((f, cls), []).extend(pts)
-
-    for f in REFINE:
-        if not (cs <= f < ce):
+    for cls, f, phrases in ATTEMPT.get(ci, []):
+        if got_n[cls] >= 2 or (cls, f) in tried:
             continue
-        P = person[f]
+        tried.add((cls, f))
+        for ph in phrases:
+            ms = sam.text(sid, cs, f, ph)
+            m = pick(cls, f, ms, person[f], USER.get(f, {}).get(cls, []))
+            ok = m is not None and valid_mask(cls, m, person[f], imgs[f])
+            log(f"  [detect] c{ci} f{f:02d} {cls:6s} '{ph}': {len(ms)} inst -> "
+                f"{'none' if m is None else int(m.sum())}{'' if ok or m is None else ' (invalid)'}")
+            if ok:
+                seeds[(f, cls)] = m
+                got_n[cls] += 1
+                break
+    # carried seeds from neighbouring chunks (their masks on frames of this chunk)
+    for cls in CLASSES + HELPERS:
+        if got_n[cls]:
+            continue
+        have = sorted(f for f in done.get(cls, {}) if cs <= f < ce and done[cls][f].sum() > 0)
+        for f in (have[:1] + have[-1:]):
+            seeds[(f, cls)] = done[cls][f]
+            log(f"  [carry ] c{ci} f{f:02d} {cls:6s}: {int(done[cls][f].sum())}")
+    # chunk 0: SHORTS from the user's point on f0 when nothing else exists
+    if ci == 0 and not any(c == "SHORTS" for _, c in seeds):
+        g = grow_white(imgs[0], person[0], 660, 765)
+        if g.sum() > 400:
+            seeds[(0, "SHORTS")] = g
+            log(f"  [user  ] c0 f00 SHORTS: region-grown from (660,765): {int(g.sum())}")
+    ev: dict[tuple, list] = {}
+    for (f, cls), m in seeds.items():
+        ev[(f, cls)] = seed_events(m)
+    for f, per in USER.items():                  # fin anchors are real, dark blobs
+        if f in (12, 15, 20) and cs <= f < ce:
+            ev.setdefault((f, "FINS"), []).extend(per["FINS"])
+    if ci == 3 and not any(c == "MASK" for _, c in seeds):
+        ev[(89, "MASK")] = [(822, 470, 1)]       # the user's reference spot, f89
+        log("  [user  ] c3 f89 MASK: point (822,470)")
+    # negative points on foam / surface reflections, only where a class has a positive
+    for f in list(range(cs, ce)):
         negs = [(x, y, 0) for x, y in NEG_ALL.get(f, [])]
         if f in FOAM_FRAMES:
-            negs += [(x, y, 0) for x, y in foam_points(imgs[f], P)]
-        for cls in CLASSES:
-            m = m1[cls].get(f)
-            has_pos = any(l == 1 for *_, l in ev2.get((f, cls), []))
-            if not has_pos:
-                if m is None or m.sum() < 60:
-                    continue                    # nothing to anchor a correction to
-                pts, lab = prompts_from_mask(m, n_pos=4, n_neg=4)
-                add2(f, cls, [(int(p[0] * 1232), int(p[1] * 1078), l) for p, l in zip(pts, lab)])
-                for x, y, l in USER.get(f, {}).get(cls, []):
-                    if l == 0:
-                        add2(f, cls, [(x, y, 0)])
-            add2(f, cls, negs)
-        # SHORTS re-anchor on f15/f30 (A): its own interior point; SKIN negative there
-        if f in (15, 30) and m1["SHORTS"].get(f) is not None and m1["SHORTS"][f].sum() > 300:
-            x, y = interior_point(m1["SHORTS"][f])
-            add2(f, "SHORTS", [(x, y, 1)])
-            add2(f, "SKIN", [(x, y, 0)])
-        if f in HAND_FRAMES:                    # F: far hand + fingers are SKIN
-            avoid = np.zeros_like(P)
-            for c in ("FINS", "SHORTS", "MASK"):
-                if m1[c].get(f) is not None:
-                    avoid |= m1[c][f]
-            add2(f, "SKIN", [(x, y, 1) for x, y in hand_tips(P, avoid)])
-        if f in HAIR_FRAMES:                    # G: hair is not SKIN
-            hm = read_mask(hairdir, f)
-            if hm.sum() < 200 and m1["HAIR"].get(f) is not None:
-                hm = m1["HAIR"][f]
-            if hm.sum() >= 120:
-                x, y = interior_point(hm)
-                add2(f, "SKIN", [(x, y, 0)])
-    # the session needs one text prompt to start returning objects
-    sid2 = sam.start(cs, ce, "p2")
-    sam.text(sid2, cs, cs + (ce - cs) // 2, "person")
-    for (f, cls), pl in ev2.items():
-        if any(l == 1 for *_, l in pl):         # a correction needs a positive to stand on
-            sam.points(sid2, cs, f, cls, [(x, y) for x, y, _ in pl], [l for *_, l in pl])
-    prompted2 = sorted({f for (f, _), pl in ev2.items() if any(l == 1 for *_, l in pl)})
-    start2 = min(max(prompted2[len(prompted2) // 2], cs + 1), ce - 2)
-    m2 = sam.propagate(sid2, cs, start2)
-    log(f"[cls] chunk {ci + 1} pass 2 done in {time.time() - t0:.0f}s; start frame {start2}")
-    areas2 = {c: {f: int(m.sum()) for f, m in m2[c].items()} for c in m2}
+            negs += [(x, y, 0) for x, y in foam_points(imgs[f], person[f])]
+        if negs:
+            for (ff, cls), pl in ev.items():
+                if ff == f and cls in CLASSES and any(l == 1 for *_, l in pl):
+                    pl.extend(negs)
+    prompted = sorted({f for f, _ in ev})
+    if not prompted:
+        sam.pred.handle_request({"type": "close_session", "session_id": sid})
+        log(f"[cls] chunk {ci}: nothing to seed")
+        return {c: {} for c in CLASSES + HELPERS}
+    start = min(max(prompted[len(prompted) // 2], cs + 1), ce - 2)
+    for (f, cls), pl in ev.items():
+        sam.points(sid, cs, f, cls, [(x, y) for x, y, _ in pl], [l for *_, l in pl])
+    res = sam.propagate(sid, cs, start)
+    log(f"[cls] chunk {ci} ({cs}-{ce - 1}) done in {time.time() - t0:.0f}s; start {start}")
+    out = {c: {} for c in CLASSES + HELPERS}
     for c in CLASSES + HELPERS:
-        log(f"   {c:6s} " + " ".join(f"{areas2[c].get(f, -1):6d}" for f in range(cs, ce, 6)))
-    return m1, m2
+        for f, m in res[c].items():
+            if m.sum() > 0 and valid_mask(c, m, person[f], imgs[f]):
+                out[c][f] = m
+        log(f"   {c:6s} valid {len(out[c]):3d}/{ce - cs}  areas " +
+            " ".join(f"{int(res[c][f].sum()) if f in res[c] else -1}" for f in range(cs, ce, 4)))
+    return out
 
 
 # ------------------------------------------------------------ postprocess --
@@ -443,21 +460,27 @@ def main() -> int:
         sam = Sam(frames, cache)
         raw = {c: {} for c in CLASSES}
         helper = {c: {} for c in HELPERS}
-        carry: dict = {}
-        for ci, (cs, ce) in enumerate(CHUNKS):
-            m1, m2 = run_chunk(sam, ci, person, imgs, hdir, carry, log)
-            use = m2 if any(len(m2[c]) for c in CLASSES) else m1
-            lo, hi = (0, SPLIT) if ci == 0 else (SPLIT, N)
+        done = {c: {} for c in CLASSES + HELPERS}      # neighbours seed from these
+        per_chunk = {}
+        for ci in ORDER:
+            res = run_chunk(sam, ci, person, imgs, done, log)
+            per_chunk[ci] = res
             for c in CLASSES + HELPERS:
-                for f, m in use[c].items():
-                    if lo <= f < hi:
-                        (raw if c in CLASSES else helper)[c][f] = m
-            # the next chunk starts from this chunk's masks on its first frames
-            for c in CLASSES:
-                f = CHUNKS[1][0] + 2
-                if ci == 0 and f in use[c]:
-                    carry[(f, c)] = use[c][f]
+                for f, m in res[c].items():
+                    done[c].setdefault(f, m)
         out_dir.mkdir(parents=True, exist_ok=True)
+        # each chunk owns the middle of its range; fall back to any chunk that
+        # produced a valid mask on that frame
+        for c in CLASSES + HELPERS:
+            dst = raw if c in CLASSES else helper
+            dst[c] = {}
+            for f in range(N):
+                own = next(ci for ci in range(len(CHUNKS)) if SPLITS[ci] <= f < SPLITS[ci + 1])
+                for ci in [own] + [k for k in range(len(CHUNKS)) if k != own]:
+                    m = per_chunk[ci][c].get(f)
+                    if m is not None and m.sum() > 0:
+                        dst[c][f] = m
+                        break
         pkl.write_bytes(pickle.dumps((raw, helper)))
         del sam
 
