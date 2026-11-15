@@ -46,7 +46,7 @@ F0, F1 = 210, 300
 CLASSES = ["SKIN", "FINS", "SHORTS", "HEAD"]
 HELPERS = ["WATCH", "WAIST"]
 PRIORITY = ["FINS", "SHORTS", "HEAD", "SKIN"]
-OID = {c: 101 + k for k, c in enumerate(CLASSES + HELPERS)}
+OID = {c: 101 + k for k, c in enumerate(CLASSES + HELPERS + ["HAND"])}
 TEXT = {"SKIN": "bare skin of the diver", "FINS": "black swim fins",
         "SHORTS": "dark swimsuit", "HEAD": "hair and dive mask",
         "WATCH": "wrist watch", "WAIST": "white belt"}
@@ -135,7 +135,7 @@ class Sam:
             "point_labels": [int(v) for v in lab], "obj_id": OID[cls]})
 
     def propagate(self, sid, cs, start):
-        got = {c: {} for c in CLASSES + HELPERS}
+        got = {c: {} for c in OID}
         inv = {v: k for k, v in OID.items()}
         for resp in self.pred.handle_stream_request({
                 "type": "propagate_in_video", "session_id": sid,
@@ -1054,6 +1054,48 @@ def stage_assemble(a):
     return 0
 
 
+# ------------------------------------------------------------------ hand ---
+HAND_RANGE = (242, 272)           # session frames; the user's prompt frames are f248 and f265
+HAND_PROMPTS = [248, 265]
+
+
+def hand_tip_points(f, P, hard):
+    """Positive points on the hand (bright, person pixels no class owns, next to the
+    lowest extremity of the body) plus the skin right next to them."""
+    import diver_classes as D
+    avoid = hard["FINS"] | hard["SHORTS"] | hard["HEAD"]
+    tips = D.hand_tips(P[f], avoid, n=1)
+    x, y = tips[0]
+    yy, xx = np.ogrid[:H, :W]
+    disk = (yy - y) ** 2 + (xx - x) ** 2 <= 60 ** 2
+    _, l = luma01(f)
+    free = disk & P[f] & ~(hard["SKIN"] | avoid) & (l > 0.5)
+    pts = fps_points(free, 4, min_dt=2.0) + fps_points(disk & hard["SKIN"] & dil(free, 20), 2, min_dt=3.0)
+    neg = fps_points(hard["HEAD"], 1, min_dt=2.0) + fps_points(dil(disk & P[f], 12) & ~dil(P[f], 3), 3, min_dt=1.5)
+    return (x, y), pts, neg
+
+
+def stage_hand(a):
+    P = envelope()
+    sam = Sam()
+    cs, ce = HAND_RANGE
+    sid = sam.start(list(range(cs, ce)), "hand")
+    log = lambda s: print(s, flush=True)
+    for f in HAND_PROMPTS:
+        hard = {c: cv2.imread(str(OUT / "hard" / c / f"{f:05d}.png"), 0) > 127 for c in CLASSES}
+        tip, pos, neg = hand_tip_points(f, P, hard)
+        log(f"[hand] f{f}: tip {tip}, {len(pos)} positives {pos}, {len(neg)} negatives")
+        pts = [(x, y, 1) for x, y in pos] + [(x, y, 0) for x, y in neg]
+        sam.points(sid, f - cs, "HAND", [(x, y) for x, y, _ in pts], [l for *_, l in pts])
+    res = sam.propagate(sid, cs, (cs + ce) // 2 - cs)["HAND"]
+    out = {}
+    for f, m in res.items():
+        out[f] = m & dil(P[f], 2)
+    (OUT / "hand.pkl").write_bytes(pickle.dumps(out))
+    log("[hand] areas " + " ".join(f"f{f}:{int(out[f].sum())}" for f in range(cs, ce) if f in out))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="stage", required=True)
@@ -1063,6 +1105,7 @@ def main():
     d.set_defaults(fn=stage_detect)
     sub.add_parser("thin").set_defaults(fn=stage_thin)
     sub.add_parser("assemble").set_defaults(fn=stage_assemble)
+    sub.add_parser("hand").set_defaults(fn=stage_hand)
     sub.add_parser("finish").set_defaults(fn=stage_finish)
     g = sub.add_parser("grade")
     g.add_argument("--workers", type=int, default=3)
