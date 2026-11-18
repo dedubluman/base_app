@@ -25,7 +25,7 @@ import cv2
 import numpy as np
 
 SKIN = np.array([0xD4, 0x9A, 0x72], np.float32) / 255
-GOLD = np.array([1.00, 0.72, 0.18], np.float32)
+GOLD = np.array([1.00, 0.82, 0.26], np.float32)
 
 
 def probe(path):
