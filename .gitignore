@@ -15,3 +15,5 @@ output/
 masks/
 .cache/
 *.log
+work/
+*.npz
