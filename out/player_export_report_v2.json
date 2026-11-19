@@ -1,0 +1,36 @@
+{
+ "video": "/root/.claude/uploads/dc050da2-0edc-5bdb-a909-5d669a008d2e/2fdab941-player_export.mov",
+ "variant": "v2",
+ "area_report": {
+  "skin": {
+   "area_px_median": 2532.0,
+   "rel_jump_p95": 0.13707237407598416,
+   "rel_jump_max": 1.1111111111111112,
+   "frames_jump_over_25pct": [
+    65,
+    69,
+    182,
+    183,
+    184,
+    185,
+    378,
+    380,
+    381,
+    388,
+    410,
+    411,
+    419
+   ],
+   "count": 13
+  },
+  "nonskin": {
+   "area_px_median": 7495.0,
+   "rel_jump_p95": 0.060716996906613106,
+   "rel_jump_max": 0.4079098643366291,
+   "frames_jump_over_25pct": [
+    224
+   ],
+   "count": 1
+  }
+ }
+}
