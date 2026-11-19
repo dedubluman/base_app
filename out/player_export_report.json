@@ -1,0 +1,35 @@
+{
+ "video": "/root/.claude/uploads/dc050da2-0edc-5bdb-a909-5d669a008d2e/2fdab941-player_export.mov",
+ "info": {
+  "w": "1232",
+  "h": "1078",
+  "fps": "30000/1001",
+  "pix_fmt": "yuv420p",
+  "nb_frames": "850",
+  "duration": "28.362",
+  "space": "bt709",
+  "trc": "bt709",
+  "prim": "bt709",
+  "range": "tv",
+  "rotation": "0",
+  "has_audio": "True",
+  "hdr": "False"
+ },
+ "sam_stride": 2,
+ "text": "person",
+ "mask_stats": {
+  "coverage_pct_mean": 0.9202161679311629,
+  "coverage_pct_min": 0.3925168060140231,
+  "coverage_pct_max": 1.8233621665903672,
+  "area_jump_rel_p95": 0.10710145142913914,
+  "area_jump_rel_max": 0.3833163145078941,
+  "iou_consec_min": 0.4573200817649961,
+  "iou_consec_p5": 0.6604084890768348,
+  "empty_frames": 0,
+  "lost_detected": 0,
+  "filled_frames": 0,
+  "unfilled_frames": [],
+  "unfilled_count": 0,
+  "reseeds": 0
+ }
+}
