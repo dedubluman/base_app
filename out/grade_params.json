@@ -24,15 +24,15 @@
   "top_dark": 0.0
  },
  "subj": {
-  "gain": 1.08,
+  "gain": 1.03,
   "contrast": 1.06,
   "sat": 1.0,
   "warm_ab": [
-   0.0,
-   0.0
+   30.0,
+   26.0
   ],
   "luma_pivot": 0.5,
-  "cast_neutralize": 0.5,
+  "cast_neutralize": 1.0,
   "clarity_amt": 0.12,
   "clarity_sigma_frac": 0.03
  },
@@ -101,5 +101,18 @@
     "vig_target": 0.5023807883262634
    }
   ]
+ },
+ "subj_fit": {
+  "before_skin_Lab": [
+   64.4,
+   -20.0,
+   -9.8
+  ],
+  "after_skin_Lab": [
+   66.9,
+   10.4,
+   15.9
+  ],
+  "note": "Lab mean of SAM-mask px (before) vs warm px in diver box (after); a/b shift luma-gated"
  }
 }

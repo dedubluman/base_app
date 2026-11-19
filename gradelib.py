@@ -77,7 +77,8 @@ def grade_subj(rgb, P):
     L = P["luma_pivot"] * 100 + (L - P["luma_pivot"] * 100) * P["contrast"]
     L = np.clip(L * P["gain"], 0, 100)
     # water cast: shift a/b toward warm by cast_neutralize * warm_ab
-    k = P["cast_neutralize"]
+    t = np.clip((lab[..., 0] - 25.0) / 25.0, 0, 1)
+    k = P["cast_neutralize"] * t * t * (3 - 2 * t)      # luma-gated: black fins stay neutral
     lab[..., 1] = (lab[..., 1] + k * P["warm_ab"][0]) * P["sat"]
     lab[..., 2] = (lab[..., 2] + k * P["warm_ab"][1]) * P["sat"]
     lab[..., 0] = L
