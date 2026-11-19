@@ -57,7 +57,7 @@ if __name__ == "__main__":
 
     params["skin"].setdefault("L_restore", 0.0)
     x0 = np.array([11.0, 17.0, 0.9, 0.0])
-    sol = least_squares(resid, x0, bounds=([-5, -5, 0.0, -10], [30, 30, 1.2, 15]), diff_step=0.03, x_scale=[3, 3, 0.2, 3], max_nfev=30)
+    sol = least_squares(resid, x0, bounds=([-5, -5, 0.0, -10], [45, 45, 1.6, 25]), diff_step=0.03, x_scale=[3, 3, 0.2, 3], max_nfev=30)
     params["skin"].update(skin_ab=[float(sol.x[0]), float(sol.x[1])], L_restore=float(sol.x[2]), dL=float(sol.x[3]))
     res = measure(items, params)
     params["fit_report_skin"] = [{"frame_pair": n, "hue": round(h, 1), "sat": round(s, 3), "L": round(L, 1), "skin_px": k} for n, h, s, L, k in res]

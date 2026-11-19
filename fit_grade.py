@@ -116,9 +116,9 @@ def main():
     else:
         ky0 = cdf_init(befores, afters)
     mean_ab = np.mean([t[3]["mean"][1:] for t in pairs], axis=0)
-    x0 = np.concatenate([ky0.ravel(), [1.0, 0.0, 0.25, mean_ab[0], mean_ab[1]] + ([0.0] if a.vgrad else [])])
-    lo = np.concatenate([np.zeros(24), [0.5, -30, 0.0, -30, -60] + ([-1.5] if a.vgrad else [])])
-    hi = np.concatenate([np.ones(24), [2.5, 30, 0.8, 30, 10] + ([1.5] if a.vgrad else [])])
+    x0 = np.concatenate([ky0.ravel(), [1.0, 0.0, 0.25, mean_ab[0], mean_ab[1]] + ([1.0] if a.vgrad else [])])
+    lo = np.concatenate([np.zeros(24), [0.5, -30, 0.0, -30, -60] + ([-3.0] if a.vgrad else [])])
+    hi = np.concatenate([np.ones(24), [2.5, 30, 0.8, 30, 10] + ([3.0] if a.vgrad else [])])
     x0 = np.clip(x0, lo + 1e-6, hi - 1e-6)
 
     def resid(x):
@@ -127,7 +127,7 @@ def main():
         return np.concatenate([vec(stats(run_bg(b, P, vs, luts, mb), mb), a.vgrad) - tv for b, mb, tv, _ in pairs])
 
     r0 = resid(x0)
-    sol = least_squares(resid, x0, bounds=(lo, hi), diff_step=5e-3, x_scale=np.concatenate([np.full(24, 0.1), [0.2, 5, 0.1, 3, 3] + ([0.3] if a.vgrad else [])]), max_nfev=a.nfev)
+    sol = least_squares(resid, x0, bounds=(lo, hi), diff_step=5e-3, x_scale=np.concatenate([np.full(24, 0.1), [0.2, 5, 0.1, 3, 3] + ([0.8] if a.vgrad else [])]), max_nfev=a.nfev)
     print("status", sol.status, "nfev", sol.nfev, "rms", np.sqrt(np.mean(sol.fun ** 2)))
     P, vs = unpack(sol.x, a.vgrad)
 
