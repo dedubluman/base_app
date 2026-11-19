@@ -23,11 +23,14 @@ def run(pred, img_path: Path, keys, work: Path):
         if work.exists():
             shutil.rmtree(work)
         work.mkdir(parents=True)
-        shutil.copy(img_path, work / "00000.jpg")
+        shutil.copy(img_path, work / "00000.jpg")      # a 1-frame session returns nothing: duplicate the frame
+        shutil.copy(img_path, work / "00001.jpg")
         sid = pred.handle_request({"type": "start_session", "resource_path": str(work)})["session_id"]
         pred.handle_request({"type": "add_prompt", "session_id": sid, "frame_index": 0, "text": PROMPTS[key]})
         ms = []
         for r in pred.handle_stream_request({"type": "propagate_in_video", "session_id": sid}):
+            if int(r["frame_index"]) != 0:
+                continue
             o = r["outputs"]
             ms += [np.asarray(m) > 0 for m in o["out_binary_masks"]]
         pred.handle_request({"type": "close_session", "session_id": sid})
