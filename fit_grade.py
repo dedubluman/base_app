@@ -70,7 +70,7 @@ def run_bg(rgb, P, vs, luts=None, mb=None):
     out = G.global_grade(rgb, P, luts)
     if mb is not None:
         lab = G.to_lab(out)
-        dab = np.array(P["anchor_ab"], np.float32) - lab[..., 1:][mb].mean(0)
+        dab = G.anchor_shift(P["anchor_ab"], lab[..., 1:][mb].mean(0), P["anchor_strength"], P["anchor_clip"])
         lab[..., 1] += dab[0]; lab[..., 2] += dab[1]
         out = G.from_lab(lab)
     return out * G.vignette_map(*rgb.shape[:2], vs, 2.2)[..., None]

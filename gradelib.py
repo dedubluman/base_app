@@ -21,7 +21,7 @@ DEFAULT = {
     "bg": {
         "knots_y": [[0, .002, .01, .03, .09, .22, .5, .9], [0, .01, .04, .1, .2, .35, .6, .9], [0, .03, .09, .18, .3, .5, .75, 1.0]],
         "sat": 1.0, "hue_deg": 0.0, "clarity_amt": 0.15, "clarity_sigma_frac": 0.04, "vgrad_stops": 0.0,
-        "anchor_ab": [-3.1, -28.05], "anchor_strength": 1.0, "anchor_alpha": 0.03, "anchor_clip": 10.0,
+        "anchor_ab": [-3.1, -28.05], "anchor_strength": 1.0, "anchor_alpha": 0.03, "anchor_clip": 8.0,
     },
     "finish": {"vignette": 0.3, "vignette_pow": 2.2, "veil": 0.05, "veil_small_extra": 0.08, "wrap_px": 3.0, "wrap_amt": 0.25,
                "final_s": 0.0},
@@ -55,6 +55,12 @@ def hsl_stats(rgb_px):
 
 def hue_diff(a, b):
     return (a - b + 180) % 360 - 180
+
+
+def anchor_shift(anchor_ab, measured_ab, strength, clip):
+    """Chroma anchor: soft-limited (tanh) shift of the water's mean a/b toward the target. Same formula in fit, render and eval."""
+    d = strength * (np.asarray(anchor_ab, np.float32) - np.asarray(measured_ab, np.float32))
+    return clip * np.tanh(d / clip)
 
 
 # ----------------------------------------------------------------------------- tone curves

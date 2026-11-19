@@ -276,7 +276,7 @@ def grade_video(video, info, soft, skin, params, out, crf=17, log=print):
             keep = cv2.resize(cv2.dilate((m > 0.004).astype(np.uint8), np.ones((31, 31), np.uint8)), (W // 4, H // 4), interpolation=cv2.INTER_NEAREST) == 0
             meas = G.to_lab(A0)[..., 1:][keep].mean(0) if keep.any() else (ema if ema is not None else np.zeros(2, np.float32))
             ema = meas if ema is None else (1 - B["anchor_alpha"]) * ema + B["anchor_alpha"] * meas
-            dab = np.clip(B["anchor_strength"] * (np.array(B["anchor_ab"], np.float32) - ema), -B["anchor_clip"], B["anchor_clip"])
+            dab = G.anchor_shift(B["anchor_ab"], ema, B["anchor_strength"], B["anchor_clip"])
         o = G.render(fr, m, skin[i].astype(np.float32) / 255 if skin is not None else None, params, vig=vig, dab=dab, luts=luts)
         enc.stdin.write((o * 65535 + 0.5).astype(np.uint16).tobytes())
         if i % 100 == 0:

@@ -23,7 +23,7 @@ def prep(params):
             H, W = m.shape
             A = G.global_grade(raw, B, luts)
             keep = cv2.dilate((m > .004).astype(np.uint8), np.ones((31, 31), np.uint8)) == 0
-            dab = np.array(B["anchor_ab"], np.float32) - G.to_lab(A)[..., 1:][keep].mean(0)
+            dab = G.anchor_shift(B["anchor_ab"], G.to_lab(A)[..., 1:][keep].mean(0), B["anchor_strength"], B["anchor_clip"])
             lab = G.to_lab(A); lab[..., 1] += dab[0]; lab[..., 2] += dab[1]; A = G.from_lab(lab)
             items.append((name, raw, m, A, G.vignette_map(H, W, params["finish"]["vignette"], params["finish"]["vignette_pow"])))
     return items
