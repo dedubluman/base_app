@@ -116,15 +116,29 @@ def main():
     else:
         ky0 = cdf_init(befores, afters)
     mean_ab = np.mean([t[3]["mean"][1:] for t in pairs], axis=0)
+    # dark non-skin subject parts: SAM 'fins' pixels of raw keyframes must land near the reference after-frame fins (L 14.8, a -0.8, b -12.3)
+    dark = []
+    for fr in (310, 524):
+        rawf = load_rgb(f".cache/ref/raw_{fr}.png")
+        fm = np.load(f".cache/parts/f{fr:04d}.npz")["fins"]
+        fm = cv2.resize(fm.astype(np.uint8), (rawf.shape[1], rawf.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
+        mk = cv2.resize(cv2.imread(f".cache/ref/mask_{fr}.png", 0), (rawf.shape[1], rawf.shape[0]), interpolation=cv2.INTER_AREA) > 40
+        dark.append((rawf, fm & mk, ~(cv2.dilate(mk.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0)))
+    DARK_T = np.array([14.8, -0.8, -12.3])
     x0 = np.concatenate([ky0.ravel(), [1.0, 0.0, 0.25, mean_ab[0], mean_ab[1]] + ([1.0] if a.vgrad else [])])
-    lo = np.concatenate([np.zeros(24), [0.5, -30, 0.0, -30, -60] + ([-3.0] if a.vgrad else [])])
-    hi = np.concatenate([np.ones(24), [2.5, 30, 0.8, 30, 10] + ([3.0] if a.vgrad else [])])
+    lo = np.concatenate([np.zeros(24), [0.5, -6, 0.0, -30, -60] + ([-3.0] if a.vgrad else [])])
+    hi = np.concatenate([np.ones(24), [2.5, 6, 0.8, 30, 10] + ([3.0] if a.vgrad else [])])
     x0 = np.clip(x0, lo + 1e-6, hi - 1e-6)
 
     def resid(x):
         P, vs = unpack(x, a.vgrad)
         luts = G.make_luts(P)
-        return np.concatenate([vec(stats(run_bg(b, P, vs, luts, mb), mb), a.vgrad) - tv for b, mb, tv, _ in pairs])
+        r = [vec(stats(run_bg(b, P, vs, luts, mb), mb), a.vgrad) - tv for b, mb, tv, _ in pairs]
+        for rawf, fm, bgm in dark:
+            if fm.sum() > 20:
+                o = G.to_lab(run_bg(rawf, P, vs, luts, bgm))[fm].mean(0)
+                r.append((o - DARK_T) * 0.7)
+        return np.concatenate(r)
 
     r0 = resid(x0)
     sol = least_squares(resid, x0, bounds=(lo, hi), diff_step=5e-3, x_scale=np.concatenate([np.full(24, 0.1), [0.2, 5, 0.1, 3, 3] + ([0.8] if a.vgrad else [])]), max_nfev=a.nfev)
