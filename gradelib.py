@@ -26,7 +26,7 @@ DEFAULT = {
     "finish": {"vignette": 0.3, "vignette_pow": 2.2, "veil": 0.05, "veil_small_extra": 0.08, "wrap_px": 3.0, "wrap_amt": 0.25,
                "final_s": 0.0},
     "skin": {"skin_ab": [8.0, 16.0], "ab_strength": 0.9, "dL": 0.0, "L_restore": 0.0, "clarity_amt": 0.10,
-             "clf_w": None, "clf_b": 0.0, "sharp": [0.5, 0.85], "matte_blur_px": 1.5},
+             "clf_w": None, "clf_b": 0.0, "sharp": [0.65, 0.92], "matte_blur_px": 1.5},
 }
 
 

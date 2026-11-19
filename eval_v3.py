@@ -42,11 +42,31 @@ def stat(rgb, m):
         return None
     lab = G.to_lab(rgb)[m].mean(0)
     h, s, l = G.hsl_stats(rgb[m])
-    return {"L": float(lab[0]), "a": float(lab[1]), "b": float(lab[2]), "hue": h, "sat": s, "n": int(m.sum())}
+    return {"L": float(lab[0]), "a": float(lab[1]), "b": float(lab[2]), "hue": h, "sat": s, "n": int(m.sum()),
+            "C": float(np.hypot(lab[1], lab[2])), "hab": float(np.degrees(np.arctan2(lab[2], lab[1])) % 360)}
 
 
 def fmt(x):
-    return "   -   " if x is None else f"{x['L']:5.1f} {x['a']:5.1f} {x['b']:5.1f} h{x['hue']:4.0f} s{x['sat']:.2f}"
+    return "   -   " if x is None else f"{x['L']:5.1f} {x['a']:5.1f} {x['b']:5.1f} C{x['C']:4.1f} h{x['hab']:4.0f}"
+
+
+def real_dabs(src, mask_path, params, upto):
+    """Replays the exact chroma-anchor EMA of grade_dive.grade_video up to frame `upto`; returns {frame: dab} for FRAMES."""
+    import grade_dive as GD
+    info = GD.probe(src); H, W = info["h"], info["w"]
+    B = params["bg"]; luts = G.make_luts(B)
+    soft = GD.read_gray_video(mask_path, upto + 1, H, W)
+    ema, res = None, {}
+    for i, fr in enumerate(GD.read_frames(src, info)):
+        if i > upto:
+            break
+        m = soft[i].astype(np.float32) / 255
+        A0 = G.global_grade(cv2.resize(fr, (W // 4, H // 4), interpolation=cv2.INTER_AREA), B, luts)
+        keep = cv2.resize(cv2.dilate((m > 0.004).astype(np.uint8), np.ones((31, 31), np.uint8)), (W // 4, H // 4), interpolation=cv2.INTER_NEAREST) == 0
+        meas = G.to_lab(A0)[..., 1:][keep].mean(0) if keep.any() else (ema if ema is not None else np.zeros(2, np.float32))
+        ema = meas if ema is None else (1 - B["anchor_alpha"]) * ema + B["anchor_alpha"] * meas
+        res[i] = np.clip(B["anchor_strength"] * (np.array(B["anchor_ab"], np.float32) - ema), -B["anchor_clip"], B["anchor_clip"])
+    return {f: res[f] for f in FRAMES}
 
 
 def main():
@@ -57,6 +77,7 @@ def main():
     print("container: src", ps, "\n           out", po)
     print("frames equal:", ps["frames"] == po["frames"], "| duration diff %.3fs" % abs(ps["dur"] - po["dur"]), "| size/fps equal:", (ps["w"], ps["h"], ps["fps"]) == (po["w"], po["h"], po["fps"]), "| audio:", po["audio"])
     B = params["bg"]; luts = G.make_luts(B)
+    dabs = real_dabs(src, REPO / "out/player_export_mask.mp4", params, max(FRAMES))
     rows = []
     worst = {"nonskin_dhue": 0.0, "nonskin_dsat": -9.0}
     for f in FRAMES:
@@ -71,12 +92,8 @@ def main():
         mk = gray(REPO / "out/player_export_mask.mp4", f)
         sk = gray(skin_v, f)
         # global-only reference: same pipeline, skin matte off (static anchor)
-        A = G.global_grade(raw, B, luts)
-        keep = cv2.dilate((mk > .004).astype(np.uint8), np.ones((31, 31), np.uint8)) == 0
-        lab = G.to_lab(A); dab = np.array(B["anchor_ab"], np.float32) - lab[..., 1:][keep].mean(0)
-        lab[..., 1] += dab[0]; lab[..., 2] += dab[1]; A = G.from_lab(lab)
         vig = G.vignette_map(H, W, params["finish"]["vignette"], params["finish"]["vignette_pow"])
-        glob = G.render(raw, mk, sk, params, vig=vig, A=A, skin_on=False)
+        glob = G.render(raw, mk, sk, params, vig=vig, dab=dabs[f], luts=luts, skin_on=False)   # = the real pipeline minus the skin layer
         regs = {}
         pe = cv2.erode((mk > .5).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
         for k in ("shorts", "fins", "hair"):
@@ -87,8 +104,8 @@ def main():
             b0, a0, g0 = stat(raw, r), stat(res, r), stat(glob, r)
             rows.append((f, k, b0, a0, g0))
             if k != "skin" and a0 and g0:
-                worst["nonskin_dhue"] = max(worst["nonskin_dhue"], abs(G.hue_diff(a0["hue"], g0["hue"])) if min(a0["sat"], g0["sat"]) > 0.08 else 0.0)
-                worst["nonskin_dsat"] = max(worst["nonskin_dsat"], a0["sat"] - g0["sat"])
+                worst["nonskin_dhue"] = max(worst["nonskin_dhue"], abs(G.hue_diff(a0["hab"], g0["hab"])) if min(a0["C"], g0["C"]) > 4 else 0.0)
+                worst["nonskin_dsat"] = max(worst["nonskin_dsat"], a0["C"] - g0["C"])
     # reference after regions
     refs = {}
     for name, a in (("head", "f9831d23-image"), ("fin", "3d75cb83-image")):
@@ -102,10 +119,10 @@ def main():
         lab = G.to_lab(im)
         sk = pe & ~(cv2.dilate(non.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0) & (lab[..., 1] > 2)
         refs[name] = {"skin": stat(im, sk), **{k: stat(im, z[k] & pe) for k in ("shorts", "fins", "hair")}}
-    print("\nregion table  [L a b hue sat]   (frame, region): before(raw) | after(output) | global-only | reference-after(head / fin)")
+    print("\nregion table  [L* a* b* C* hab]   (frame, region): before(raw) | after(output) | global-only | reference-after(head / fin)")
     for f, k, b0, a0, g0 in rows:
         print(f"{f:4d} {k:6s} | {fmt(b0)} | {fmt(a0)} | {fmt(g0)} | {fmt(refs['head'].get(k))} / {fmt(refs['fin'].get(k))}")
-    print("\nnon-skin vs global-only: worst |dHue| %.1f deg (regions with sat>0.08), worst sat increase %+.3f" % (worst["nonskin_dhue"], worst["nonskin_dsat"]))
+    print("\nnon-skin (shorts/fins/hair) vs real pipeline minus skin layer: worst |dh_ab| %.1f deg (C*>4), worst chroma increase %+.2f C*" % (worst["nonskin_dhue"], worst["nonskin_dsat"]))
     # skin vs reference
     for f, k, b0, a0, g0 in rows:
         if k == "skin" and a0:
