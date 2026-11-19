@@ -15,3 +15,8 @@ output/
 masks/
 .cache/
 *.log
+.venv/
+masks/
+.cache/
+inputs/
+nohup.out
