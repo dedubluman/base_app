@@ -1,0 +1,35 @@
+{
+ "video": "/home/user/base_app/out/_test4s.mp4",
+ "info": {
+  "w": "1232",
+  "h": "1078",
+  "fps": "30000/1001",
+  "pix_fmt": "yuv420p",
+  "nb_frames": "120",
+  "duration": "4.004",
+  "space": "bt709",
+  "trc": "bt709",
+  "prim": "bt709",
+  "range": "tv",
+  "rotation": "0",
+  "has_audio": "False",
+  "hdr": "False"
+ },
+ "sam_stride": 1,
+ "text": "freediver",
+ "mask_stats": {
+  "coverage_pct_mean": 1.5533383881888057,
+  "coverage_pct_min": 1.203828638893574,
+  "coverage_pct_max": 1.7320284075849939,
+  "area_jump_rel_p95": 0.04040704019589325,
+  "area_jump_rel_max": 0.08442951767888796,
+  "iou_consec_min": 0.389961623304022,
+  "iou_consec_p5": 0.6921354603721388,
+  "empty_frames": 0,
+  "lost_detected": 0,
+  "filled_frames": 0,
+  "unfilled_frames": [],
+  "unfilled_count": 0,
+  "reseeds": 0
+ }
+}
