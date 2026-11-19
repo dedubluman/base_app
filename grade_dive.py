@@ -158,11 +158,10 @@ def postprocess(sam, stride, n, log=print, feather_sigma=2.5, tsmooth=2, max_fil
     w = np.array([1, 2, 3, 2, 1][2 - tsmooth: 3 + tsmooth], np.float32)
     w /= w.sum()
     soft = np.zeros((n, H, W), np.uint8)
-    f = full.astype(np.float32)
     for i in range(n):
         acc = np.zeros((H, W), np.float32)
         for k, wk in zip(range(i - tsmooth, i + tsmooth + 1), w):
-            acc += wk * f[min(max(k, 0), n - 1)]
+            acc += wk * full[min(max(k, 0), n - 1)].astype(np.float32)
         acc = cv2.GaussianBlur(acc, (0, 0), feather_sigma)
         soft[i] = np.clip(acc * 255 + 0.5, 0, 255).astype(np.uint8)
     # 5. QC numbers
