@@ -21,6 +21,8 @@ from scipy.optimize import least_squares
 import gradelib as G
 
 PCT = [1, 5, 25, 50, 75, 95, 99]
+# R p95/p99 of after_head come from surface light shafts (spatial structure a global curve cannot make) -> low weight
+PW = np.array([[1, 1, 1, 1, 1, .15, .15], [1] * 7, [1] * 7], float)
 W_SMALL = 320
 
 
@@ -50,21 +52,27 @@ def stats(rgb, m):
 
 
 def vec(st, vgrad):
-    v = [st["pct"].ravel() / 5.0, st["mean"] * np.array([1.5, 1.5, 1.5]), np.log(st["std"] + 1e-3) * 30, [st["vig"] * 40]]
+    v = [(st["pct"] * PW).ravel() / 5.0, st["mean"] * np.array([1.5, 1.5, 1.5]), np.log(st["std"] + 1e-3) * 30, [st["vig"] * 40]]
     if vgrad:
         v.append(st["thirds"] * 20)
     return np.concatenate(v)
 
 
 def unpack(x, vgrad):
-    ky = np.cumsum(x[:24].reshape(3, 8), axis=1)
     P = json.loads(json.dumps(G.DEFAULT["bg"]))
-    P.update(knots_y=ky.tolist(), sat=float(x[24]), hue_deg=float(x[25]), vgrad_stops=float(x[27]) if vgrad else 0.0)
+    P.update(knots_y=np.maximum.accumulate(x[:24].reshape(3, 8), axis=1).tolist(), sat=float(x[24]), hue_deg=float(x[25]),
+             vgrad_stops=float(x[29]) if vgrad else 0.0, anchor_ab=[float(x[27]), float(x[28])])
     return P, float(x[26])
 
 
-def run_bg(rgb, P, vs, luts=None):
+def run_bg(rgb, P, vs, luts=None, mb=None):
+    """global grade -> chroma anchor (what the temporal EMA converges to) -> elliptical vignette."""
     out = G.global_grade(rgb, P, luts)
+    if mb is not None:
+        lab = G.to_lab(out)
+        dab = np.array(P["anchor_ab"], np.float32) - lab[..., 1:][mb].mean(0)
+        lab[..., 1] += dab[0]; lab[..., 2] += dab[1]
+        out = G.from_lab(lab)
     return out * G.vignette_map(*rgb.shape[:2], vs, 2.2)[..., None]
 
 
@@ -100,27 +108,33 @@ def main():
         pairs.append((b, mb, vec(st, a.vgrad), st))
         befores.append((b, mb)); afters.append((t, mt))
 
-    ky0 = cdf_init(befores, afters)
-    inc0 = np.diff(np.concatenate([np.zeros((3, 1)), ky0], axis=1), axis=1)
-    inc0 = np.concatenate([ky0[:, :1], inc0], axis=1)[:, :8] if False else np.concatenate([ky0[:, :1], np.diff(ky0, axis=1)], axis=1)
-    x0 = np.concatenate([inc0.ravel(), [1.0, 0.0, 0.25] + ([0.0] if a.vgrad else [])])
-    lo = np.concatenate([np.zeros(24), [0.5, -30, 0.0] + ([-1.5] if a.vgrad else [])])
-    hi = np.concatenate([np.full(24, 0.6), [2.5, 30, 0.8] + ([1.5] if a.vgrad else [])])
+    # init: the v1 power-law fit (a*x^g+b) sampled at the knots, a good smooth monotone start
+    old = json.loads(Path("/tmp/gp_old.json").read_text())["bg"] if Path("/tmp/gp_old.json").exists() else None
+    if old and "a" in old:
+        ky0 = np.clip(np.array([np.array(old["a"][c]) * np.power(np.clip(G.KX, 1e-6, 1), old["g"][c]) + old["b"][c] for c in range(3)]), 0, 1)
+        ky0 = np.maximum.accumulate(ky0, axis=1)
+    else:
+        ky0 = cdf_init(befores, afters)
+    mean_ab = np.mean([t[3]["mean"][1:] for t in pairs], axis=0)
+    x0 = np.concatenate([ky0.ravel(), [1.0, 0.0, 0.25, mean_ab[0], mean_ab[1]] + ([0.0] if a.vgrad else [])])
+    lo = np.concatenate([np.zeros(24), [0.5, -30, 0.0, -30, -60] + ([-1.5] if a.vgrad else [])])
+    hi = np.concatenate([np.ones(24), [2.5, 30, 0.8, 30, 10] + ([1.5] if a.vgrad else [])])
     x0 = np.clip(x0, lo + 1e-6, hi - 1e-6)
 
     def resid(x):
         P, vs = unpack(x, a.vgrad)
         luts = G.make_luts(P)
-        return np.concatenate([vec(stats(run_bg(b, P, vs, luts), mb), a.vgrad) - tv for b, mb, tv, _ in pairs])
+        return np.concatenate([vec(stats(run_bg(b, P, vs, luts, mb), mb), a.vgrad) - tv for b, mb, tv, _ in pairs])
 
     r0 = resid(x0)
-    sol = least_squares(resid, x0, bounds=(lo, hi), diff_step=2e-3, max_nfev=a.nfev)
+    sol = least_squares(resid, x0, bounds=(lo, hi), diff_step=5e-3, x_scale=np.concatenate([np.full(24, 0.1), [0.2, 5, 0.1, 3, 3] + ([0.3] if a.vgrad else [])]), max_nfev=a.nfev)
+    print("status", sol.status, "nfev", sol.nfev, "rms", np.sqrt(np.mean(sol.fun ** 2)))
     P, vs = unpack(sol.x, a.vgrad)
 
     rep = {"rms_init(cdf)": float(np.sqrt(np.mean(r0 ** 2))), "rms_fit": float(np.sqrt(np.mean(sol.fun ** 2))), "pairs": []}
     luts = G.make_luts(P)
     for (b, mb, tv, ts), name in zip(pairs, [Path(p[0]).stem for p in a.pair]):
-        s = stats(run_bg(b, P, vs, luts), mb)
+        s = stats(run_bg(b, P, vs, luts, mb), mb)
         rep["pairs"].append({"raw": name, "dLab_mean": (s["mean"] - ts["mean"]).round(2).tolist(),
                              "std_ratio": (s["std"] / ts["std"]).round(2).tolist(), "pct_max_abs_diff": float(np.abs(s["pct"] - ts["pct"]).max().round(1)),
                              "vig_out/target": [round(s["vig"], 3), round(ts["vig"], 3)],
@@ -129,7 +143,6 @@ def main():
     d = json.loads(out.read_text()) if out.exists() else {}
     d.setdefault("finish", G.DEFAULT["finish"]); d.setdefault("skin", G.DEFAULT["skin"])
     d["bg"] = {**G.DEFAULT["bg"], **P}
-    d["bg"]["anchor_ab"] = [float(np.mean([t[3]["mean"][1] for t in pairs])), float(np.mean([t[3]["mean"][2] for t in pairs]))]
     d["finish"]["vignette"] = vs
     d["fit_report_bg"] = rep
     out.write_text(json.dumps(d, indent=1))
