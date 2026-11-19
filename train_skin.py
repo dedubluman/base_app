@@ -20,6 +20,13 @@ sys.path.insert(0, str(REPO))
 import gradelib as G  # noqa: E402
 
 KEYS = ["shorts", "fins", "hair"]
+SHARP = G.DEFAULT["skin"]["sharp"]
+EXCLUDE = {150}   # SAM found no fins there although they are visible -> skin labels are contaminated
+
+
+def feat_for(rgb, person):
+    lab = G.to_lab(rgb)
+    return G.skin_features(lab, G.water_lab(lab, person))
 
 
 def load_kf(frames, mask_video):
@@ -47,11 +54,11 @@ def load_kf(frames, mask_video):
         non &= cv2.dilate(person.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
         skin = pe & ~(cv2.dilate(non.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0)
         data.append({"f": f, "rgb": rgb, "person": person, "skin": skin, "non": non & pe,
-                     "feat": G.skin_features(G.to_lab(rgb))})
+                     "feat": feat_for(rgb, person)})
     return data
 
 
-def fit_logreg(X, y, w, l2=1e-2, iters=400):
+def fit_logreg(X, y, w, l2=3.0, iters=400):
     wt = np.zeros(X.shape[1]); b = 0.0
     for _ in range(iters):   # Newton / IRLS
         z = X @ wt + b
@@ -74,7 +81,7 @@ def sample(d, rng, n=6000):
         if len(idx):
             idx = rng.choice(idx, min(n, len(idx)), replace=False)
             xs.append(d["feat"].reshape(-1, d["feat"].shape[-1])[idx]); ys.append(np.full(len(idx), lab))
-    return (np.concatenate(xs), np.concatenate(ys)) if xs else (np.zeros((0, 5)), np.zeros(0))
+    return (np.concatenate(xs), np.concatenate(ys)) if xs else (np.zeros((0, 4)), np.zeros(0))
 
 
 def train(ds, rng):
@@ -87,16 +94,17 @@ def train(ds, rng):
 def matte(d, wt, b):
     z = d["feat"] @ wt + b
     p = 1 / (1 + np.exp(-np.clip(z, -30, 30)))
-    return cv2.GaussianBlur(p.astype(np.float32), (0, 0), 1.0) * d["person"]
+    u = np.clip((p - SHARP[0]) / (SHARP[1] - SHARP[0]), 0, 1)
+    return cv2.GaussianBlur((u * u * (3 - 2 * u)).astype(np.float32), (0, 0), 1.0) * d["person"]
 
 
 def main():
-    frames = sorted(int(p.stem[1:]) for p in (REPO / ".cache/parts").glob("f*.npz"))
+    frames = sorted(int(p.stem[1:]) for p in (REPO / ".cache/parts").glob("f[0-9][0-9][0-9][0-9].npz"))
     ds = load_kf(frames, REPO / "out/player_export_mask.mp4")
     rng = np.random.default_rng(0)
     report = []
     for i, d in enumerate(ds):   # leave-one-keyframe-out
-        tr = [x for j, x in enumerate(ds) if j != i]
+        tr = [x for j, x in enumerate(ds) if j != i and x["f"] not in EXCLUDE]
         wt, b = train(tr, rng)
         m = matte(d, wt, b)
         tot = m.sum() + 1e-6
@@ -105,11 +113,11 @@ def main():
                "skin_recall": float(m[d["skin"]].sum() / max(d["skin"].sum(), 1)),
                "nonskin_mean_matte": float(m[d["non"]].mean()) if d["non"].any() else None}
         report.append(rep)
-    wt, b = train(ds, rng)
+    wt, b = train([x for x in ds if x["f"] not in EXCLUDE], rng)
     p = REPO / "out/grade_params.json"
     d = json.loads(p.read_text())
     d.setdefault("skin", dict(G.DEFAULT["skin"]))
-    d["skin"]["clf_w"] = wt.tolist(); d["skin"]["clf_b"] = b
+    d["skin"]["clf_w"] = wt.tolist(); d["skin"]["clf_b"] = b; d["skin"]["sharp"] = list(SHARP)
     d["skin_qualifier_cv"] = report
     p.write_text(json.dumps(d, indent=1))
     for r in report:

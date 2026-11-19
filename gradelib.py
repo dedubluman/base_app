@@ -25,8 +25,8 @@ DEFAULT = {
     },
     "finish": {"vignette": 0.3, "vignette_pow": 2.2, "veil": 0.05, "veil_small_extra": 0.08, "wrap_px": 3.0, "wrap_amt": 0.25,
                "final_s": 0.0},
-    "skin": {"skin_ab": [8.0, 16.0], "ab_strength": 0.9, "dL": 0.0, "clarity_amt": 0.10,
-             "clf_w": None, "clf_b": 0.0, "matte_blur_px": 1.5},
+    "skin": {"skin_ab": [8.0, 16.0], "ab_strength": 0.9, "dL": 0.0, "L_restore": 0.0, "clarity_amt": 0.10,
+             "clf_w": None, "clf_b": 0.0, "sharp": [0.5, 0.85], "matte_blur_px": 1.5},
 }
 
 
@@ -104,36 +104,48 @@ def vignette_map(h, w, strength, power):
 
 
 # ----------------------------------------------------------------------------- skin matte (colour qualifier on the RAW frame)
-def skin_features(lab):
-    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
-    ch = np.sqrt(a * a + b * b)
-    return np.stack([L / 50 - 1, a / 20, b / 20, ch / 20, (L / 50 - 1) * (a / 20)], -1)
+def water_lab(lab, mask_bool):
+    """Median Lab of the water ring around the diver (everything outside the dilated mask) of a (cropped) Lab image."""
+    ring = cv2.dilate(mask_bool.astype(np.uint8), np.ones((13, 13), np.uint8)) == 0
+    px = lab[ring] if ring.sum() > 50 else lab.reshape(-1, 3)
+    return np.median(px, axis=0)
+
+
+def skin_features(lab, wl):
+    """Features relative to the local water colour: skin is lighter than the water, fins/shorts/hair darker, and the
+    ab offset from the water separates warm skin from neutral/blue dark parts at every depth."""
+    dL, da, db = lab[..., 0] - wl[0], lab[..., 1] - wl[1], lab[..., 2] - wl[2]
+    return np.stack([dL / 20, da / 10, db / 20, (-da) / np.maximum(db, 3.0)], -1)
 
 
 def skin_matte(raw_rgb, mask, S):
-    """Soft skin matte inside the diver mask. Logistic qualifier on raw Lab (luma + hue + chroma gates learned on SAM-labelled
-    skin vs shorts/fins/hair pixels), blurred slightly, always limited to the diver mask."""
+    """Soft skin matte inside the diver mask. Logistic qualifier (luma + hue + chroma gates relative to the local water,
+    learned on SAM-labelled skin vs shorts/fins/hair pixels), slightly blurred, always limited to the diver mask."""
     H, W = mask.shape
     out = np.zeros((H, W), np.float32)
     if S["clf_w"] is None or mask.max() <= 0.004:
         return out
     ys, xs = np.where(mask > 0.004)
-    y0, y1, x0, x1 = max(ys.min() - 4, 0), min(ys.max() + 5, H), max(xs.min() - 4, 0), min(xs.max() + 5, W)
+    y0, y1, x0, x1 = max(ys.min() - 40, 0), min(ys.max() + 41, H), max(xs.min() - 40, 0), min(xs.max() + 41, W)
     lab = to_lab(raw_rgb[y0:y1, x0:x1])
-    z = skin_features(lab) @ np.array(S["clf_w"], np.float32) + S["clf_b"]
+    mc = mask[y0:y1, x0:x1]
+    z = skin_features(lab, water_lab(lab, mc > 0.004)) @ np.array(S["clf_w"], np.float32) + S["clf_b"]
     p = 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
-    p = cv2.GaussianBlur(p.astype(np.float32), (0, 0), S["matte_blur_px"])
-    out[y0:y1, x0:x1] = p * np.clip(mask[y0:y1, x0:x1] * 1.0, 0, 1)
+    t0, t1 = S.get("sharp", [0.0, 1.0])                  # sharpen the qualifier: below t0 -> 0, above t1 -> 1 (smoothstep between)
+    u = np.clip((p - t0) / (t1 - t0), 0, 1)
+    p = cv2.GaussianBlur((u * u * (3 - 2 * u)).astype(np.float32), (0, 0), S["matte_blur_px"])
+    out[y0:y1, x0:x1] = p * np.clip(mc, 0, 1)
     return out
 
 
 # ----------------------------------------------------------------------------- full frame render
-def render(rgb, mask, skin, params, vig=None, dab=None, luts=None, skin_on=True, finish=True):
+def render(rgb, mask, skin, params, vig=None, dab=None, luts=None, skin_on=True, finish=True, A=None):
     """rgb raw frame; mask = soft diver mask (0..1); skin = soft skin matte (0..1, inside the mask)."""
     B, F, S = params["bg"], params["finish"], params["skin"]
     H, W = rgb.shape[:2]
-    A = global_grade(rgb, B, luts)
-    if dab is not None:
+    if A is None:
+        A = global_grade(rgb, B, luts)
+    if A is not None and dab is not None and not getattr(A, "_dab_done", False):
         lab = to_lab(A)
         lab[..., 1] += dab[0]
         lab[..., 2] += dab[1]
@@ -147,7 +159,8 @@ def render(rgb, mask, skin, params, vig=None, dab=None, luts=None, skin_on=True,
         k = S["ab_strength"] * s
         lab[..., 1] += k * (S["skin_ab"][0] - lab[..., 1])
         lab[..., 2] += k * (S["skin_ab"][1] - lab[..., 2])
-        lab[..., 0] = np.clip(lab[..., 0] + s * S["dL"], 0, 100)
+        Lraw = to_lab(rgb[y0:y1, x0:x1])[..., 0]       # skin keeps (part of) its raw lighting: bright, separated from the dark water
+        lab[..., 0] = np.clip(lab[..., 0] + s * (S["L_restore"] * (Lraw - lab[..., 0]) + S["dL"]), 0, 100)
         lab = local_contrast(lab, S["clarity_amt"], 0.03)
         Bk = from_lab(lab)
         out = A.copy()
