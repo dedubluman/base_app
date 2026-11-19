@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""grade_dive.py <video> — SAM 3.1 diver mask + separate background/subject underwater grade.
+"""grade_dive.py <video> — SAM 3.1 diver mask + skin matte + layered underwater grade (v2 / v3).
 
     . .venv/bin/activate
     python grade_dive.py inputs/dive.mov                 # full run
@@ -184,6 +184,18 @@ def postprocess(sam, stride, n, log=print, feather_sigma=2.5, tsmooth=2, max_fil
 
 
 # --------------------------------------------------------------------------- IO
+def read_gray_video(path: Path, n: int, H: int, W: int) -> np.ndarray:
+    p = subprocess.Popen(["ffmpeg", "-v", "error", "-i", str(path), "-f", "rawvideo", "-pix_fmt", "gray", "-"], stdout=subprocess.PIPE, bufsize=10 ** 8)
+    out = np.zeros((n, H, W), np.uint8)
+    for i in range(n):
+        b = p.stdout.read(W * H)
+        if len(b) < W * H:
+            break
+        out[i] = np.frombuffer(b, np.uint8).reshape(H, W)
+    p.stdout.close(); p.wait()
+    return out
+
+
 def write_mask_video(soft, info, out: Path):
     n, H, W = soft.shape
     p = subprocess.Popen(["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "gray", "-s", f"{W}x{H}",
@@ -198,8 +210,7 @@ def write_mask_video(soft, info, out: Path):
 def open_encoder(video: Path, info, out: Path, crf: int):
     w, h = info["w"], info["h"]
     a = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb48le", "-s", f"{w}x{h}",
-         "-framerate", str(info["fps"]), "-i", "-"]
-    a += ["-i", str(video), "-map", "0:v:0"]
+         "-framerate", str(info["fps"]), "-i", "-", "-i", str(video), "-map", "0:v:0"]
     if info["has_audio"]:
         a += ["-map", "1:a:0", "-c:a", "copy"]
     a += ["-vf", "scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd+full_chroma_int:sws_dither=ed,format=yuv420p",
@@ -211,36 +222,63 @@ def open_encoder(video: Path, info, out: Path, crf: int):
     return subprocess.Popen(a, stdin=subprocess.PIPE)
 
 
-def grade_video(video, info, soft, params, out, crf=17, log=print):
+# --------------------------------------------------------------------------- skin matte
+def skin_mattes(video, info, soft, S, log=print):
+    """Pass 1: colour-qualifier skin matte per frame on the RAW frame, limited to the diver mask; ±2 frame smoothing."""
+    n, H, W = soft.shape
+    raw = np.zeros((n, H, W), np.uint8)
+    t0 = time.time()
+    for i, fr in enumerate(read_frames(video, info)):
+        if i >= n:
+            break
+        raw[i] = np.clip(G.skin_matte(fr, soft[i].astype(np.float32) / 255, S) * 255 + 0.5, 0, 255).astype(np.uint8)
+        if i % 200 == 0:
+            log(f"[skin] {i}/{n} {time.time() - t0:.0f}s")
+    w = np.array([1, 2, 3, 2, 1], np.float32) / 9
+    out = np.zeros_like(raw)
+    for i in range(n):
+        acc = np.zeros((H, W), np.float32)
+        for k, wk in zip(range(i - 2, i + 3), w):
+            acc += wk * raw[min(max(k, 0), n - 1)]
+        out[i] = np.minimum(acc, soft[i]).astype(np.uint8)       # never outside the diver mask
+    return out
+
+
+def area_report(soft, skin, limit=0.25, min_px=300):
+    m = (soft > 127).reshape(len(soft), -1).sum(1).astype(float)
+    s = (skin > 127).reshape(len(skin), -1).sum(1).astype(float)
+    ns = np.maximum(m - s, 0)
+    rep = {}
+    for name, a in (("skin", s), ("nonskin", ns)):
+        rel = np.abs(np.diff(a)) / np.maximum(a[:-1], 1)
+        bad = [int(i + 1) for i in np.where((rel > limit) & (np.maximum(a[1:], a[:-1]) > min_px))[0]]
+        rep[name] = {"area_px_median": float(np.median(a)), "rel_jump_p95": float(np.percentile(rel, 95)), "rel_jump_max": float(rel.max()),
+                     "frames_jump_over_25pct": bad[:60], "count": len(bad)}
+    return rep
+
+
+# --------------------------------------------------------------------------- render
+def grade_video(video, info, soft, skin, params, out, crf=17, log=print):
     H, W = info["h"], info["w"]
-    vig = G.vignette_map(H, W, params["bg"]["vignette"], params["bg"]["vignette_pow"])
+    B = params["bg"]
+    luts = G.make_luts(B)
+    vig = G.vignette_map(H, W, params["finish"]["vignette"], params["finish"]["vignette_pow"])
     enc = open_encoder(video, info, out, crf)
     t0 = time.time()
-    bgp = params["bg"]
-    ema = None   # temporally smoothed mean (a,b) of the graded water: slow chroma anchor, follows depth/cast drift without pumping
+    ema = None   # slow chroma anchor of the graded water: follows depth/cast drift without pumping
     for i, fr in enumerate(read_frames(video, info)):
         if i >= soft.shape[0]:
             break
         m = soft[i].astype(np.float32) / 255
-        bg = G.grade_bg(fr, bgp, vig)
-        if bgp.get("anchor_strength", 0) > 0:
-            sm = cv2.resize(bg, (W // 4, H // 4), interpolation=cv2.INTER_AREA)
-            keep = cv2.resize(cv2.dilate((m > 0.004).astype(np.uint8), np.ones((31, 31), np.uint8)), (W // 4, H // 4),
-                              interpolation=cv2.INTER_NEAREST) == 0
-            meas = G.to_lab(sm)[..., 1:][keep].mean(0) if keep.any() else (ema if ema is not None else np.zeros(2, np.float32))
-            ema = meas if ema is None else (1 - bgp["anchor_alpha"]) * ema + bgp["anchor_alpha"] * meas
-            dab = np.clip(bgp["anchor_strength"] * (np.array(bgp["anchor_ab"], np.float32) - ema), -bgp["anchor_clip"], bgp["anchor_clip"])
-            lab = G.to_lab(bg)
-            lab[..., 1] += dab[0]
-            lab[..., 2] += dab[1]
-            bg = G.from_lab(lab)
-        if m.max() > 0.004:
-            ys, xs = np.where(m > 0.004)
-            y0, y1, x0, x1 = max(ys.min() - 16, 0), min(ys.max() + 17, H), max(xs.min() - 16, 0), min(xs.max() + 17, W)
-            sj = G.grade_subj(fr[y0:y1, x0:x1], params["subj"], m[y0:y1, x0:x1])
-            mm = m[y0:y1, x0:x1, None]
-            bg[y0:y1, x0:x1] = bg[y0:y1, x0:x1] * (1 - mm) + sj * mm
-        enc.stdin.write((np.clip(bg, 0, 1) * 65535 + 0.5).astype(np.uint16).tobytes())
+        dab = None
+        if B.get("anchor_strength", 0) > 0:
+            A0 = G.global_grade(cv2.resize(fr, (W // 4, H // 4), interpolation=cv2.INTER_AREA), B, luts)
+            keep = cv2.resize(cv2.dilate((m > 0.004).astype(np.uint8), np.ones((31, 31), np.uint8)), (W // 4, H // 4), interpolation=cv2.INTER_NEAREST) == 0
+            meas = G.to_lab(A0)[..., 1:][keep].mean(0) if keep.any() else (ema if ema is not None else np.zeros(2, np.float32))
+            ema = meas if ema is None else (1 - B["anchor_alpha"]) * ema + B["anchor_alpha"] * meas
+            dab = np.clip(B["anchor_strength"] * (np.array(B["anchor_ab"], np.float32) - ema), -B["anchor_clip"], B["anchor_clip"])
+        o = G.render(fr, m, skin[i].astype(np.float32) / 255 if skin is not None else None, params, vig=vig, dab=dab, luts=luts)
+        enc.stdin.write((o * 65535 + 0.5).astype(np.uint16).tobytes())
         if i % 100 == 0:
             log(f"[grade] {i}/{soft.shape[0]} {time.time() - t0:.0f}s")
     enc.stdin.close()
@@ -254,6 +292,9 @@ def main():
     ap.add_argument("--params", type=Path, default=REPO / "out" / "grade_params.json")
     ap.add_argument("--text", default="person", help="SAM 3.1 text prompt for the first frame of every chunk")
     ap.add_argument("--sam-stride", type=int, default=2, help="run SAM on every Nth frame, interpolate in between")
+    ap.add_argument("--variant", choices=["v2", "v3"], default="v3",
+                    help="v2: skin warm correction through a plain luma qualifier; v3: learned colour qualifier skin matte (+ <name>_skin.mp4)")
+    ap.add_argument("--remask", action="store_true", help="ignore out/<name>_mask.mp4 and rebuild the diver mask (SAM cache is still reused)")
     ap.add_argument("--masks-only", action="store_true")
     ap.add_argument("--crf", type=int, default=17)
     ap.add_argument("--name", default=None)
@@ -268,19 +309,33 @@ def main():
     if info["hdr"]:
         print("[probe] HDR source -> tone-mapped to SDR Rec.709 before grading")
     n = info["nb_frames"] or int(round(info["duration"] * float(info["fps"])))
+    H, W = info["h"], info["w"]
 
-    sam, stride = sam_masks(video, info, name, a.text, a.sam_stride)
-    soft, mstats = postprocess(sam, stride, n)
-    write_mask_video(soft, info, a.out_dir / f"{name}_mask.mp4")
-    print("[mask]", json.dumps(mstats))
-    params = json.loads(a.params.read_text()) if a.params.exists() else {"bg": G.DEFAULT["bg"], "subj": G.DEFAULT["subj"]}
-    report = {"video": str(video), "info": {k: str(v) for k, v in info.items()}, "sam_stride": stride, "text": a.text,
-              "mask_stats": mstats}
-    (a.out_dir / f"{name}_report.json").write_text(json.dumps(report, indent=1))
+    mpath = a.out_dir / f"{name}_mask.mp4"
+    if mpath.exists() and not a.remask:
+        soft = read_gray_video(mpath, n, H, W)
+        print(f"[mask] reusing {mpath.name}")
+    else:
+        sam, stride = sam_masks(video, info, name, a.text, a.sam_stride)
+        soft, mstats = postprocess(sam, stride, n)
+        write_mask_video(soft, info, mpath)
+        print("[mask]", json.dumps(mstats))
+    params = json.loads(a.params.read_text()) if a.params.exists() else json.loads(json.dumps(G.DEFAULT))
     if a.masks_only:
         return
-    grade_video(video, info, soft, params, a.out_dir / f"{name}_graded.mp4", a.crf)
-    print("[done]", a.out_dir / f"{name}_graded.mp4")
+    S = params["skin"]
+    if a.variant == "v2":   # plain luma qualifier, no learned hue/chroma gates
+        S = dict(S, clf_w=[8.0, 0, 0, 0, 0], clf_b=0.32)
+    params = dict(params, skin=S)
+    skin = skin_mattes(video, info, soft, S)
+    arep = area_report(soft, skin)
+    print("[skin]", json.dumps(arep))
+    if a.variant == "v3":
+        write_mask_video(skin, info, a.out_dir / f"{name}_skin.mp4")
+    out = a.out_dir / f"{name}_graded_{a.variant}.mp4"
+    grade_video(video, info, soft, skin, params, out, a.crf)
+    (a.out_dir / f"{name}_report_{a.variant}.json").write_text(json.dumps({"video": str(video), "variant": a.variant, "area_report": arep}, indent=1))
+    print("[done]", out)
 
 
 if __name__ == "__main__":
