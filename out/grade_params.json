@@ -27,14 +27,22 @@
   "gain": 1.03,
   "contrast": 1.06,
   "sat": 1.0,
-  "warm_ab": [
-   30.0,
-   26.0
-  ],
   "luma_pivot": 0.5,
-  "cast_neutralize": 1.0,
+  "cast_neutralize": 0.9,
   "clarity_amt": 0.12,
-  "clarity_sigma_frac": 0.03
+  "clarity_sigma_frac": 0.03,
+  "skin_ab": [
+   10.4,
+   15.9
+  ],
+  "water_ab": [
+   -12.0,
+   -33.0
+  ],
+  "water_d": [
+   9.0,
+   18.0
+  ]
  },
  "fit_report": {
   "rms_before": 8.14736011308364,

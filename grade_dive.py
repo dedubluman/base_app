@@ -109,7 +109,7 @@ def interp_masks(a, b, t):
     return ((1 - t) * da + t * db) > 0
 
 
-def postprocess(sam, stride, n, log=print, feather_sigma=2.5, tsmooth=2, max_fill=8):
+def postprocess(sam, stride, n, log=print, feather_sigma=2.5, tsmooth=2, max_fill=8, erode_px=2):
     """sam: (T',H,W) bool. -> soft uint8 masks (n,H,W), stats dict."""
     Tp, H, W = sam.shape
     # 1. expand stride (shape interpolation between SAM frames)
@@ -128,6 +128,10 @@ def postprocess(sam, stride, n, log=print, feather_sigma=2.5, tsmooth=2, max_fil
             if nl > 2:
                 keep = [j for j in range(1, nl) if st[j, cv2.CC_STAT_AREA] >= 0.15 * st[1:, cv2.CC_STAT_AREA].max()]
                 full[i] = np.isin(lab, keep)
+    if erode_px:   # keeps the grade of the subject off the water around the silhouette (no halo)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * erode_px + 1,) * 2)
+        for i in range(n):
+            full[i] = cv2.erode(full[i].astype(np.uint8), k) > 0
     area = full.reshape(n, -1).sum(1).astype(float)
     # 3. lost-frame detection (zero, or collapsed vs. neighbours) and gap filling
     med = np.array([np.median(area[max(0, i - 7): i + 8][area[max(0, i - 7): i + 8] > 0]) if (area[max(0, i - 7): i + 8] > 0).any() else 0
@@ -221,7 +225,7 @@ def grade_video(video, info, soft, params, out, crf=17, log=print):
         if m.max() > 0.004:
             ys, xs = np.where(m > 0.004)
             y0, y1, x0, x1 = max(ys.min() - 16, 0), min(ys.max() + 17, H), max(xs.min() - 16, 0), min(xs.max() + 17, W)
-            sj = G.grade_subj(fr[y0:y1, x0:x1], params["subj"])
+            sj = G.grade_subj(fr[y0:y1, x0:x1], params["subj"], m[y0:y1, x0:x1])
             mm = m[y0:y1, x0:x1, None]
             bg[y0:y1, x0:x1] = bg[y0:y1, x0:x1] * (1 - mm) + sj * mm
         enc.stdin.write((np.clip(bg, 0, 1) * 65535 + 0.5).astype(np.uint16).tobytes())
@@ -236,7 +240,7 @@ def main():
     ap.add_argument("video", type=Path)
     ap.add_argument("--out-dir", type=Path, default=REPO / "out")
     ap.add_argument("--params", type=Path, default=REPO / "out" / "grade_params.json")
-    ap.add_argument("--text", default="freediver", help="SAM 3.1 text prompt for the first frame of every chunk")
+    ap.add_argument("--text", default="person", help="SAM 3.1 text prompt for the first frame of every chunk")
     ap.add_argument("--sam-stride", type=int, default=2, help="run SAM on every Nth frame, interpolate in between")
     ap.add_argument("--masks-only", action="store_true")
     ap.add_argument("--crf", type=int, default=17)

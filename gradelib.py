@@ -19,8 +19,8 @@ DEFAULT = {
         "top_dark": 0.0,
     },
     "subj": {
-        "gain": 1.08, "contrast": 1.06, "sat": 1.0, "warm_ab": [0.0, 0.0],
-        "luma_pivot": 0.5, "cast_neutralize": 0.5,
+        "gain": 1.08, "contrast": 1.06, "sat": 1.0, 
+        "luma_pivot": 0.5, "cast_neutralize": 0.9, "skin_ab": [10.4, 15.9], "water_ab": [-12.0, -33.0], "water_d": [9.0, 18.0],
         "clarity_amt": 0.12, "clarity_sigma_frac": 0.03,
     },
 }
@@ -70,17 +70,25 @@ def grade_bg(rgb, P, vig=None):
     return np.clip(out, 0, 1)
 
 
-def grade_subj(rgb, P):
+def grade_subj(rgb, P, mask=None):
     """Keep skin hue/chroma (no blue paint). Remove the water cast partly, add light + contrast."""
     lab = to_lab(rgb)
     L = lab[..., 0]
     L = P["luma_pivot"] * 100 + (L - P["luma_pivot"] * 100) * P["contrast"]
     L = np.clip(L * P["gain"], 0, 100)
-    # water cast: shift a/b toward warm by cast_neutralize * warm_ab
+    # water cast: pull a/b toward the target skin chroma, gated so that black fins (low L)
+    # and water-coloured pixels (strongly negative b, e.g. mask-edge water) stay untouched
     t = np.clip((lab[..., 0] - 25.0) / 25.0, 0, 1)
-    k = P["cast_neutralize"] * t * t * (3 - 2 * t)      # luma-gated: black fins stay neutral
-    lab[..., 1] = (lab[..., 1] + k * P["warm_ab"][0]) * P["sat"]
-    lab[..., 2] = (lab[..., 2] + k * P["warm_ab"][1]) * P["sat"]
+    d = np.hypot(lab[..., 1] - P["water_ab"][0], lab[..., 2] - P["water_ab"][1])   # distance from water chroma
+    w = np.clip((d - P["water_d"][0]) / (P["water_d"][1] - P["water_d"][0]), 0, 1)
+    w = w * w * (3 - 2 * w)
+    if mask is not None:   # deep inside the mask it is certainly subject: skin may be water-tinted, so ignore the chroma gate there
+        dt = cv2.distanceTransform((mask > 0.5).astype(np.uint8), cv2.DIST_L2, 3)
+        it = np.clip((dt - 3.0) / 6.0, 0, 1)
+        w = np.maximum(w, it * it * (3 - 2 * it))
+    k = P["cast_neutralize"] * (t * t * (3 - 2 * t)) * w
+    lab[..., 1] = (lab[..., 1] + k * (P["skin_ab"][0] - lab[..., 1])) * P["sat"]
+    lab[..., 2] = (lab[..., 2] + k * (P["skin_ab"][1] - lab[..., 2])) * P["sat"]
     lab[..., 0] = L
     lab = local_contrast(lab, P["clarity_amt"], P["clarity_sigma_frac"])
     return from_lab(lab)
@@ -90,6 +98,6 @@ def composite(rgb, mask, params, vig=None):
     bg = grade_bg(rgb, params["bg"], vig)
     if mask is None or not mask.any():
         return bg
-    sj = grade_subj(rgb, params["subj"])
+    sj = grade_subj(rgb, params["subj"], mask)
     m = mask[..., None].astype(np.float32)
     return bg * (1 - m) + sj * m
