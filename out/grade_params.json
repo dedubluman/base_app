@@ -21,7 +21,14 @@
   "clarity_sigma_frac": 0.04,
   "vignette": 0.6484861779336692,
   "vignette_pow": 2.0,
-  "top_dark": 0.0
+  "top_dark": 0.0,
+  "anchor_ab": [
+   -3.1,
+   -28.05
+  ],
+  "anchor_strength": 1.0,
+  "anchor_alpha": 0.03,
+  "anchor_clip": 10.0
  },
  "subj": {
   "gain": 1.03,

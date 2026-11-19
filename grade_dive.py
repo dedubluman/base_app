@@ -205,7 +205,7 @@ def open_encoder(video: Path, info, out: Path, crf: int):
     a += ["-vf", "scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd+full_chroma_int:sws_dither=ed,format=yuv420p",
           "-c:v", "libx264", "-crf", str(crf), "-preset", "medium", "-pix_fmt", "yuv420p",
           "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv",
-          "-r", str(info["fps"]), "-movflags", "+faststart", "-shortest", str(out)]
+          "-r", str(info["fps"]), "-movflags", "+faststart", str(out)]
     if info["rotation"]:  # re-attach the source's rotation tag (frames are decoded with -noautorotate)
         a[-1:-1] = ["-metadata:s:v:0", f"rotate={-info['rotation'] % 360}"]
     return subprocess.Popen(a, stdin=subprocess.PIPE)
@@ -216,11 +216,24 @@ def grade_video(video, info, soft, params, out, crf=17, log=print):
     vig = G.vignette_map(H, W, params["bg"]["vignette"], params["bg"]["vignette_pow"])
     enc = open_encoder(video, info, out, crf)
     t0 = time.time()
+    bgp = params["bg"]
+    ema = None   # temporally smoothed mean (a,b) of the graded water: slow chroma anchor, follows depth/cast drift without pumping
     for i, fr in enumerate(read_frames(video, info)):
         if i >= soft.shape[0]:
             break
         m = soft[i].astype(np.float32) / 255
-        bg = G.grade_bg(fr, params["bg"], vig)
+        bg = G.grade_bg(fr, bgp, vig)
+        if bgp.get("anchor_strength", 0) > 0:
+            sm = cv2.resize(bg, (W // 4, H // 4), interpolation=cv2.INTER_AREA)
+            keep = cv2.resize(cv2.dilate((m > 0.004).astype(np.uint8), np.ones((31, 31), np.uint8)), (W // 4, H // 4),
+                              interpolation=cv2.INTER_NEAREST) == 0
+            meas = G.to_lab(sm)[..., 1:][keep].mean(0) if keep.any() else (ema if ema is not None else np.zeros(2, np.float32))
+            ema = meas if ema is None else (1 - bgp["anchor_alpha"]) * ema + bgp["anchor_alpha"] * meas
+            dab = np.clip(bgp["anchor_strength"] * (np.array(bgp["anchor_ab"], np.float32) - ema), -bgp["anchor_clip"], bgp["anchor_clip"])
+            lab = G.to_lab(bg)
+            lab[..., 1] += dab[0]
+            lab[..., 2] += dab[1]
+            bg = G.from_lab(lab)
         if m.max() > 0.004:
             ys, xs = np.where(m > 0.004)
             y0, y1, x0, x1 = max(ys.min() - 16, 0), min(ys.max() + 17, H), max(xs.min() - 16, 0), min(xs.max() + 17, W)
