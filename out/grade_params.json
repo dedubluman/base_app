@@ -56,15 +56,25 @@
  },
  "skin": {
   "skin_ab": [
-   8.0,
-   16.0
+   28.276335525532684,
+   29.999797957866907
   ],
-  "ab_strength": 0.9,
+  "ab_strength": 1.0,
   "dL": 0.0,
   "clarity_amt": 0.1,
-  "clf_w": null,
-  "clf_b": 0.0,
-  "matte_blur_px": 1.5
+  "clf_w": [
+   -2.021788674608784,
+   -7.444260931664202,
+   -2.649110528116939,
+   -1.7126697529222736
+  ],
+  "clf_b": -0.761553069195619,
+  "matte_blur_px": 1.5,
+  "sharp": [
+   0.5,
+   0.85
+  ],
+  "L_restore": 1.199999999272807
  },
  "fit_report_bg": {
   "rms_init(cdf)": 5.921574189458767,
@@ -204,5 +214,93 @@
    9.0,
    18.0
   ]
- }
+ },
+ "skin_qualifier_cv": [
+  {
+   "frame": 15,
+   "non_skin_px": 3073,
+   "skin_px": 7264,
+   "leak_mass_into_nonskin": 0.0488067976599988,
+   "skin_recall": 0.6957756412186812,
+   "nonskin_mean_matte": 0.10932692140340805
+  },
+  {
+   "frame": 30,
+   "non_skin_px": 3161,
+   "skin_px": 6626,
+   "leak_mass_into_nonskin": 0.07326986303674324,
+   "skin_recall": 0.7611171309047691,
+   "nonskin_mean_matte": 0.17119687795639038
+  },
+  {
+   "frame": 150,
+   "non_skin_px": 102,
+   "skin_px": 7000,
+   "leak_mass_into_nonskin": 0.00027904347902914716,
+   "skin_recall": 0.29103684779575895,
+   "nonskin_mean_matte": 0.00737147917971015
+  },
+  {
+   "frame": 310,
+   "non_skin_px": 2343,
+   "skin_px": 5542,
+   "leak_mass_into_nonskin": 0.002996920774097549,
+   "skin_recall": 0.5169005929154638,
+   "nonskin_mean_matte": 0.004838569555431604
+  },
+  {
+   "frame": 524,
+   "non_skin_px": 1067,
+   "skin_px": 2421,
+   "leak_mass_into_nonskin": 0.012783356867646308,
+   "skin_recall": 0.40946703930129597,
+   "nonskin_mean_matte": 0.01572125218808651
+  },
+  {
+   "frame": 599,
+   "non_skin_px": 630,
+   "skin_px": 2502,
+   "leak_mass_into_nonskin": 0.02018440701925964,
+   "skin_recall": 0.5480896532773781,
+   "nonskin_mean_matte": 0.06455191969871521
+  },
+  {
+   "frame": 700,
+   "non_skin_px": 607,
+   "skin_px": 1972,
+   "leak_mass_into_nonskin": 0.0038586802980320766,
+   "skin_recall": 0.606350788480128,
+   "nonskin_mean_matte": 0.012537697330117226
+  }
+ ],
+ "fit_report_skin": [
+  {
+   "frame_pair": "head",
+   "hue": 20.5,
+   "sat": 0.43,
+   "L": 63.5,
+   "skin_px": 12623
+  },
+  {
+   "frame_pair": "head",
+   "hue": 20.9,
+   "sat": 0.463,
+   "L": 65.7,
+   "skin_px": 10487
+  },
+  {
+   "frame_pair": "fin",
+   "hue": 17.6,
+   "sat": 0.459,
+   "L": 66.5,
+   "skin_px": 1462
+  },
+  {
+   "frame_pair": "fin",
+   "hue": 18.7,
+   "sat": 0.464,
+   "L": 69.6,
+   "skin_px": 1888
+  }
+ ]
 }

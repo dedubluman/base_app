@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fit the small skin correction (target a/b, dL) so SKIN pixels (skin matte > .5) of the rendered output hit the reference
+"""Fit the small skin correction (target a/b, dL) so SKIN pixels (skin matte > .8) of the rendered output hit the reference
 after-frame skin statistics (HSL hue, HSL saturation, Lab L*). Measured on the real render (matte, veil, vignette included)."""
 import json, sys
 from pathlib import Path
@@ -34,7 +34,7 @@ def measure(items, params):
     for name, raw, m, A, vig in items:
         sk = G.skin_matte(raw, m, params["skin"])
         o = G.render(raw, m, sk, params, vig=vig, A=A)
-        sel = sk > 0.5
+        sel = sk > 0.8
         px = o[sel]
         h, s, l = G.hsl_stats(px)
         L = G.to_lab(o)[..., 0][sel].mean()
@@ -44,6 +44,7 @@ def measure(items, params):
 
 if __name__ == "__main__":
     p = Path("out/grade_params.json"); params = json.loads(p.read_text())
+    params["skin"]["ab_strength"] = 1.0
     items = prep(params)
 
     def resid(x):
@@ -55,8 +56,8 @@ if __name__ == "__main__":
         return np.array(r)
 
     params["skin"].setdefault("L_restore", 0.0)
-    x0 = np.array([11.0, 17.0, 0.8, 0.0])
-    sol = least_squares(resid, x0, bounds=([-5, -5, 0.0, -15], [40, 40, 1.2, 15]), diff_step=0.03, x_scale=[3, 3, 0.2, 3], max_nfev=30)
+    x0 = np.array([11.0, 17.0, 0.9, 0.0])
+    sol = least_squares(resid, x0, bounds=([-5, -5, 0.0, -10], [30, 30, 1.2, 15]), diff_step=0.03, x_scale=[3, 3, 0.2, 3], max_nfev=30)
     params["skin"].update(skin_ab=[float(sol.x[0]), float(sol.x[1])], L_restore=float(sol.x[2]), dL=float(sol.x[3]))
     res = measure(items, params)
     params["fit_report_skin"] = [{"frame_pair": n, "hue": round(h, 1), "sat": round(s, 3), "L": round(L, 1), "skin_px": k} for n, h, s, L, k in res]

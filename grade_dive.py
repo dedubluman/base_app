@@ -325,7 +325,7 @@ def main():
         return
     S = params["skin"]
     if a.variant == "v2":   # plain luma qualifier, no learned hue/chroma gates
-        S = dict(S, clf_w=[8.0, 0, 0, 0, 0], clf_b=0.32)
+        S = dict(S, clf_w=[8.0, 0, 0, 0], clf_b=0.8)
     params = dict(params, skin=S)
     skin = skin_mattes(video, info, soft, S)
     arep = area_report(soft, skin)
