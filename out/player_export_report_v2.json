@@ -3,30 +3,39 @@
  "variant": "v2",
  "area_report": {
   "skin": {
-   "area_px_median": 2532.0,
-   "rel_jump_p95": 0.13707237407598416,
-   "rel_jump_max": 1.1111111111111112,
+   "area_px_median": 2300.0,
+   "rel_jump_p95": 0.15554073318423764,
+   "rel_jump_max": 3.72,
    "frames_jump_over_25pct": [
     65,
+    66,
+    67,
     69,
+    70,
     182,
     183,
     184,
     185,
-    378,
-    380,
+    356,
+    376,
+    377,
     381,
+    382,
+    383,
+    384,
     388,
     410,
     411,
+    412,
+    413,
     419
    ],
-   "count": 13
+   "count": 22
   },
   "nonskin": {
-   "area_px_median": 7495.0,
-   "rel_jump_p95": 0.060716996906613106,
-   "rel_jump_max": 0.4079098643366291,
+   "area_px_median": 8033.0,
+   "rel_jump_p95": 0.058917419489933086,
+   "rel_jump_max": 0.39069049194793737,
    "frames_jump_over_25pct": [
     224
    ],
