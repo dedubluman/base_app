@@ -37,7 +37,7 @@ SETTINGS = dict(
     surface_boost=0.22,       # cool highlight lift on the bright surface
     # --- subject -----------------------------------------------------
     skin_wb=(1.85, 1.00, 0.72),   # recover red lost to water absorption
-    skin_exposure=0.92,
+    skin_exposure=0.85,
     skin_contrast=1.12,
     skin_warm=0.30,              # push toward golden bronze
     skin_sat=1.0,
@@ -134,7 +134,7 @@ def grade_subject(img, S, gain, vig, top=None):
     x = l2 + (x - l2) * S["skin_sat"]
     # shorts: pull a hint of cool back so they read white-blue, not beige
     near_white = smoothstep(0.62, 0.9, l) * (1 - skin)
-    x = x * (1 - 0.5 * near_white[..., None]) + (lum(x)[..., None] * np.array([0.93, 0.98, 1.06], np.float32)) * 0.5 * near_white[..., None]
+    x = x * (1 - 0.8 * near_white[..., None]) + (lum(x)[..., None] * np.array([0.93, 0.98, 1.06], np.float32)) * 0.8 * near_white[..., None]
     # vignette shared but weaker on the subject
     return np.clip(x * (0.55 + 0.45 * vig[..., None]) + S["subject_rim"] * 0.0, 0, 1)
 
@@ -156,7 +156,7 @@ def probe(path):
 
 
 def read_frames(path, w, h):
-    p = subprocess.Popen(["ffmpeg", "-v", "error", "-i", str(path), "-f", "rawvideo",
+    p = subprocess.Popen(["ffmpeg", "-v", "error", "-i", str(path), "-fps_mode", "passthrough", "-f", "rawvideo",
                           "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE)
     sz = w * h * 3
     while True:
@@ -197,6 +197,10 @@ def process(frames, masks, S, w, h):
                 cs, _ = cv2.findContours((lab == k).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 pts = np.vstack(cs)
                 cv2.fillConvexPoly(stick, cv2.convexHull(pts), 1.0)
+        if stick.any():  # reach the ring/collar at the top of the pole (dark or unsaturated only)
+            near = cv2.dilate(stick, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (61, 61)))
+            ring = ((near > 0) & (m == 0) & ((sat < 0.55) | (lum(img) < 0.16))).astype(np.float32)
+            stick = np.maximum(stick, ring)
         stick = cv2.GaussianBlur(cv2.dilate(stick, np.ones((3, 3), np.uint8)), (0, 0), 1.0)[..., None]
         l0 = lum(img)[..., None]
         st_col = np.clip((l0 + (img - l0) * 0.25) * 0.85 * (0.5 + 0.5 * vig[..., None]), 0, 1)
@@ -241,7 +245,8 @@ def main():
         enc.stdin.write(g.tobytes())
     enc.stdin.close(); enc.wait()
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(tmp), "-i", str(a.input), "-map", "0:v",
-                    "-map", "1:a?", "-c:v", "copy", "-c:a", "copy", "-shortest", str(a.output)], check=True)
+                    "-map", "1:a?", "-c:v", "copy", "-c:a", "copy", str(a.output)], check=True)
+    print("tmp frames", subprocess.check_output(["ffprobe","-v","error","-count_frames","-select_streams","v:0","-show_entries","stream=nb_read_frames","-of","csv=p=0",str(tmp)]).decode().strip())
     tmp.unlink()
     a.output.with_suffix(".settings.json").write_text(json.dumps(S, indent=2))
 
