@@ -33,7 +33,9 @@ SETTINGS = dict(
           (0.70, (40, 100, 150)), (1.00, (140, 195, 225))],  # navy gradient map (RGB 0-255)
     vignette_strength=0.80,   # corner darkening
     vignette_power=2.1,
-    bottom_dark=0.45,         # extra darkening toward the lower frame
+    bottom_dark=0.30,
+    vig_floor=0.30,           # vignette never darkens below this fraction of the water grade
+    water_ambient=(0.0, 0.034, 0.042),   # lifted deep-petrol floor so lower corners keep texture (IMAGE 2: ~RGB 1,15,22)         # extra darkening toward the lower frame
     surface_boost=0.22,       # cool highlight lift on the bright surface
     # --- subject -----------------------------------------------------
     skin_match_w=[0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0],  # per percentile (1,5,25,50,75,95,99): pull toward IMAGE 2 (highlights only; the clip's lit share differs)
@@ -45,13 +47,22 @@ SETTINGS = dict(
     skin_a_scale=0.98,        # keep red/orange (a*) controlled; warmth lives in b*
     skin_b_scale=1.14,
     skin_mid_chroma=0.85,     # muted bronze midtones (chroma factor at L* 30..65)
-    skin_shadow_chroma=0.85,  # extra desaturation of skin shadows (L* < 25) -> cool-neutral
+    skin_shadow_chroma=0.75,  # extra desaturation of skin shadows (L* < 25) -> cool-neutral
     skin_shadow_lift=7.0,     # L* added to the smooth base in the shadows (floor near IMAGE 2's p5 = 29)
     skin_ref_hi_scale=0.70,   # IMAGE 2's warm-pixel stats come from its lit shoulders only; scale its L* above the median
-    skin_top_light=11.0,      # L* gain for sun-facing top of the body vs. undersides (shoulder tops bright, torso underside deep)
+    skin_top_light=15.0,      # L* gain for sun-facing top of the body vs. undersides (shoulder tops bright, torso underside deep)
     skin_hi_knee=62.0,        # highlight roll-off: L* above this is compressed (IMAGE 2 p95 = 83.5)
     skin_hi_range=15.0,
-    skin_vig_mix=0.30,        # share of the vignette applied to skin
+    skin_vig_mix=0.30,
+    skin_shape_gain=20.0,     # light-from-above shading derived from the skin silhouette (round limbs: lit tops, falling-off undersides)
+    skin_shape_R=38.0,        # px over which the silhouette 'height' rises
+    skin_shape_k=1.6,
+    skin_light_dir=(0.0, -0.62, 0.78),
+    skin_shadow_cool_a=1.0,   # shadows: pull a*/b* down -> cooler, neutral troughs
+    skin_shadow_cool_b=2.6,
+    skin_tone_sigma=3.0,      # temporal stabiliser: frames of Gaussian smoothing of the per-frame skin L*
+    skin_tone_k=0.7,
+    skin_tone_cap=3.0,        # share of the vignette applied to skin
     skin_wb=(1.85, 0.94, 0.72),   # recover red lost to water absorption
     skin_exposure=0.95,
     skin_contrast=1.12,
@@ -61,6 +72,13 @@ SETTINGS = dict(
     subject_rim=0.10,            # slight lift for separation
     mask_feather=1.2,
     # --- part split (skin / hair / gear / shorts) --------------------
+    head_dark_lum=0.36,       # above the lens bottom every pixel darker than this is hair/mask/strap/snorkel, never skin
+    alpha_lo=0.38,
+    alpha_hi=0.62,
+    gf_radius=3,              # guided-filter edge snapping of the part masks
+    gf_eps=0.0005,
+    tw_center=0.5,            # temporal smoothing weights (optical-flow aligned neighbours)
+    tw_side=0.25,
     gear_lum=0.17,            # raw luminance below which a diver pixel is gear (lens, frame, snorkel, watch, fins)
     hair_lum=0.30,            # raw luminance below which pixels next to the SAM hair mask count as hair
     hair_grow=9,              # px the SAM hair mask may grow into dark pixels
@@ -80,10 +98,10 @@ SETTINGS = dict(
     hair_gain=0.58,
     hair_sat=0.55,
     gear_sat=0.30,
-    gear_gain=0.55,
-    lens_lum=0.28,
-    snorkel_w=27,             # px: thinner than this inside the head area = snorkel tube
-    tube_lum=0.42,            # dive-mask lens/frame: dark pixels in the band below the hair
+    gear_gain=0.42,
+    lens_lum=0.30,
+    snorkel_w=25,             # px: thinner than this inside the head area = snorkel tube
+    tube_lum=0.33,            # dive-mask lens/frame: dark pixels in the band below the hair
     lens_band=0.85,           # band height in hair heights
     shorts_tint=(0.95, 1.00, 1.05),
     shorts_gain=1.45,
@@ -144,7 +162,13 @@ def grade_water(img, S, gain, vig):
     # cool surface highlights
     hi = smoothstep(0.55, 0.95, l)[..., None]
     out = out + S["surface_boost"] * hi * np.array([0.10, 0.22, 0.30], np.float32)
-    return np.clip(out * vig[..., None], 0, 1)
+    ycol = (np.arange(vig.shape[0], dtype=np.float32) / vig.shape[0])[:, None]
+    floor = S["vig_floor"] * smoothstep(0.50, 0.85, ycol)      # floor only under the horizon of the frame: top stays deep navy
+    vv = floor + (1 - floor) * vig
+    out = out * vv[..., None]
+    lo = (1 - smoothstep(0.08, 0.50, lum(out)))[..., None]     # lift only the darks: corners keep a petrol-blue floor + texture
+    out = out + np.array(S["water_ambient"], np.float32) * lo
+    return np.clip(out, 0, 1)
 
 
 def grade_subject(img, S, gain, vig, top=None):
@@ -206,6 +230,7 @@ def split_parts(img, full, hair_s, shorts_s, fins_s, S, fin2_s=None):
     # gear: SAM fins + very dark diver pixels (mask lens/frame, snorkel, watch, fins)
     dark = (L < S["gear_lum"]) & reach
     dark = cv2.morphologyEx(dark.astype(np.uint8), cv2.MORPH_OPEN, np.ones((2, 2), np.uint8)) > 0
+    tube_px = np.zeros_like(full)
     # hair geometry from the main hair component only (SAM leaves stray blobs on the neck)
     nl, lab, st, _ = cv2.connectedComponentsWithStats(hair_s.astype(np.uint8), 8)
     if nl > 1:
@@ -213,36 +238,51 @@ def split_parts(img, full, hair_s, shorts_s, fins_s, S, fin2_s=None):
         hair_s = lab == k
         ys, xs = np.nonzero(hair_s)
         hh = ys.max() - ys.min() + 1
+        top_, hb = int(ys.min()), int(ys.max())
+        x0, x1 = max(int(xs.min()) - 14, 0), int(xs.max()) + 24
         zone = np.zeros_like(full)
-        y0, y1 = ys.max() - 6, int(ys.max() + S["lens_band"] * hh)
-        zone[max(y0, 0):y1, max(xs.min() - 14, 0):xs.max() + 24] = True
+        zone[max(top_ + int(0.45 * hh), 0):int(hb + S["lens_band"] * hh), x0:x1] = True
         lens = ((L < S["lens_lum"]) & zone & reach).astype(np.uint8)
         lens = cv2.morphologyEx(lens, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         lens = cv2.morphologyEx(lens, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))
+        hull = np.zeros(L.shape, np.uint8)
+        lens_bottom = int(hb + 0.7 * hh)
         n2, lab2, st2, _ = cv2.connectedComponentsWithStats(lens, 8)
         if n2 > 1:
             k = 1 + int(np.argmax(st2[1:, cv2.CC_STAT_AREA]))
             cs, _ = cv2.findContours((lab2 == k).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            hull = np.zeros(L.shape, np.uint8)
             cv2.fillConvexPoly(hull, cv2.convexHull(np.vstack(cs)), 1)
             dark = dark | ((hull > 0) & zone & reach)
-        # snorkel tube: thin structure beside the head (skin parts are thicker than the tube)
-        head = np.zeros_like(full)
-        head[max(ys.min() - 40, 0):int(ys.max() + 1.6 * hh), max(xs.min() - 60, 0):xs.max() + 70] = True
-        k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (S["snorkel_w"], S["snorkel_w"]))
-        thick = cv2.morphologyEx(full.astype(np.uint8), cv2.MORPH_OPEN, k_open) > 0
-        tube = full & ~thick & head & (L < S["tube_lum"])
-        tube = cv2.morphologyEx(tube.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
-        if tube.any():  # grow along pixels of the tube's own tone (lower tube touches the cheek)
+            lens_bottom = int(np.nonzero(hull.any(1))[0].max())
+        # nothing above the lens bottom is bare skin unless it is bright: hair, mask frame/strap, snorkel, ear shadow
+        hz = np.zeros_like(full)
+        hz[max(top_ - 10, 0):lens_bottom + 2, x0:x1] = True
+        head_dark = (L < S["head_dark_lum"]) & hz & reach
+        head_dark = cv2.morphologyEx(head_dark.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)) > 0
+        dark = dark | head_dark
+        # snorkel tube: thin dark structure around the head, inside AND outside the diver mask
+        box = np.zeros_like(full)
+        box[max(top_ - 70, 0):int(hb + 1.7 * hh), max(x0 - 70, 0):x1 + 80] = True
+        cand = ((L < S["tube_lum"]) & box).astype(np.uint8)
+        thick = cv2.morphologyEx(cand, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (S["snorkel_w"], S["snorkel_w"])))
+        thin = ((cand > 0) & (thick == 0)).astype(np.uint8)
+        thin = cv2.morphologyEx(thin, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        n3, lab3, st3, _ = cv2.connectedComponentsWithStats(thin, 8)
+        anchor = _grow(hz | (hull > 0), 10)
+        ids = [i_ for i_ in np.unique(lab3[anchor & (thin > 0)]) if i_ > 0 and st3[i_, cv2.CC_STAT_AREA] >= 150]
+        tube = np.isin(lab3, ids) if ids else np.zeros_like(full)
+        if tube.any():   # grow along the tube's own tone
             ref = float(np.median(L[tube]))
             for _ in range(3):
-                tube |= (np.abs(L - ref) < 0.07) & _grow(tube, 7) & full & head & ~hair_s
-        dark = dark | tube
+                tube |= (np.abs(L - ref) < 0.07) & _grow(tube, 7) & box & _grow(full, 30) & ~hair_s
+        above = np.zeros_like(full)
+        above[:max(top_ - 6, 0), :] = True                 # above the top of the hair nothing can be skin: snorkel tip
+        tube_px = tube | (full & above & box)
     fins_g = fins_s.copy()
     if fins_s.any():   # SAM may find only one fin: grow into pixels of the same tone (still inside the diver mask)
         refl = float(np.median(L[fins_s]))
         fins_g |= (np.abs(L - refl) < S["fin_lum_tol"]) & _grow(fins_s, S["fin_grow"]) & reach
-    gear = fins_g | dark
+    gear = fins_g | dark | tube_px
     # hair: SAM hair + dark pixels hugging it
     hair = hair_s | ((L < S["hair_lum"]) & _grow(hair_s, S["hair_grow"]) & reach)
     hair &= ~dark | hair_s          # the dark mask lens never becomes hair
@@ -256,6 +296,12 @@ def split_parts(img, full, hair_s, shorts_s, fins_s, S, fin2_s=None):
     f = S["part_feather"]
     sm = lambda m: cv2.GaussianBlur(m.astype(np.float32), (0, 0), f)
     fullf, hf, gf, sf = sm(full | fins_s), sm(hair), sm(gear), sm(shorts)
+    if S["gf_radius"] > 0:    # snap every part edge to the image's own edges (fins, shorts, legs vs water)
+        guide = L.astype(np.float32)
+        gfil = lambda m: np.clip(cv2.ximgproc.guidedFilter(guide, m.astype(np.float32), int(S["gf_radius"]), float(S["gf_eps"])), 0, 1)
+        fullf, hf, gf, sf = gfil(fullf), gfil(hf), gfil(gf), gfil(sf)
+        tight = lambda m: smoothstep(S["alpha_lo"], S["alpha_hi"], m)   # ~2 px transitions: no pale halo around limbs/fins
+        fullf, hf, gf, sf = tight(fullf), tight(hf), tight(gf), tight(sf)
     skin = np.clip(fullf - np.maximum.reduce([hf, gf, sf]), 0, 1)
     return dict(full=fullf, skin=skin, hair=hf, gear=gf, shorts=sf)
 
@@ -318,7 +364,7 @@ def nblur(x, w, sigma):
     return num / np.maximum(den, 1e-3)
 
 
-def grade_skin_lab(img, S, vig, top=None, w=None):
+def grade_skin_lab(img, S, vig, top=None, w=None, off=0.0):
     """Skin only. L*: IMAGE 2 tone curve on the very smooth base + boosted body-scale,
     local and fine contrast. a*/b* from IMAGE 2's chroma-vs-L* table: shadows low chroma
     and cool, mids muted bronze, highlights champagne-gold (b* carries the warmth, a* held back)."""
@@ -330,6 +376,18 @@ def grade_skin_lab(img, S, vig, top=None, w=None):
     base = np.interp(B40, cx, cy).astype(np.float32)
     Lo = (base + S["skin_low_gain"] * (b10 - B40) + S["skin_mid_gain"] * (b3 - b10)
           + S["skin_fine_gain"] * (L - b3))
+    if S["skin_shape_gain"]:
+        # light from above shaded on the silhouette: gives limbs/torso a round, lit-top / falling-off-underside form
+        dist = cv2.distanceTransform((w > 0.5).astype(np.uint8), cv2.DIST_L2, 5)
+        R = S["skin_shape_R"]
+        hgt = cv2.GaussianBlur(np.sqrt(np.minimum(dist, R) / R).astype(np.float32), (0, 0), 5)
+        gy, gx = np.gradient(hgt)
+        kk = S["skin_shape_k"] * R
+        nx, ny = -gx * kk, -gy * kk
+        lx, ly, lz = S["skin_light_dir"]
+        shade = (nx * lx + ny * ly + lz) / np.sqrt(nx * nx + ny * ny + 1.0)
+        Lo = Lo + S["skin_shape_gain"] * (shade - lz) * (w > 0.05)
+    Lo = Lo + off
     if top is not None:
         Lo = Lo + S["skin_top_light"] * (top - 0.35) * np.clip(Lo / 55.0, 0.3, 1.2)
     Lo = Lo + S["skin_shadow_lift"] * (1 - smoothstep(30, 62, base))
@@ -346,6 +404,7 @@ def grade_skin_lab(img, S, vig, top=None, w=None):
     mid = smoothstep(30, 45, Ls) * (1 - smoothstep(55, 70, Ls))
     k = (1 - (1 - S["skin_shadow_chroma"]) * shadow) * (1 - (1 - S["skin_mid_chroma"]) * mid)
     a, b = a * k, b * k
+    a, b = a - S["skin_shadow_cool_a"] * shadow, b - S["skin_shadow_cool_b"] * shadow   # cool, neutral troughs
     if top is not None:                   # sun-facing upper body leans champagne-gold (b*), not red
         hi = smoothstep(55, 85, Ls) * top
         b = b + 1.5 * hi
@@ -384,7 +443,56 @@ def read_frames(path, w, h):
         yield np.frombuffer(b, np.uint8).reshape(h, w, 3)
 
 
-def process(frames, masks, S, w, h):
+WKEYS = ("full", "skin", "hair", "gear", "shorts")
+
+
+def precompute_weights(frames_iter, masks, S, rng, calib_max):
+    W, gray, skinL, smp = [], [], [], []
+    for i, fr in enumerate(frames_iter):
+        img = fr.astype(np.float32) / 255.0
+        one = {k: [v[i]] for k, v in masks.items()}
+        P = split_parts(img, one['full'][0].astype(bool), one['hair'][0], one['shorts'][0], one['fins'][0], S, one['fin2'][0])
+        W.append({k: (P[k] * 255 + 0.5).astype(np.uint8) for k in WKEYS})
+        gray.append(cv2.cvtColor(fr, cv2.COLOR_RGB2GRAY))
+        sk = P['skin'] > 0.9
+        skinL.append(float(cv2.cvtColor(img, cv2.COLOR_RGB2LAB)[..., 0][sk].mean()) if sk.any() else np.nan)
+        if i % 6 == 0 and i < calib_max and sk.any():
+            smp.append(sample_skin_L(img, P, rng))
+        if i % 40 == 0:
+            print(f"[pre] frame {i}", flush=True)
+    return W, gray, np.array(skinL), smp
+
+
+def smooth_weights(W, gray, S):
+    """Temporal smoothing of the part weights with optical-flow-aligned neighbours (no lag, no ghosting)."""
+    n, (h, w) = len(W), gray[0].shape
+    dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+    gx, gy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    out = []
+    for i in range(n):
+        acc = {k: W[i][k].astype(np.float32) * S["tw_center"] for k in WKEYS}
+        ws = S["tw_center"]
+        for j in (i - 1, i + 1):
+            if 0 <= j < n:
+                fl = dis.calc(gray[i], gray[j], None)          # pixel in frame i -> position in frame j
+                mx, my = gx + fl[..., 0], gy + fl[..., 1]
+                for k in WKEYS:
+                    acc[k] += cv2.remap(W[j][k], mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE).astype(np.float32) * S["tw_side"]
+                ws += S["tw_side"]
+        out.append({k: np.clip(acc[k] / ws + 0.5, 0, 255).astype(np.uint8) for k in WKEYS})
+    return out
+
+
+def skin_tone_offsets(skinL, S):
+    s = np.where(np.isnan(skinL), np.nanmean(skinL), skinL)
+    sig = S["skin_tone_sigma"]
+    k = np.exp(-0.5 * (np.arange(-int(4 * sig), int(4 * sig) + 1) / sig) ** 2); k /= k.sum()
+    pad = np.pad(s, len(k) // 2, mode="edge")
+    smooth = np.convolve(pad, k, mode="valid")
+    return np.clip((smooth - s) * S["skin_tone_k"], -S["skin_tone_cap"], S["skin_tone_cap"])
+
+
+def process(frames, masks, S, w, h, W=None, off=None):
     vig = vignette(h, w, S["vignette_strength"])
     ema, out = None, []
     for i, fr in enumerate(frames):
@@ -400,9 +508,12 @@ def process(frames, masks, S, w, h):
         if len(ys):
             yy = (np.arange(h, dtype=np.float32) - ys[0]) / max(ys[-1] - ys[0], 1)
             top = (1 - smoothstep(0.0, 0.6, yy))[:, None] * np.ones((1, w), np.float32)
-        P = split_parts(img, m.astype(bool), masks['hair'][i], masks['shorts'][i], masks['fins'][i], S, masks['fin2'][i])
+        if W is not None:      # temporally smoothed, edge-snapped weights from the pre-pass
+            P = {k: W[i][k].astype(np.float32) / 255.0 for k in WKEYS}
+        else:
+            P = split_parts(img, m.astype(bool), masks['hair'][i], masks['shorts'][i], masks['fins'][i], S, masks['fin2'][i])
         sm = P['full'][..., None]
-        x_skin = grade_skin_lab(img, S, vig, top, P['skin'])
+        x_skin = grade_skin_lab(img, S, vig, top, P['skin'], 0.0 if off is None else float(off[i]))
         x_hair = grade_neutral(img, S, vig, S['hair_tint'], S['hair_gain'], S['hair_sat'], top, rim=0.5)
         x_gear = grade_neutral(img, S, vig, (1, 1, 1.03), S['gear_gain'], S['gear_sat'])
         x_sh = grade_neutral(img, S, vig, S['shorts_tint'], S['shorts_gain'], 0.25)
@@ -508,23 +619,29 @@ def main():
     # the seeded tracker loses the fin once it leaves the frame (huge blobs / nothing): keep only plausible frames
     f2 = [m if S["fin2_min_area"] <= m.sum() <= S["fin2_max_area"] else np.zeros_like(m) for m in f2]
     masks["fin2"] = vote3(f2)
-    frames = list(read_frames(a.input, w, h)) if a.preview else None
-    # calibration: skin L* distribution of the clip (sampled frames), fixed for the whole render -> no flicker
     rng = np.random.default_rng(0)
-    smp = []
-    src_iter = frames if frames is not None else read_frames(a.input, w, h)
-    for i, fr in enumerate(src_iter):
-        if i % 6 == 0 and i < min(n, a.calib_max):
-            one = {k: [v[i]] for k, v in masks.items()}
-            P = split_parts(fr.astype(np.float32) / 255.0, one['full'][0].astype(bool), one['hair'][0],
-                            one['shorts'][0], one['fins'][0], S, one['fin2'][0])
-            if (P['skin'] > 0.9).any():
-                smp.append(sample_skin_L(fr.astype(np.float32) / 255.0, P, rng))
+    W = off = None
+    if a.preview:
+        frames = list(read_frames(a.input, w, h))
+        smp = []
+        for i, fr in enumerate(frames):    # calibration: skin L* distribution on sampled frames (fixed for the render -> no flicker)
+            if i % 6 == 0 and i < min(n, a.calib_max):
+                one = {k: [v[i]] for k, v in masks.items()}
+                P = split_parts(fr.astype(np.float32) / 255.0, one['full'][0].astype(bool), one['hair'][0],
+                                one['shorts'][0], one['fins'][0], S, one['fin2'][0])
+                if (P['skin'] > 0.9).any():
+                    smp.append(sample_skin_L(fr.astype(np.float32) / 255.0, P, rng))
+    else:
+        W, gray, skinL, smp = precompute_weights(read_frames(a.input, w, h), masks, S, rng, a.calib_max)
     cx, cy, src_p, ref_p = build_curve(np.concatenate(smp), S)
     S["_curve"] = [cx, cy]
     S["_skin_L_src_pct"], S["_skin_L_ref_pct"] = src_p, ref_p
     print("skin L* src pct", np.round(src_p, 1), "-> ref", np.round(ref_p, 1))
-    if frames is None:
+    if not a.preview:
+        W = smooth_weights(W, gray, S)
+        del gray
+        off = skin_tone_offsets(skinL, S)
+        print("skin tone offsets L*: max |%.2f|" % np.abs(off).max())
         frames = read_frames(a.input, w, h)
     if a.preview:
         idx = [int(x) for x in a.preview.split(",")]
@@ -543,7 +660,7 @@ def main():
     enc = subprocess.Popen(["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
                             "-s", f"{w}x{h}", "-r", fps, "-i", "-", "-c:v", "libx264", "-crf", "12",
                             "-preset", "slow", "-pix_fmt", "yuv420p", str(tmp)], stdin=subprocess.PIPE)
-    for g, _ in process(frames, masks, S, w, h):
+    for g, _ in process(frames, masks, S, w, h, W, off):
         enc.stdin.write(g.tobytes())
     enc.stdin.close(); enc.wait()
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(tmp), "-i", str(a.input), "-map", "0:v",
