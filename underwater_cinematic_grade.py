@@ -36,6 +36,22 @@ SETTINGS = dict(
     bottom_dark=0.45,         # extra darkening toward the lower frame
     surface_boost=0.22,       # cool highlight lift on the bright surface
     # --- subject -----------------------------------------------------
+    skin_match_w=[0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0],  # per percentile (1,5,25,50,75,95,99): pull toward IMAGE 2 (highlights only; the clip's lit share differs)
+    skin_toe=1.0,            # deepen skin shadows/lower mids (L* <= median) by this factor
+    skin_low_gain=3.2,        # body-scale light falloff on L* (sigma 10..35 px band): sculpts the flat torso
+    skin_shadow_stretch=1.5,  # stretch of the lower half of the tone curve around the median (deeper undersides)
+    skin_mid_gain=2.3,       # local contrast on L* (sigma 3..10 px band)
+    skin_fine_gain=1.30,      # texture on L* (< 3 px)
+    skin_a_scale=0.98,        # keep red/orange (a*) controlled; warmth lives in b*
+    skin_b_scale=1.14,
+    skin_mid_chroma=0.85,     # muted bronze midtones (chroma factor at L* 30..65)
+    skin_shadow_chroma=0.85,  # extra desaturation of skin shadows (L* < 25) -> cool-neutral
+    skin_shadow_lift=7.0,     # L* added to the smooth base in the shadows (floor near IMAGE 2's p5 = 29)
+    skin_ref_hi_scale=0.70,   # IMAGE 2's warm-pixel stats come from its lit shoulders only; scale its L* above the median
+    skin_top_light=11.0,      # L* gain for sun-facing top of the body vs. undersides (shoulder tops bright, torso underside deep)
+    skin_hi_knee=62.0,        # highlight roll-off: L* above this is compressed (IMAGE 2 p95 = 83.5)
+    skin_hi_range=15.0,
+    skin_vig_mix=0.30,        # share of the vignette applied to skin
     skin_wb=(1.85, 0.94, 0.72),   # recover red lost to water absorption
     skin_exposure=0.95,
     skin_contrast=1.12,
@@ -252,6 +268,86 @@ def vote3(ms):
     return out
 
 
+REF = json.loads((REPO / "skin_reference.json").read_text())
+_PCT = ["1", "5", "25", "50", "75", "95", "99"]
+
+
+def sample_skin_L(img, P, rng):
+    """L* values (cv2 Lab, 0..100) of this frame's exposed skin, subsampled."""
+    L = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)[..., 0]
+    v = L[P["skin"] > 0.9]
+    if len(v) > 4000:
+        v = rng.choice(v, 4000, replace=False)
+    return v
+
+
+def build_curve(src_L, S):
+    """Monotone tone curve: clip skin L* percentiles -> IMAGE 2 skin percentiles."""
+    src = np.percentile(src_L, [float(x) for x in _PCT])
+    ref = np.array([REF["L_pct"][k] for k in _PCT])
+    ref[3:] = ref[3] + (ref[3:] - ref[3]) * 1.0
+    ref = np.where(ref > 50, 50 + (ref - 50) * S["skin_ref_hi_scale"], ref)
+    w = np.array(S["skin_match_w"])
+    src_t = src.copy()
+    src_t[:4] = src[:4] * S["skin_toe"]            # shadow toe: real depth in the lower half
+    piv = src_t[3]
+    src_t[:3] = piv + (src_t[:3] - piv) * S["skin_shadow_stretch"]
+    src_t = np.clip(src_t, 2, 98)
+    tgt = w * ref + (1 - w) * src_t
+    xs = np.concatenate([[0], src, [100]])
+    ys = np.concatenate([[0], np.maximum.accumulate(tgt), [100]])
+    ys = np.maximum.accumulate(ys)
+    for i in range(1, len(xs)):          # strictly increasing x
+        xs[i] = max(xs[i], xs[i - 1] + 1e-3)
+    return xs.tolist(), ys.tolist(), src.tolist(), ref.tolist()
+
+
+def nblur(x, w, sigma):
+    """Mask-normalised Gaussian blur: skin pixels only, no bleed from water/hair/gear."""
+    num = cv2.GaussianBlur(x * w, (0, 0), sigma)
+    den = cv2.GaussianBlur(w, (0, 0), sigma)
+    return num / np.maximum(den, 1e-3)
+
+
+def grade_skin_lab(img, S, vig, top=None, w=None):
+    """Skin only. L*: IMAGE 2 tone curve on the very smooth base + boosted body-scale,
+    local and fine contrast. a*/b* from IMAGE 2's chroma-vs-L* table: shadows low chroma
+    and cool, mids muted bronze, highlights champagne-gold (b* carries the warmth, a* held back)."""
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+    L = lab[..., 0]
+    w = np.ones(L.shape, np.float32) if w is None else np.clip(w, 0, 1).astype(np.float32)
+    B40, b10, b3 = nblur(L, w, 35), nblur(L, w, 10), nblur(L, w, 3)
+    cx, cy = np.array(S["_curve"][0], np.float32), np.array(S["_curve"][1], np.float32)
+    base = np.interp(B40, cx, cy).astype(np.float32)
+    Lo = (base + S["skin_low_gain"] * (b10 - B40) + S["skin_mid_gain"] * (b3 - b10)
+          + S["skin_fine_gain"] * (L - b3))
+    if top is not None:
+        Lo = Lo + S["skin_top_light"] * (top - 0.35) * np.clip(Lo / 55.0, 0.3, 1.2)
+    Lo = Lo + S["skin_shadow_lift"] * (1 - smoothstep(30, 62, base))
+    k_ = S["skin_hi_knee"]
+    Lo = np.where(Lo > k_, k_ + S["skin_hi_range"] * np.tanh((Lo - k_) / S["skin_hi_range"]), Lo)
+    Lo = np.clip(Lo, 0, 100)
+    bl = np.array([b["L"] for b in REF["bands"]], np.float32)
+    ba = np.array([b["a"] for b in REF["bands"]], np.float32)
+    bb = np.array([b["b"] for b in REF["bands"]], np.float32)
+    Ls = cv2.GaussianBlur(Lo, (0, 0), 2.0)
+    a = np.interp(Ls, bl, ba) * S["skin_a_scale"]
+    b = np.interp(Ls, bl, bb) * S["skin_b_scale"]
+    shadow = 1 - smoothstep(12, 30, Ls)
+    mid = smoothstep(30, 45, Ls) * (1 - smoothstep(55, 70, Ls))
+    k = (1 - (1 - S["skin_shadow_chroma"]) * shadow) * (1 - (1 - S["skin_mid_chroma"]) * mid)
+    a, b = a * k, b * k
+    if top is not None:                   # sun-facing upper body leans champagne-gold (b*), not red
+        hi = smoothstep(55, 85, Ls) * top
+        b = b + 1.5 * hi
+        a = a - 0.3 * hi
+    a = cv2.GaussianBlur(a, (0, 0), 1.5)
+    b = cv2.GaussianBlur(b, (0, 0), 1.5)
+    out = cv2.cvtColor(np.stack([Lo, a, b], -1).astype(np.float32), cv2.COLOR_LAB2RGB)
+    vm = S["skin_vig_mix"]
+    return np.clip(out * ((1 - vm) + vm * vig[..., None]), 0, 1)
+
+
 def merge_masks(mdir: Path, n, shape):
     ms = []
     for i in range(n):
@@ -297,7 +393,7 @@ def process(frames, masks, S, w, h):
             top = (1 - smoothstep(0.0, 0.6, yy))[:, None] * np.ones((1, w), np.float32)
         P = split_parts(img, m.astype(bool), masks['hair'][i], masks['shorts'][i], masks['fins'][i], S)
         sm = P['full'][..., None]
-        x_skin = grade_subject(img, S, gain, vig, top)
+        x_skin = grade_skin_lab(img, S, vig, top, P['skin'])
         x_hair = grade_neutral(img, S, vig, S['hair_tint'], S['hair_gain'], S['hair_sat'], top, rim=0.5)
         x_gear = grade_neutral(img, S, vig, (1, 1, 1.03), S['gear_gain'], S['gear_sat'])
         x_sh = grade_neutral(img, S, vig, S['shorts_tint'], S['shorts_gain'], 0.25)
@@ -353,6 +449,7 @@ def main():
     ap.add_argument("--output", type=Path)
     ap.add_argument("--masks", type=Path)
     ap.add_argument("--preview", default="")
+    ap.add_argument("--calib-max", type=int, default=10**9, help="only calibrate on frames below this index (partial masks)")
     ap.add_argument("--set", action="append", default=[], help="KEY=JSON value")
     a = ap.parse_args()
     S = dict(SETTINGS)
@@ -368,7 +465,24 @@ def main():
     masks = {"full": merge_masks(mdir, n, (h, w))}
     for k in ("hair", "shorts", "fins"):
         masks[k] = vote3(load_part(root / f"{stem}__{k}" / "subject", n, (h, w)))
-    frames = list(read_frames(a.input, w, h)) if a.preview else read_frames(a.input, w, h)
+    frames = list(read_frames(a.input, w, h)) if a.preview else None
+    # calibration: skin L* distribution of the clip (sampled frames), fixed for the whole render -> no flicker
+    rng = np.random.default_rng(0)
+    smp = []
+    src_iter = frames if frames is not None else read_frames(a.input, w, h)
+    for i, fr in enumerate(src_iter):
+        if i % 6 == 0 and i < min(n, a.calib_max):
+            one = {k: [v[i]] for k, v in masks.items()}
+            P = split_parts(fr.astype(np.float32) / 255.0, one['full'][0].astype(bool), one['hair'][0],
+                            one['shorts'][0], one['fins'][0], S)
+            if (P['skin'] > 0.9).any():
+                smp.append(sample_skin_L(fr.astype(np.float32) / 255.0, P, rng))
+    cx, cy, src_p, ref_p = build_curve(np.concatenate(smp), S)
+    S["_curve"] = [cx, cy]
+    S["_skin_L_src_pct"], S["_skin_L_ref_pct"] = src_p, ref_p
+    print("skin L* src pct", np.round(src_p, 1), "-> ref", np.round(ref_p, 1))
+    if frames is None:
+        frames = read_frames(a.input, w, h)
     if a.preview:
         idx = [int(x) for x in a.preview.split(",")]
         sel = {i: frames[i] for i in idx}
