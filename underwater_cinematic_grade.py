@@ -64,6 +64,13 @@ SETTINGS = dict(
     gear_lum=0.17,            # raw luminance below which a diver pixel is gear (lens, frame, snorkel, watch, fins)
     hair_lum=0.30,            # raw luminance below which pixels next to the SAM hair mask count as hair
     hair_grow=9,              # px the SAM hair mask may grow into dark pixels
+    hair_max_area=9500,
+    hair_top_frac=0.42,
+    pole_reach=140,           # px: pole section in front of the body = hole in the diver mask with diver pixels both sides
+    shorts_max_area=12000,
+    fin2_lum_max=0.47,
+    fin2_max_area=12000,
+    fin2_min_area=300,
     fin_grow=22,
     fin_lum_tol=0.10,
     shorts_grow=14,           # px the SAM shorts mask may grow into similarly bright pixels
@@ -189,10 +196,12 @@ def _grow(m, px):
     return cv2.dilate(m.astype(np.uint8), k) > 0
 
 
-def split_parts(img, full, hair_s, shorts_s, fins_s, S):
+def split_parts(img, full, hair_s, shorts_s, fins_s, S, fin2_s=None):
     """Return soft masks skin / hair / gear / shorts (SAM 3.1 part masks refined with
     colour cues inside the diver mask). skin = diver - hair - gear - shorts."""
     L = lum(img)
+    if fin2_s is not None and fin2_s.any():   # second (raised) fin tracked from a seed: only fin-toned pixels, never leg skin
+        fins_s = fins_s | (fin2_s & (L < S["fin2_lum_max"]))
     reach = _grow(full | fins_s, 3)
     # gear: SAM fins + very dark diver pixels (mask lens/frame, snorkel, watch, fins)
     dark = (L < S["gear_lum"]) & reach
@@ -391,7 +400,7 @@ def process(frames, masks, S, w, h):
         if len(ys):
             yy = (np.arange(h, dtype=np.float32) - ys[0]) / max(ys[-1] - ys[0], 1)
             top = (1 - smoothstep(0.0, 0.6, yy))[:, None] * np.ones((1, w), np.float32)
-        P = split_parts(img, m.astype(bool), masks['hair'][i], masks['shorts'][i], masks['fins'][i], S)
+        P = split_parts(img, m.astype(bool), masks['hair'][i], masks['shorts'][i], masks['fins'][i], S, masks['fin2'][i])
         sm = P['full'][..., None]
         x_skin = grade_skin_lab(img, S, vig, top, P['skin'])
         x_hair = grade_neutral(img, S, vig, S['hair_tint'], S['hair_gain'], S['hair_sat'], top, rim=0.5)
@@ -418,6 +427,20 @@ def process(frames, masks, S, w, h):
             near = cv2.dilate(stick, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (61, 61)))
             ring = ((near > 0) & (m == 0) & ((sat < 0.55) | (lum(img) < 0.16))).astype(np.float32)
             stick = np.maximum(stick, ring)
+        if stick.any():  # upper pole: the part in front of the body is a hole in the diver mask (diver pixels on both sides)
+            fu = (m > 0).astype(np.uint8)
+            k = S["pole_reach"]
+            left = cv2.dilate(fu, np.ones((1, k), np.uint8), anchor=(k - 1, 0))     # a diver pixel within k px to the left
+            right = cv2.dilate(fu, np.ones((1, k), np.uint8), anchor=(0, 0))        # ... and to the right
+            hole = ((fu == 0) & (left > 0) & (right > 0)).astype(np.uint8)
+            hole = cv2.morphologyEx(hole, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+            seed = cv2.dilate((stick > 0).astype(np.uint8), np.ones((15, 15), np.uint8))
+            nl2, lab2, _, _ = cv2.connectedComponentsWithStats(np.maximum(hole, (stick > 0).astype(np.uint8)), 8)
+            ids = np.unique(lab2[(seed > 0) & (hole > 0)])
+            ids = ids[ids > 0]
+            if len(ids):
+                upper = np.isin(lab2, ids) & (fu == 0)
+                stick = np.maximum(stick, upper.astype(np.float32))
         stick = cv2.GaussianBlur(cv2.dilate(stick, np.ones((3, 3), np.uint8)), (0, 0), 1.0)[..., None]
         l0 = lum(img)[..., None]
         st_col = np.clip((l0 + (img - l0) * 0.25) * 0.85 * (0.5 + 0.5 * vig[..., None]), 0, 1)
@@ -464,7 +487,27 @@ def main():
     stem = a.input.stem
     masks = {"full": merge_masks(mdir, n, (h, w))}
     for k in ("hair", "shorts", "fins"):
-        masks[k] = vote3(load_part(root / f"{stem}__{k}" / "subject", n, (h, w)))
+        pm = load_part(root / f"{stem}__{k}" / "subject", n, (h, w))
+        if k == "shorts":   # tracker drift onto torso (area explosion): fall back to the last good mask
+            last = None
+            for i, m in enumerate(pm):
+                if m.sum() > S["shorts_max_area"] and last is not None:
+                    pm[i] = last.copy()
+                elif m.sum() <= S["shorts_max_area"]:
+                    last = m
+        if k == "hair":     # tracker swelled over mask + face on some frames: keep the top (hair) part of the blob only
+            for i, m in enumerate(pm):
+                if m.sum() > S["hair_max_area"]:
+                    ys, _ = np.nonzero(m)
+                    cut = ys.min() + S["hair_top_frac"] * (ys.max() - ys.min() + 1)
+                    keep = m.copy()
+                    keep[int(cut):] = False
+                    pm[i] = keep
+        masks[k] = vote3(pm)
+    f2 = load_part(root / f"{stem}__fin2" / "subject", n, (h, w))
+    # the seeded tracker loses the fin once it leaves the frame (huge blobs / nothing): keep only plausible frames
+    f2 = [m if S["fin2_min_area"] <= m.sum() <= S["fin2_max_area"] else np.zeros_like(m) for m in f2]
+    masks["fin2"] = vote3(f2)
     frames = list(read_frames(a.input, w, h)) if a.preview else None
     # calibration: skin L* distribution of the clip (sampled frames), fixed for the whole render -> no flicker
     rng = np.random.default_rng(0)
@@ -474,7 +517,7 @@ def main():
         if i % 6 == 0 and i < min(n, a.calib_max):
             one = {k: [v[i]] for k, v in masks.items()}
             P = split_parts(fr.astype(np.float32) / 255.0, one['full'][0].astype(bool), one['hair'][0],
-                            one['shorts'][0], one['fins'][0], S)
+                            one['shorts'][0], one['fins'][0], S, one['fin2'][0])
             if (P['skin'] > 0.9).any():
                 smp.append(sample_skin_L(fr.astype(np.float32) / 255.0, P, rng))
     cx, cy, src_p, ref_p = build_curve(np.concatenate(smp), S)

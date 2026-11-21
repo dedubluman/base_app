@@ -1,0 +1,65 @@
+{
+  "water_black": 0.03,
+  "water_white": 0.8,
+  "water_gamma": 2.15,
+  "water_detail_keep": 0.45,
+  "ramp": [
+    [
+      0.0,
+      [
+        1,
+        4,
+        12
+      ]
+    ],
+    [
+      0.15,
+      [
+        3,
+        16,
+        38
+      ]
+    ],
+    [
+      0.4,
+      [
+        8,
+        44,
+        82
+      ]
+    ],
+    [
+      0.7,
+      [
+        40,
+        100,
+        150
+      ]
+    ],
+    [
+      1.0,
+      [
+        140,
+        195,
+        225
+      ]
+    ]
+  ],
+  "vignette_strength": 0.8,
+  "vignette_power": 2.1,
+  "bottom_dark": 0.45,
+  "surface_boost": 0.22,
+  "skin_wb": [
+    1.85,
+    1.0,
+    0.72
+  ],
+  "skin_exposure": 0.85,
+  "skin_contrast": 1.12,
+  "skin_warm": 0.3,
+  "skin_sat": 1.0,
+  "skin_hi_gold": 0.55,
+  "subject_rim": 0.1,
+  "mask_feather": 1.2,
+  "exposure_ema": 0.85
+}

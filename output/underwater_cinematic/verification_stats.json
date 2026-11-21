@@ -1,0 +1,11 @@
+{
+ "skin_mean_L_step_max": 1.12,
+ "skin_mean_L_step_median": 0.124,
+ "hair_mean_Lab_median": [
+  19.2,
+  -4.0,
+  -5.6
+ ],
+ "hair_b_max": -5.2,
+ "frames": 236
+}
