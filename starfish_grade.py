@@ -25,10 +25,10 @@ REPO = Path(__file__).resolve().parent
 
 P = dict(
     # environment
-    bg_gamma=2.4, bg_gain=0.95, bg_chroma_keep=0.10,
+    bg_gamma=2.6, bg_gain=0.95, bg_chroma_keep=0.10,
     bg_ramp=[(0.0, (0.008, 0.022, 0.040)), (0.12, (0.022, 0.085, 0.130)),
              (0.30, (0.055, 0.190, 0.250)), (0.55, (0.100, 0.340, 0.430)),
-             (0.80, (0.290, 0.540, 0.600)), (1.0, (0.680, 0.860, 0.890))],
+             (0.80, (0.250, 0.480, 0.550)), (1.0, (0.600, 0.800, 0.840))],
     vignette_strength=0.62, vignette_center=(0.5, 0.58), vignette_power=2.2,
     # fin: keep original luma/chroma, push toward cobalt, lift blacks to navy
     fin_luma_gamma=1.35, fin_chroma_boost=1.8, fin_chan_gamma=(2.0, 1.3, 1.1),
@@ -37,7 +37,7 @@ P = dict(
     star_ramp=[(0.0, (0.070, 0.025, 0.150)), (0.25, (0.200, 0.070, 0.400)),
                (0.55, (0.420, 0.170, 0.750)), (0.80, (0.600, 0.330, 0.950)),
                (1.0, (0.800, 0.640, 1.000))],
-    star_luma_w=(0.60, 0.30, 0.10), star_gamma=1.55, star_detail=0.9, star_vignette=0.35,
+    star_luma_w=(0.60, 0.30, 0.10), star_gamma=1.35, star_stab_sigma=6.0, star_detail=0.9, star_vignette=0.35,
     # exposure stabiliser
     stab_sigma=10.0, stab_power=0.7, stab_clip=(0.8, 1.25),
 )
@@ -155,7 +155,9 @@ class Grader:
         # starfish: gradient map on a red-weighted luma, global normalisation (no flicker)
         wl = np.array(P["star_luma_w"], np.float32)
         Ys = (src * wl).sum(-1)
-        ys = np.clip((Ys - self.star_lo) / (self.star_hi - self.star_lo), 0, 1) ** P["star_gamma"]
+        lo = self.star_lo[min(f, len(self.star_lo) - 1)]
+        hi = self.star_hi[min(f, len(self.star_hi) - 1)]
+        ys = np.clip((Ys - lo) / max(hi - lo, 0.15), 0, 1) ** P["star_gamma"]
         ys = np.clip(ys + P["star_detail"] * (ys - cv2.GaussianBlur(ys, (0, 0), 5)), 0, 1)
         S = apply_ramp(self.star_l, ys)
 
@@ -196,7 +198,7 @@ def prepass(video, stem, cache):
         d = json.loads(f.read_text())
         return d["star_stats"], np.array(d["gains"], np.float32)
     star_root = REPO / "masks" / f"{stem}__starfish"
-    ml, ys = [], []
+    ml, ys, per = [], [], []
     wl = np.array(P["star_luma_w"], np.float32)
     for i, fr in enumerate(decode_all(video, 270)):
         sm = load_union(star_root, i, (fr.shape[0], fr.shape[1]) if False else (1920, 1080))
@@ -204,7 +206,11 @@ def prepass(video, stem, cache):
         Y = fr @ np.array([0.2126, 0.7152, 0.0722], np.float32)
         ml.append(float(Y[~cv2.dilate(sm.astype(np.uint8), np.ones((9, 9), np.uint8)).astype(bool)].mean()))
         if sm.any():
-            ys.append((fr[cv2.erode(sm.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)] * wl).sum(-1))
+            v = (fr[cv2.erode(sm.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)] * wl).sum(-1)
+            ys.append(v)
+            per.append((float(np.percentile(v, 3)), float(np.percentile(v, 99.5))))
+        else:
+            per.append(per[-1] if per else (0.3, 0.8))
     ml = np.array(ml)
     sig = P["stab_sigma"]
     k = np.exp(-0.5 * (np.arange(-int(3 * sig), int(3 * sig) + 1) / sig) ** 2)
@@ -212,7 +218,16 @@ def prepass(video, stem, cache):
     sm_ml = np.convolve(pad, k / k.sum(), "valid")
     gains = np.clip((sm_ml / ml) ** P["stab_power"], *P["stab_clip"])
     allv = np.concatenate(ys)
-    stats = [float(np.percentile(allv, 3)), float(np.percentile(allv, 99.5))]
+    glob_lo, glob_hi = float(np.percentile(allv, 3)), float(np.percentile(allv, 99.5))
+    per = np.array(per)
+    ss = P["star_stab_sigma"]
+    kk = np.exp(-0.5 * (np.arange(-int(3 * ss), int(3 * ss) + 1) / ss) ** 2)
+    sm_lo, sm_hi = (np.convolve(np.pad(per[:, k], (len(kk) // 2,) * 2, mode="edge"), kk / kk.sum(), "valid") for k in (0, 1))
+    # per-frame normalisation (heavily smoothed) keeps the starfish vivid when it falls into shadow,
+    # clamped around the clip-global range so it can never pump
+    lo = np.clip(sm_lo, glob_lo * 0.6, glob_lo * 1.4)
+    hi = np.clip(sm_hi, glob_hi * 0.6, glob_hi * 1.15)
+    stats = [lo.tolist(), hi.tolist()]
     f.write_text(json.dumps({"star_stats": stats, "gains": gains.tolist(), "bg_luma": ml.tolist()}))
     return stats, gains
 
@@ -230,7 +245,7 @@ def main():
     cache.mkdir(exist_ok=True)
     a.out.mkdir(parents=True, exist_ok=True)
     stats, gains = prepass(a.input, stem, cache)
-    print("star luma norm", stats, "gain range", float(gains.min()), float(gains.max()))
+    print("star luma norm lo/hi range", min(stats[0]), max(stats[0]), min(stats[1]), max(stats[1]), "gain range", float(gains.min()), float(gains.max()))
     H, W = 1920, 1080
     G = Grader(stem, (H, W), stats, gains)
 
@@ -258,7 +273,7 @@ def main():
              "-vf", "scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd+full_chroma_int,format=yuv420p",
              "-c:v", "libx264", "-preset", "slow", "-crf", "13", "-profile:v", "high", "-level", "4.2",
              "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv",
-             "-movflags", "+faststart", "-c:a", "copy", "-shortest", str(mp4)], stdin=subprocess.PIPE)
+             "-movflags", "+faststart", "-c:a", "copy", str(mp4)], stdin=subprocess.PIPE)
         rng = np.random.default_rng(1)
         for i, fr in enumerate(decode_all(a.input)):
             g, _, _ = G.grade(fr, i)
