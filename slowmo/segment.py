@@ -49,10 +49,10 @@ def assemble(frame_rgb: np.ndarray, sam: dict) -> np.ndarray:
     g = lambda k: sam[k].astype(np.uint8)
     S = _fill_holes(_drop_small(g("sky"), 4000), 60000)
     # sun disc is not 'sky' for SAM: close it, but only over bright pixels
-    Sc = _open_close(S, 0, 81)
-    S = np.maximum(S, (Sc & (L > 0.78)).astype(np.uint8))
+    Sc = _open_close(S, 0, 151)
+    S = np.maximum(S, (Sc & (L > 0.60)).astype(np.uint8))
     sky_frac = S.mean()
-    Wt = _fill_holes(_drop_small(g("water"), 6000), 20000)
+    Wt = _fill_holes(_drop_small(g("water"), 6000), 150000)   # rock is never enclosed by water
     V = _drop_small(g("green vegetation"), 1500) & (1 - S)
     Rk = np.maximum(g("rock cliff"), g("rock"))
     if sky_frac < 0.03:                                  # fully underwater frame
@@ -64,8 +64,11 @@ def assemble(frame_rgb: np.ndarray, sam: dict) -> np.ndarray:
         return out.astype(np.uint8)
     Wt = Wt & (1 - S)
     V = V & (1 - Wt)
-    Sb = Rk & Wt
+    Sb = _drop_small(Rk & Wt & (L < 0.42).astype(np.uint8), 8000)    # glare patches are not seabed
     # everything above the waterline that is neither sky nor vegetation is rock / cliff
+    # the wave-foam fringe along the waterline belongs to the water, not to the warm rock grade
+    Wd = cv2.dilate(Wt, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+    Wt = Wt | (Wd & (1 - S) & (1 - V) & (L > 0.35).astype(np.uint8))
     R = (1 - S) & (1 - V) & (1 - Wt)
     R = _drop_small(R, 3000)
     Wt = Wt & (1 - Sb)

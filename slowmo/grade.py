@@ -53,7 +53,7 @@ def clarity(x, mask, radius, amt):
 
 def g_sky(x, ys):
     L = lum(x)
-    Lb = blur(L, 25)
+    Lb = blur(L, 45)
     L2 = np.clip(L, 0, 1) ** 1.35 * 0.95 * (1 - 0.30 * (1 - ys) ** 0.8)
     t = smooth(0.18, 0.80, L2)
     col = ramp(t, [(0.0, (0.05, 0.17, 0.40)), (0.45, (0.13, 0.33, 0.60)), (1.0, (0.50, 0.66, 0.82))])
@@ -61,7 +61,7 @@ def g_sky(x, ys):
     sky = np.clip(col * (1 + 1.2 * detail), 0, 1)
     sky = 0.80 * sky + 0.20 * x * np.array([0.9, 1.0, 1.1], np.float32)
     # sun: leave the glow warm and bright instead of tinting it blue
-    sun = smooth(0.80, 0.97, Lb)[..., None]
+    sun = smooth(0.62, 0.97, Lb)[..., None]
     warm = np.clip(x * np.array([1.06, 1.0, 0.86], np.float32) + 0.03 * np.array([1, .75, .3], np.float32), 0, 1)
     return sky * (1 - sun) + warm * sun
 
@@ -70,11 +70,11 @@ def g_rock(x):
     h, s, v = hsv(x)
     h2 = hue_pull(h, 36.0, 0.60)
     s2 = np.clip(s * 1.25 + 0.05, 0, 0.50)
-    v2 = np.clip(v, 0, 1) ** 0.92
+    v2 = np.clip(v * 1.12 + 0.02, 0, 1) ** 0.85
     y = from_hsv(h2, s2, v2)
     L = lum(y)[..., None]
     sh = smooth(0.35, 0.0, L); hi = smooth(0.45, 0.9, L)
-    y = y * (1 - 0.22 * sh) + np.array([0.20, 0.115, 0.07], np.float32) * 0.22 * sh * 1.0
+    y = y * (1 - 0.12 * sh) + np.array([0.20, 0.115, 0.07], np.float32) * 0.12 * sh
     y = y * (1 - 0.18 * hi) + np.array([1.0, 0.82, 0.50], np.float32) * 0.18 * hi * (L / np.maximum(lum(np.array([1.0, .82, .5], np.float32)), 1e-3))
     return np.clip(y, 0, 1)
 
@@ -103,12 +103,12 @@ def g_water(x, ys):
 
 def g_seabed(x, mask):
     h, s, v = hsv(x)
-    h2 = hue_pull(h, 88.0, 0.25)                # towards golden-green
-    y = from_hsv(h2, np.clip(s * 1.45 + 0.05, 0, 0.8), np.clip(v * 1.35, 0, 1) ** 0.95)
+    h2 = hue_pull(h, 88.0, 0.12)                # towards golden-green
+    y = from_hsv(h2, np.clip(s * 1.15 + 0.03, 0, 0.6), np.clip(v * 1.3, 0, 1) ** 0.95)
     L = lum(y)[..., None]
-    y = y + smooth(0.30, 0.75, L) * np.array([0.07, 0.06, -0.015], np.float32)
+    y = y + smooth(0.30, 0.75, L) * np.array([0.035, 0.035, -0.01], np.float32)
     y = y + smooth(0.25, 0.0, L) * np.array([-0.012, 0.025, 0.045], np.float32)
-    return np.clip(clarity(y, mask, 10, 0.45), 0, 1)
+    return np.clip(clarity(y, mask, 10, 0.30), 0, 1)
 
 
 def global_finish(x):
