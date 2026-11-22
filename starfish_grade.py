@@ -31,8 +31,8 @@ P = dict(
              (0.80, (0.290, 0.540, 0.600)), (1.0, (0.680, 0.860, 0.890))],
     vignette_strength=0.62, vignette_center=(0.5, 0.58), vignette_power=2.2,
     # fin: keep original luma/chroma, push toward cobalt, lift blacks to navy
-    fin_luma_gamma=1.05, fin_chroma_boost=1.8, fin_chan_gamma=(1.9, 1.5, 1.12),
-    fin_gain=0.90, fin_floor=(0.035, 0.055, 0.150), fin_local_contrast=0.25,
+    fin_luma_gamma=1.35, fin_chroma_boost=1.8, fin_chan_gamma=(2.0, 1.3, 1.1),
+    fin_gain=0.95, fin_floor=(0.012, 0.022, 0.065), fin_local_contrast=0.25,
     # starfish
     star_ramp=[(0.0, (0.070, 0.025, 0.150)), (0.25, (0.200, 0.070, 0.400)),
                (0.55, (0.420, 0.170, 0.750)), (0.80, (0.600, 0.330, 0.950)),
@@ -145,7 +145,7 @@ class Grader:
         fb = np.clip(Yf[..., None] + chroma * boost, 0, 1)
         fb = fb ** np.array(P["fin_chan_gamma"], np.float32)
         floor = np.array(P["fin_floor"], np.float32)
-        F = np.clip(fb * P["fin_gain"] + floor * (1 - fb.max(-1, keepdims=True)), 0, 1)
+        F = np.clip(fb * P["fin_gain"] + floor * (1 - fb.max(-1, keepdims=True)) ** 2, 0, 1)
         hi = smoothstep(0.7, 0.95, F.mean(-1, keepdims=True))  # keep specular caustics neutral-white, no pink
         F = F * (1 - hi * 0.6) + F.mean(-1, keepdims=True) * np.array([0.9, 1.0, 1.08], np.float32) * hi * 0.6
         lc = P["fin_local_contrast"]
