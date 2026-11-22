@@ -30,12 +30,9 @@ P = dict(
              (0.30, (0.055, 0.190, 0.250)), (0.55, (0.100, 0.340, 0.430)),
              (0.80, (0.290, 0.540, 0.600)), (1.0, (0.680, 0.860, 0.890))],
     vignette_strength=0.62, vignette_center=(0.5, 0.58), vignette_power=2.2,
-    # fin
-    fin_gamma=1.55, fin_gain=1.0,
-    fin_ramp=[(0.0, (0.004, 0.006, 0.030)), (0.25, (0.015, 0.070, 0.300)),
-              (0.50, (0.050, 0.240, 0.800)), (0.75, (0.280, 0.520, 1.000)),
-              (0.92, (0.700, 0.820, 1.000)), (1.0, (0.960, 0.975, 1.000))],
-    fin_keep_orig=0.25,
+    # fin: keep original luma/chroma, push toward cobalt, lift blacks to navy
+    fin_luma_gamma=1.05, fin_chroma_boost=1.8, fin_chan_gamma=(2.1, 1.65, 0.95),
+    fin_gain=0.88, fin_floor=(0.020, 0.035, 0.100), fin_local_contrast=0.25,
     # starfish
     star_ramp=[(0.0, (0.070, 0.025, 0.150)), (0.25, (0.200, 0.070, 0.400)),
                (0.55, (0.440, 0.190, 0.770)), (0.80, (0.620, 0.360, 0.950)),
@@ -106,7 +103,7 @@ class Grader:
         self.stem = stem
         self.star_root = REPO / "masks" / f"{stem}__starfish"
         self.fin_root = REPO / "masks" / f"{stem}__fin"
-        self.bg_l, self.fin_l, self.star_l = (ramp_lut(P[k]) for k in ("bg_ramp", "fin_ramp", "star_ramp"))
+        self.bg_l, self.star_l = (ramp_lut(P[k]) for k in ("bg_ramp", "star_ramp"))
         self.vig = vignette(self.h, self.w, P)[..., None]
         self.star_lo, self.star_hi = star_stats
         self.gains = gains
@@ -117,8 +114,12 @@ class Grader:
         if self.fin_root.exists():
             fm = load_union(self.fin_root, f, (self.h, self.w))
             wf = cv2.GaussianBlur(fm.astype(np.float32), (0, 0), 1.2)
-        else:  # fallback only: blue-dominant / very dark pixels
-            wf = np.zeros_like(ws)
+        else:  # tuning-only fallback: blue-dominant body, holes filled
+            blue = ((rgb[..., 2] - rgb[..., 1]) > 0.07).astype(np.uint8)
+            blue = cv2.morphologyEx(blue, cv2.MORPH_CLOSE, np.ones((61, 61), np.uint8))
+            n, lab, st, _ = cv2.connectedComponentsWithStats(blue)
+            big = 1 + int(np.argmax(st[1:, 4])) if n > 1 else 0
+            wf = cv2.GaussianBlur((lab == big).astype(np.float32), (0, 0), 1.5)
         wf = np.clip(wf, 0, 1) * (1 - ws)
         return ws, wf
 
@@ -137,12 +138,19 @@ class Grader:
             dark = src * (yb / np.maximum(Y, 1e-3))[..., None]
             gray = dark.mean(-1, keepdims=True)
             B = B * (1 - keep) + np.clip(gray + (dark - gray) * 0.5, 0, 1) * keep * np.array([0.7, 0.95, 1.1], np.float32)
-        # fin: blue-black identity, SUBEA lettering / caustics ride on luma
-        yf = np.clip(Y ** P["fin_gamma"] * P["fin_gain"] * 1.15, 0, 1)
-        F = apply_ramp(self.fin_l, yf)
-        ko = P["fin_keep_orig"]
-        orig = np.clip(src * (yf / np.maximum(Y, 1e-3))[..., None], 0, 1)
-        F = F * (1 - ko) + orig * ko * np.array([0.8, 0.95, 1.1], np.float32)
+        # fin: original structure kept (luma + chroma), recoloured toward cobalt, never black
+        Yf = np.clip(Y, 1e-4, 1) ** P["fin_luma_gamma"]
+        chroma = src - Y[..., None]
+        fb = np.clip(Yf[..., None] + chroma * P["fin_chroma_boost"], 0, 1)
+        fb = fb ** np.array(P["fin_chan_gamma"], np.float32)
+        floor = np.array(P["fin_floor"], np.float32)
+        F = np.clip(fb * P["fin_gain"] + floor * (1 - fb.max(-1, keepdims=True)), 0, 1)
+        hi = smoothstep(0.7, 0.95, F.mean(-1, keepdims=True))  # keep specular caustics neutral-white, no pink
+        F = F * (1 - hi * 0.6) + F.mean(-1, keepdims=True) * np.array([0.9, 1.0, 1.08], np.float32) * hi * 0.6
+        lc = P["fin_local_contrast"]
+        if lc:  # gentle local contrast so reflections and lettering stay crisp
+            lum = F.mean(-1, keepdims=True)
+            F = np.clip(F + (lum - cv2.GaussianBlur(lum, (0, 0), 18)[..., None]) * lc, 0, 1)
         # starfish: gradient map on a red-weighted luma, global normalisation (no flicker)
         wl = np.array(P["star_luma_w"], np.float32)
         Ys = (src * wl).sum(-1)
