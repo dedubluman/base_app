@@ -251,13 +251,14 @@ def main():
 
     if a.render:
         fps = "362000/12097"  # source average rate; 362 frames, 1:1
-        master = a.out / f"{stem}_graded_master_prores422hq.mov"
+        mp4 = a.out / f"{stem}_graded_1080p.mp4"
         enc = subprocess.Popen(
             ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb48le", "-s", f"{W}x{H}", "-r", fps,
-             "-i", "-", "-i", str(a.input), "-map", "0:v", "-map", "1:a?", "-c:v", "prores_ks", "-profile:v", "3",
-             "-vendor", "apl0", "-pix_fmt", "yuv422p10le", "-vf", "scale=out_color_matrix=bt709:out_range=tv",
-             "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-c:a", "copy",
-             "-shortest", str(master)], stdin=subprocess.PIPE)
+             "-i", "-", "-i", str(a.input), "-map", "0:v", "-map", "1:a?",
+             "-vf", "scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd+full_chroma_int,format=yuv420p",
+             "-c:v", "libx264", "-preset", "slow", "-crf", "13", "-profile:v", "high", "-level", "4.2",
+             "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv",
+             "-movflags", "+faststart", "-c:a", "copy", "-shortest", str(mp4)], stdin=subprocess.PIPE)
         rng = np.random.default_rng(1)
         for i, fr in enumerate(decode_all(a.input)):
             g, _, _ = G.grade(fr, i)
