@@ -31,13 +31,13 @@ P = dict(
              (0.80, (0.290, 0.540, 0.600)), (1.0, (0.680, 0.860, 0.890))],
     vignette_strength=0.62, vignette_center=(0.5, 0.58), vignette_power=2.2,
     # fin: keep original luma/chroma, push toward cobalt, lift blacks to navy
-    fin_luma_gamma=1.05, fin_chroma_boost=1.8, fin_chan_gamma=(2.1, 1.65, 0.95),
-    fin_gain=0.88, fin_floor=(0.020, 0.035, 0.100), fin_local_contrast=0.25,
+    fin_luma_gamma=1.05, fin_chroma_boost=1.8, fin_chan_gamma=(1.9, 1.5, 1.12),
+    fin_gain=0.90, fin_floor=(0.035, 0.055, 0.150), fin_local_contrast=0.25,
     # starfish
     star_ramp=[(0.0, (0.070, 0.025, 0.150)), (0.25, (0.200, 0.070, 0.400)),
-               (0.55, (0.440, 0.190, 0.770)), (0.80, (0.620, 0.360, 0.950)),
-               (1.0, (0.830, 0.700, 1.000))],
-    star_luma_w=(0.60, 0.30, 0.10), star_vignette=0.35,
+               (0.55, (0.420, 0.170, 0.750)), (0.80, (0.600, 0.330, 0.950)),
+               (1.0, (0.800, 0.640, 1.000))],
+    star_luma_w=(0.60, 0.30, 0.10), star_gamma=1.55, star_detail=0.9, star_vignette=0.35,
     # exposure stabiliser
     stab_sigma=10.0, stab_power=0.7, stab_clip=(0.8, 1.25),
 )
@@ -141,7 +141,8 @@ class Grader:
         # fin: original structure kept (luma + chroma), recoloured toward cobalt, never black
         Yf = np.clip(Y, 1e-4, 1) ** P["fin_luma_gamma"]
         chroma = src - Y[..., None]
-        fb = np.clip(Yf[..., None] + chroma * P["fin_chroma_boost"], 0, 1)
+        boost = np.array([0.25, 0.5, P["fin_chroma_boost"]], np.float32)
+        fb = np.clip(Yf[..., None] + chroma * boost, 0, 1)
         fb = fb ** np.array(P["fin_chan_gamma"], np.float32)
         floor = np.array(P["fin_floor"], np.float32)
         F = np.clip(fb * P["fin_gain"] + floor * (1 - fb.max(-1, keepdims=True)), 0, 1)
@@ -154,7 +155,8 @@ class Grader:
         # starfish: gradient map on a red-weighted luma, global normalisation (no flicker)
         wl = np.array(P["star_luma_w"], np.float32)
         Ys = (src * wl).sum(-1)
-        ys = np.clip((Ys - self.star_lo) / (self.star_hi - self.star_lo), 0, 1) ** 0.95
+        ys = np.clip((Ys - self.star_lo) / (self.star_hi - self.star_lo), 0, 1) ** P["star_gamma"]
+        ys = np.clip(ys + P["star_detail"] * (ys - cv2.GaussianBlur(ys, (0, 0), 5)), 0, 1)
         S = apply_ramp(self.star_l, ys)
 
         out = B * wb[..., None] + F * wf[..., None] + S * ws[..., None]
