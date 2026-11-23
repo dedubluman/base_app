@@ -81,3 +81,62 @@ Known limits: SAM 3.1 cannot text-detect sand (see table above), so sand is deri
 are only marginally confident detections, handled by gap-filling between confident keyframes and a monotonic
 sand-to-water gate; the far (hazy) half of the seabed stays navy by design, so the *median* sand pixel reads teal
 (h ~199) while the near seabed reads Mocha (h ~134).
+
+---
+
+# v2: temporal colour consistency + 15 s optical-flow slow motion
+
+## Diagnosis of the v1 colour fluctuation (`python -m deepgrade.diagnose`)
+
+The source is steady: its background drifts only L .535 -> .521 and hue 197 -> 212 over the whole dive.
+v1 graded the seabed ("sand") and the open water with **two different colour regimes** and cross-faded between
+them while the camera tilted away from the sand (frames 48-64 = 1.5-2.1 s): background L .318 -> .261,
+hue 215 -> 251, chroma .038 -> .069. That regime switch was the greenish-bright opening and the sudden dark-navy
+step. A second, smaller defect: the diver's lit-skin hue drifted 122 -> 70 degrees over the first 1.5 s because the
+skin white balance was clipped at 4x red gain and its likelihood window did not follow the source's skin hue.
+
+## v2 grade (`grade2.py`, `params2.py`, `render2.py`)
+
+* **One base look** for water, sand and the unclaimed remainder (one tone map, one palette). The seabed identity is
+  restrained Mocha earth on lit sand texture and on SAM 3.1 rocks (constant share, hazing out with the gate) on top
+  of that base - never a different overall colour.
+* **Temporally smoothed anchors:** background brightness, skin white balance, skin hue window, skin hue/chroma
+  residual, sky level, "air" fraction: measured per frame, Gaussian-smoothed (6-10 frames), then the grade is a pure
+  function of (frame, weights, smoothed anchors). No per-frame auto-grading.
+* **Natural above-water path:** sky, land (SAM `sky`, `mountain`) get a gentle tone curve only; the sea keeps half
+  of the natural look. No navy spill onto sky or coast.
+* **Diver:** skin white balance applied to skin only (adaptive hue window, closed-loop hue/chroma landing), the
+  swimwear is segmented with SAM 3.1 (`shorts`) and keeps its own colour; mask, snorkel, wristband untouched.
+* **Masks:** SAM 3.1 diver / rocks / water / sky / mountain / snorkel / shorts as before (no regeneration needed:
+  tracked vs independent detections IoU .98-.99, motion-compensated frame-to-frame IoU .977).
+
+## 15 s slow motion (`interp.py`, `rife_model.py`, `final_render.py`)
+
+* Engine: **RIFE v4.26** (Practical-RIFE, official `hzwer/RIFE` release), CPU, arbitrary-timestep interpolation.
+  It was not in the repo; it is the upstream model, not a duplicate. Weights in `checkpoints/rife/` (gitignored).
+* Timing: 230 frames -> 450 frames at 30 fps = exactly 15.000 s; output frame k shows source position
+  min(k*230/450, 229); speed 51.1 % (7.674 s / 15 s). Order preserved, nothing reversed, frozen or dropped.
+* Audio: original AAC, rubberband pitch-preserving stretch to exactly 15.000 s.
+* The surface break (frames ~192-198) is a fast *continuous* camera move, not a cut; RIFE handled it without
+  ghosting (checked on every pair), and an automatic artifact detector with conservative fallbacks (coarser flow, then
+  dissolve) covers any frame it would flag.
+
+## Measured result (v2 final, `underwater_cinematic_final_15s.mp4`)
+
+| Check | v1 (previous) | v2 (final) |
+|---|---|---|
+| Underwater background colour range over the dive (dE-ok x100) | 10.3 | 2.7 (3.4 in the delivered 15 s video; source itself 6.5) |
+| Worst 12-frame background change | 7.8 | 1.9 |
+| Background hue / L over frames 0-119 | 206-254 deg / .251-.318 | 251-255 deg / .235-.247 |
+| High-pass flicker of the background | .48 | .21-.24 (source noise floor .19) |
+| Lit-skin hue over the dive | 70-122 deg | 67-82 deg (chroma .029-.038, L .56-.64) |
+| Shorts colour | drifted to lime (hue 138-145) | own pale-cyan white kept (hue 205-207) |
+| Duration / frames / fps | 7.674 s / 230 / 30000:1001 | **15.000000 s / 450 / 30:1**, audio stream 15.000000 s |
+| Interpolation accuracy (leave-one-out, 21 frames) | n/a | RIFE 28.1 dB vs plain average 25.2 dB vs frame repeat 22.6 dB |
+| Artifact detector | n/a | 0 of 450 frames flagged (max local spike 1.72 vs threshold 1.9) |
+| Audio | copied | rubberband stretch, best-match frequency scale 0.98 (pitch kept), loudness restored to the source's -27 dB mean |
+
+Limits: the seabed's Mocha identity lives on the rocks and lit sand texture; the sand itself shares the navy base on
+purpose (that sharing is what removes the fluctuation). The waterline is a fast continuous camera move; RIFE
+interpolates it cleanly, but every frame there is synthesized from two motion-blurred neighbours, so it is softer than
+the rest. The `interp_loo` numbers at the waterline (~21 dB) are low for the same reason (that test skips a whole frame).
