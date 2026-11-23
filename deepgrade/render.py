@@ -30,10 +30,16 @@ REPO = Path(__file__).resolve().parent.parent
 
 def load_weights(fin: Path, t: int) -> dict:
     w = {}
-    for k in "DSRWU":
+    for k in "DSRMWU":
+        if not (fin / k).exists():
+            w[k] = np.zeros_like(w["D"]) if "D" in w else 0
+            continue
         w[k] = cv2.imread(str(fin / k / f"{t:05d}.png"), 0).astype(np.float32) / 255.0
     tot = sum(w.values())
-    return {k: v / np.maximum(tot, 1e-3) for k, v in w.items()}
+    out = {k: v / np.maximum(tot, 1e-3) for k, v in w.items()}
+    pf = fin / "P" / f"{t:05d}.png"                       # swimwear inside the diver (auxiliary mask)
+    out["P"] = (cv2.imread(str(pf), 0).astype(np.float32) / 255.0) if pf.exists() else np.zeros_like(out["D"])
+    return out
 
 
 def smooth_series(vals: list, sigma: float, log: bool = False):

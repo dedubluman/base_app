@@ -31,9 +31,13 @@ EXTRA = {
 }
 
 
+# Swimwear: segmented so the skin white balance can leave it alone (stage "shorts").
+SHORTS = dict(prompt="shorts", det=0.3, out_prob=0.3, keep_prob=0.30, min_area=0.0005)
+
+
 def stuff_frames(name: str, n: int, stride: int) -> list[int]:
     lo, hi = {"rocks": (0, 120), "water": (45, n - 1), "sky": (165, n - 1),
-              "mountain": (186, n - 1), "snorkel": (60, n - 1)}[name]
+              "mountain": (186, n - 1), "snorkel": (60, n - 1), "shorts": (0, 184)}[name]
     fr = list(range(lo, hi + 1, stride))
     if name != "rocks" and fr[-1] != n - 1:
         fr.append(n - 1)
@@ -74,6 +78,10 @@ def main() -> None:
         for name, c in STUFF.items():
             sam.detect_frames(mdir, name, c["prompt"], stuff_frames(name, n, a.stuff_stride),
                               c["det"], c["out_prob"], c["keep_prob"])
+    if "shorts" in stages:
+        c = SHORTS
+        sam.detect_frames(mdir, "shorts", c["prompt"], stuff_frames("shorts", n, 4),
+                          c["det"], c["out_prob"], c["keep_prob"], c["min_area"])
     if "extra" in stages:
         for name, c in EXTRA.items():
             sam.detect_frames(mdir, name, c["prompt"], stuff_frames(name, n, a.stuff_stride),

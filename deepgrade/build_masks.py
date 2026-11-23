@@ -120,13 +120,14 @@ def main() -> None:
     ap.add_argument("--video", type=Path, default=REPO / "inputs/player_export.mov")
     ap.add_argument("--range", nargs=2, type=int, default=None)
     ap.add_argument("--params", type=Path, default=None)
+    ap.add_argument("--out", default="final_v2", help="folder name under masks/<stem>/")
     a = ap.parse_args()
     p = Params.load(a.params) if a.params else Params()
     info = probe(a.video)
     n, W, H = info.n_frames, info.width, info.height
     mdir = REPO / "masks" / a.video.stem
-    fin = mdir / "final"
-    for k in "DSRWU":
+    fin = mdir / a.out
+    for k in "DSRMWUP":
         (fin / k).mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     lo, hi = a.range if a.range else (0, n - 1)
@@ -138,6 +139,17 @@ def main() -> None:
         grays.append(np.clip(g * 255 + .5, 0, 255).astype(np.uint8))
     assert len(grays) == n, (len(grays), n)
     print(f"[masks] decoded {n} gray frames {time.time()-t0:.0f}s", flush=True)
+    # hard scene cuts (the camera breaking the surface): large frame-to-frame change that no
+    # motion model explains. Used by the grade (no smoothing across a cut) and by the retimer.
+    gd = np.array([np.abs(grays[i].astype(np.float32) - grays[i - 1].astype(np.float32)).mean()
+                   for i in range(1, n)])
+    med = np.median(gd)
+    ratio = [gd[i] / max(np.median(np.r_[gd[max(0, i - 5):i], gd[i + 1:i + 6]]), 1e-3)
+             for i in range(len(gd))]
+    cuts = [int(i + 1) for i in range(len(gd)) if ratio[i] > 2.5 and gd[i] > 8.0]   # isolated spikes only
+    (mdir / "scene_cuts.json").write_text(json.dumps({"cuts": cuts, "frame_diff": gd.tolist(),
+                                                      "spike_ratio": [float(r) for r in ratio]}))
+    print(f"[masks] median frame diff {med:.2f}; hard cuts at frames {cuts}", flush=True)
 
     shape = (H, W)
     diver_k = keyframes(mdir / "diver", shape)
@@ -145,6 +157,7 @@ def main() -> None:
     rocks_raw = keyframes(mdir / "rocks", shape)
     rocks_k = smooth_keys(fill_gaps(rocks_raw, sorted(rocks_raw), 3), p.temporal_sigma_keyframes)
     mount_k = smooth_keys(keyframes(mdir / "mountain", shape), p.temporal_sigma_keyframes)
+    shorts_k = keyframes(mdir / "shorts", shape)           # SAM 3.1 "shorts": swimwear, kept out of the skin WB
     water_raw = keyframes(mdir / "water", shape)
     wk = sorted(water_raw)
     water_hold = fill_gaps({k: v for k, v in water_raw.items() if k < 190}, [k for k in wk if k < 190],
@@ -185,6 +198,7 @@ def main() -> None:
 
     # --- pass 1: raw diver (+snorkel) per frame, flows cached per neighbour pair
     raw: dict[int, np.ndarray] = {}
+    rawP: dict[int, np.ndarray] = {}
     t1 = time.time()
     for t in range(max(0, lo - 1), min(n - 1, hi + 1) + 1):
         d = diver_raw(t, diver_k)
@@ -192,6 +206,10 @@ def main() -> None:
             continue
         s = diver_raw(t, snork_k) if snork_k else None
         raw[t] = d if s is None else np.maximum(d, s)
+        if shorts_k:
+            rp = diver_raw(t, shorts_k)
+            if rp is not None:
+                rawP[t] = rp
     print(f"[masks] raw diver masks {len(raw)} frames {time.time()-t1:.0f}s", flush=True)
 
     # --- pass 2: temporal smoothing + refinement + composition
@@ -214,11 +232,16 @@ def main() -> None:
             D = acc / ws
             D = refine_diver(D, luma, p.diver_feather_px, p.diver_guided_r, p.diver_guided_eps)
         S = interp_linear(sky_k, t, shape)
-        R = np.maximum(interp_linear(rocks_k, t, shape, fade=12), interp_linear(mount_k, t, shape))
-        Wt = interp_linear(water_k, t, shape)
+        R = interp_linear(rocks_k, t, shape, fade=12)
+        M = interp_linear(mount_k, t, shape)
+        Wt = interp_linear(water_k, t, shape, fade=18)   # SAM's first 'water' hit is marginal: ease it in
         wcov = float((Wt * (1 - D)).mean() / max((1 - D).mean(), 1e-3))
         wcovs[t] = wcov
         stage2[t] = (D, S, R, Wt)
+        np.save(fin / f"_tmp_{t:05d}_M.npy", M.astype(np.float16))
+        Pm = rawP.get(t)
+        Pm = np.zeros(shape, np.float32) if Pm is None else np.clip(feather(Pm, 1.5), 0, 1) * np.clip(D * 1.5, 0, 1)
+        cv2.imwrite(str(fin / "P" / f"{t:05d}.png"), np.clip(Pm * 255 + .5, 0, 255).astype(np.uint8))
         if t % 20 == 0:
             print(f"[masks] frame {t} wcov={wcov:.3f} {time.time()-t0:.0f}s", flush=True)
         # write intermediate state so the compose pass can use the smoothed gate
@@ -245,10 +268,11 @@ def main() -> None:
         S = np.load(fin / f"_tmp_{t:05d}_S.npy").astype(np.float32)
         R = np.load(fin / f"_tmp_{t:05d}_R.npy").astype(np.float32)
         Wt = np.load(fin / f"_tmp_{t:05d}_W.npy").astype(np.float32)
-        w = compose(D, S, R, Wt, gate_json[t], p.region_feather_px)
+        M = np.load(fin / f"_tmp_{t:05d}_M.npy").astype(np.float32)
+        w = compose(D, S, R, M, Wt, gate_json[t], p.region_feather_px)
         for kname, arr in w.items():
             cv2.imwrite(str(fin / kname / f"{t:05d}.png"), np.clip(arr * 255 + .5, 0, 255).astype(np.uint8))
-        for nm in "DSRW":
+        for nm in "DSRWM":
             (fin / f"_tmp_{t:05d}_{nm}.npy").unlink(missing_ok=True)
     print(f"[masks] done frames {lo}-{hi} in {time.time()-t0:.0f}s", flush=True)
 

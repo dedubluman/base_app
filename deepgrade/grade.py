@@ -90,6 +90,8 @@ def frame_stats(rgb: np.ndarray, lab0: np.ndarray, w: dict, p: Params) -> dict:
         band_[y0:int(y0 + 0.62 * (y1 - y0 + 1))] = True
         C0 = np.hypot(lab0[..., 1], lab0[..., 2])
         sel = D & band_ & (L0 > 0.50) & (L0 < 0.86) & (C0 < 0.10)
+        if "P" in w:
+            sel &= w["P"] < 0.3                                 # swimwear is not skin
         if sel.sum() > 1500:
             lin = srgb_to_lin(rgb[sel])
             m = np.median(lin, axis=0)
@@ -100,8 +102,11 @@ def frame_stats(rgb: np.ndarray, lab0: np.ndarray, w: dict, p: Params) -> dict:
             g = tgt / np.maximum(m, 1e-4)
             Y = np.array([0.2126, 0.7152, 0.0722], np.float32)
             g = g * (Y @ m) / max(float(Y @ (g * m)), 1e-6)
-            st["skin_gains"] = np.clip(g, 0.35, 4.0).tolist()
+            st["skin_gains"] = np.clip(g, 0.35, 5.5).tolist()
+            st["skin_lin"] = m.tolist()
             st["skin_med"] = Lm
+            ms = np.median(lab0[sel][:, 1:], axis=0)             # source skin hue: the window follows it
+            st["skin_hue_src"] = float(np.degrees(np.arctan2(ms[1], ms[0])) % 360)
     return st
 
 

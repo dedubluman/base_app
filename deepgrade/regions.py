@@ -49,17 +49,18 @@ def refine_diver(raw: np.ndarray, luma: np.ndarray, feather_px: float, r: int,
     return feather(np.clip(g, 0, 1), feather_px)
 
 
-def compose(D, S, R, Wt, sand_gate: float, region_feather: float):
+def compose(D, S, R, M, Wt, sand_gate: float, region_feather: float):
     """Disjoint soft region weights (sum to 1).
 
-    D diver, S sky, R rocks, Wt water (SAM 3.1 masks). Whatever SAM did not
-    claim is the 'unclaimed' remainder: seabed sand while the camera looks at
-    the bottom (sand_gate=1), open water otherwise (sand_gate=0).
+    D diver, S sky, M land/hills, R rocks, Wt water (all SAM 3.1 masks). Whatever SAM did
+    not claim is the 'unclaimed' remainder: seabed sand while the camera looks at the
+    bottom (sand_gate=1), open water otherwise (sand_gate=0).
     """
     S = feather(S, region_feather) * (1 - D)
-    R = feather(R, region_feather) * (1 - D) * (1 - S)
-    Wt = feather(Wt, region_feather) * (1 - D) * (1 - S) * (1 - R)
-    rem = np.clip(1 - D - S - R - Wt, 0, 1)
-    return {"D": D, "S": S, "R": R,
+    M = feather(M, region_feather) * (1 - D) * (1 - S)
+    R = feather(R, region_feather) * (1 - D) * (1 - S) * (1 - M)
+    Wt = feather(Wt, region_feather) * (1 - D) * (1 - S) * (1 - M) * (1 - R)
+    rem = np.clip(1 - D - S - M - R - Wt, 0, 1)
+    return {"D": D, "S": S, "R": R, "M": M,
             "W": Wt + rem * (1 - sand_gate),
             "U": rem * sand_gate}
