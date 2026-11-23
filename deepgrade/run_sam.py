@@ -33,7 +33,7 @@ EXTRA = {
 
 def stuff_frames(name: str, n: int, stride: int) -> list[int]:
     lo, hi = {"rocks": (0, 120), "water": (45, n - 1), "sky": (165, n - 1),
-              "mountain": (186, n - 1), "snorkel": (120, n - 1)}[name]
+              "mountain": (186, n - 1), "snorkel": (60, n - 1)}[name]
     fr = list(range(lo, hi + 1, stride))
     if name != "rocks" and fr[-1] != n - 1:
         fr.append(n - 1)

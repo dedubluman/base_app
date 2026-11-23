@@ -24,16 +24,29 @@ def guided_filter(guide: np.ndarray, p: np.ndarray, r: int, eps: float) -> np.nd
 
 
 def refine_diver(raw: np.ndarray, luma: np.ndarray, feather_px: float, r: int,
-                 eps: float) -> np.ndarray:
+                 eps: float, band_in: int = 4, band_out: int = 7) -> np.ndarray:
     """Snap a SAM soft mask to real image edges (hair, fingers, snorkel) and
-    keep a natural, slightly soft alpha (no cut-out look)."""
+    keep a natural, slightly soft alpha (no cut-out look).
+
+    The guided filter may only decide inside a narrow band around SAM's edge
+    (``band_in`` px inside, ``band_out`` px outside): the solid interior stays 1,
+    the far exterior stays 0, so dark hair / gear inside the diver can never be
+    punched out and thin parts can never leak.
+    """
     m = np.clip(raw.astype(np.float32), 0, 1)
     m = feather(m, 1.0)
-    g = guided_filter(luma, m, r, eps)
-    g = np.clip(g, 0, 1)
+    g = np.clip(guided_filter(luma, m, r, eps), 0, 1)
     # gentle S-curve: keeps a soft alpha edge but removes the guided filter's grey halo
     g = np.clip((g - 0.5) * 1.35 + 0.5, 0, 1)
-    return feather(g, feather_px)
+    hard = (m > 0.5).astype(np.uint8)
+    k_in = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * band_in + 1, 2 * band_in + 1))
+    k_out = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * band_out + 1, 2 * band_out + 1))
+    inner = cv2.erode(hard, k_in).astype(np.float32)
+    outer = cv2.dilate((m > 0.2).astype(np.uint8), k_out).astype(np.float32)
+    inner = feather(inner, 1.5)
+    outer = feather(outer, 1.5)
+    g = np.maximum(g * outer, inner)
+    return feather(np.clip(g, 0, 1), feather_px)
 
 
 def compose(D, S, R, Wt, sand_gate: float, region_feather: float):

@@ -64,33 +64,48 @@ def verify(src: Path, out: Path) -> bool:
 
 
 def masks_qc(video: Path) -> None:
+    """Temporal stability of the final diver weight.
+
+    Plain consecutive-frame IoU mixes real motion with flicker, so the previous
+    mask is first warped into the current frame with DIS optical flow
+    (motion-compensated IoU); what is left is jitter / tracking error."""
+    from shades.io import iter_frames, probe
+
+    from .build_masks import flow, warp_to
+
+    info = probe(video)
     fin = REPO / "masks" / video.stem / "final"
-    frames = sorted(int(p.stem) for p in (fin / "D").glob("*.png"))
+    W, H = info.width, info.height
+    grays = []
+    for fr in iter_frames(video, info, scale_w=W // 2):
+        g = 0.2126 * fr[..., 0] + 0.7152 * fr[..., 1] + 0.0722 * fr[..., 2]
+        grays.append(np.clip(g * 255 + .5, 0, 255).astype(np.uint8))
     prev, rows = None, []
-    for t in frames:
+    for t in range(info.n_frames):
         D = cv2.imread(str(fin / "D" / f"{t:05d}.png"), 0).astype(np.float32) / 255
-        area = float(D.mean())
-        if prev is not None:
-            a, b = prev > 0.5, D > 0.5
+        if prev is not None and prev.max() > 0.5 and D.max() > 0.5:
+            mc = warp_to(prev, flow(grays[t], grays[t - 1]), (W, H))
+            a, b = mc > 0.5, D > 0.5
             u = np.logical_or(a, b).sum()
-            iou = float(np.logical_and(a, b).sum() / u) if u else 1.0
-            flick = float(np.abs(D - prev).mean())
+            iou_mc = float(np.logical_and(a, b).sum() / u) if u else 1.0
+            a0 = prev > 0.5
+            u0 = np.logical_or(a0, b).sum()
+            iou = float(np.logical_and(a0, b).sum() / u0) if u0 else 1.0
         else:
-            iou, flick = 1.0, 0.0
-        rows.append((t, area, iou, flick))
+            iou_mc = iou = 1.0
+        rows.append((t, float(D.mean()), iou, iou_mc))
         prev = D
     arr = np.array(rows)
     print(f"frames {len(rows)}  diver area {arr[:,1].min():.4f}..{arr[:,1].max():.4f}")
-    print(f"consecutive-frame IoU: min {arr[:,2].min():.3f} mean {arr[:,2].mean():.3f}")
-    bad = arr[(arr[:, 2] < 0.93)]
-    print("frames with IoU<0.93:", [(int(r[0]), round(float(r[2]), 3)) for r in bad][:20])
-    # area jumps (relative) = potential tracking failures
-    da = np.abs(np.diff(arr[:, 1])) / np.maximum(arr[:-1, 1], 1e-4)
-    jumps = [(int(arr[i + 1, 0]), round(float(da[i]), 3)) for i in np.argsort(-da)[:5]]
-    print("largest relative area jumps:", jumps)
+    print(f"plain IoU          min {arr[:,2].min():.3f}  mean {arr[:,2].mean():.3f}")
+    print(f"motion-comp. IoU   min {arr[:,3].min():.3f}  mean {arr[:,3].mean():.3f}  "
+          f"p5 {np.percentile(arr[:,3],5):.3f}")
+    bad = arr[arr[:, 3] < 0.90]
+    print("frames with motion-compensated IoU < 0.90:",
+          [(int(r[0]), round(float(r[3]), 3)) for r in bad])
     (REPO / "masks" / video.stem / "qc_masks.json").write_text(json.dumps(
         {"frames": arr[:, 0].astype(int).tolist(), "area": arr[:, 1].tolist(),
-         "iou": arr[:, 2].tolist(), "flicker": arr[:, 3].tolist()}))
+         "iou": arr[:, 2].tolist(), "iou_motion_compensated": arr[:, 3].tolist()}))
 
 
 def sheet(src: Path, out: Path, dst: Path, idx: list[int]) -> None:

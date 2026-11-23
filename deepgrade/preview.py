@@ -60,6 +60,7 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=REPO / "output/preview")
     ap.add_argument("--params", type=Path, default=None)
     ap.add_argument("--scale", type=float, default=0.5)
+    ap.add_argument("--final", action="store_true", help="use the built per-frame weights (masks/<stem>/final)")
     a = ap.parse_args()
     p = Params.load(a.params) if a.params else Params()
     idx = [int(x) for x in a.frames.split(",")]
@@ -70,8 +71,14 @@ def main() -> None:
     rows, stats = [], {}
     for f in idx:
         rgb = frames[f]
-        w, gate = preview_weights(mdir, f, rgb, p)
+        if a.final:
+            from .render import load_weights
+            w = load_weights(mdir / "final", f)
+            gate = json.loads((mdir / "final/gate.json").read_text())["gate"][str(f)]
+        else:
+            w, gate = preview_weights(mdir, f, rgb, p)
         st = frame_stats(rgb, rgb_to_oklab(rgb), w, p)
+        st["gate"] = gate
         out = grade_frame(rgb, w, st, p)
         cv2.imwrite(str(a.out / f"graded_{f:03d}.png"),
                     cv2.cvtColor((out * 65535 + .5).astype(np.uint16), cv2.COLOR_RGB2BGR))

@@ -135,20 +135,24 @@ def grade_frame(rgb: np.ndarray, w: dict, st: dict, p: Params,
     sm = 0.52 if sm is None or np.isnan(sm) else sm
     Ltarget = p.sand_L_bottom + (p.sand_L_top - p.sand_L_bottom) * (1 - yy) ** 1.3
     Ls = Ltarget + p.sand_L_slope * (L0 - sm)
+    gate = float(st.get("gate", 1.0))   # 1 = camera on the seabed, 0 = open water
     seab = np.clip(U + R, 0, 1)
     bp = band(L0, seab)
     Lu = Ls + (p.sand_local_gain - 1) * bp
-    Lr = Ls + p.rock_L_delta + (p.rock_local_gain - 1) * bp
+    # as the camera leaves the seabed the rocks sink into the water haze (no floating island)
+    Lr = (Ls + p.rock_L_delta * (0.4 + 0.6 * gate)
+          + (p.rock_local_gain - 1) * (0.55 + 0.45 * gate) * bp - p.rock_haze_dim * (1 - gate))
     Lu = p.water_L_floor + np.logaddexp(0, (Lu - p.water_L_floor) * 40) / 40
     Lr = p.water_L_floor + np.logaddexp(0, (Lr - p.water_L_floor) * 40) / 40
     au, bu = sand_palette(Lu, p)
     ar, br = sand_palette(Lr, p, p.rock_C_boost)
     # far / hazy seabed keeps the water's navy; near seabed and rocks carry the Mocha earth
-    mo = p.sand_mocha_top + (p.sand_mocha_bottom - p.sand_mocha_top) * smoothstep(0.05, 0.95, yy)
+    mo = p.sand_mocha_top + (p.sand_mocha_bottom - p.sand_mocha_top) * smoothstep(0.05, p.sand_mocha_span, yy)
+    # distance haze over the seabed = the water's navy; near seabed carries the earth
     awu, bwu = water_palette(Lu, p)
     awr, bwr = water_palette(Lr, p)
     au, bu = polar_mix(awu, bwu, au, bu, mo)
-    mo_r = np.clip(mo + p.rock_mocha_extra, 0, p.rock_mocha)   # rocks: always earthier than neighbouring sand, same distance ramp
+    mo_r = np.clip(mo + p.rock_mocha_extra, 0, p.rock_mocha) * (0.6 + 0.4 * gate)   # earthier than the sand around, hazier in open water
     ar, br = polar_mix(awr, bwr, ar, br, mo_r)
     au = au + p.sand_detail_chroma * da
     bu = bu + p.sand_detail_chroma * db
@@ -156,7 +160,11 @@ def grade_frame(rgb: np.ndarray, w: dict, st: dict, p: Params,
     br = br + p.sand_detail_chroma * db
 
     # ---------------- SKY / above water
-    Lsky = p.sky_L_offset + p.sky_L_gain * L0
+    skm = st.get("sky_med")
+    skm = 0.86 if skm is None or np.isnan(skm) else skm
+    # anchored + amplified around the frame's sky brightness: keeps (and slightly deepens) the
+    # natural top-to-horizon gradient instead of flattening it
+    Lsky = p.sky_L_anchor + p.sky_L_slope * (L0 - skm)
     ak, bk = hc_to_ab(p.sky_hue_cool, p.sky_C_cool)
     # keep a share of the horizon glow, rotated toward silver (pastel, not saturated)
     ak = ak + p.sky_chroma_keep * a0 * 0.8
@@ -201,7 +209,7 @@ def grade_frame(rgb: np.ndarray, w: dict, st: dict, p: Params,
 
     # ---------------- highlights & particles -> Silver Sand (outside the diver)
     nd = 1 - D
-    hw = smoothstep(p.highlight_start, p.highlight_end, L0) * nd
+    hw = smoothstep(p.highlight_start, p.highlight_end, L0) * nd * (1 - 0.9 * S)   # sky keeps its own colour
     k = int(p.particle_scale_px)
     th = L0 - cv2.morphologyEx(L0, cv2.MORPH_OPEN,
                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))

@@ -92,6 +92,8 @@ def main() -> None:
     a.out.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
 
+    gates = json.loads((fin / "gate.json").read_text())["gate"]
+
     # ---- pass 1: anchors
     rows = {}
     for t, rgb in enumerate(iter_frames(a.video, info)):
@@ -113,6 +115,7 @@ def main() -> None:
     smoothed = {}
     for i, t in enumerate(ts):
         d = {k: sm[k][i] for k in sm}
+        d["gate"] = gates[str(t)]
         if gains[0][i] is not None:
             d["skin_gains"] = [gains[c][i] for c in range(3)]
         smoothed[t] = d

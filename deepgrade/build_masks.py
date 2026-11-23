@@ -78,6 +78,28 @@ def interp_linear(keys: dict[int, np.ndarray], t: int, shape, fade: int = 6) -> 
     return (1 - a) * keys[lo] + a * keys[hi]
 
 
+def fill_gaps(keys: dict[int, np.ndarray], grid: list[int], max_gap: int,
+              hold: bool = False, thr: float = 0.004) -> dict[int, np.ndarray]:
+    """SAM's detector is only marginally confident on stuff-classes, so a keyframe can miss
+    between two confident detections. Fill such a miss from the surrounding detections:
+    linear in time (rocks) or hold the previous mask (water: it stays water once seen).
+    Only gaps of <= max_gap keyframes *between* detections are filled; the start and the end
+    of the class's presence are left to the fade-in/out."""
+    out = dict(keys)
+    present = [k for k in grid if k in keys and keys[k].mean() > thr]
+    for a, b in zip(present, present[1:]):
+        between = [k for k in grid if a < k < b]
+        if not between or len(between) > max_gap:
+            continue
+        for k in between:
+            if hold:
+                out[k] = keys[a]
+            else:
+                w = (k - a) / (b - a)
+                out[k] = (1 - w) * keys[a] + w * keys[b]
+    return out
+
+
 def smooth_keys(keys: dict[int, np.ndarray], sigma: float) -> dict[int, np.ndarray]:
     if sigma <= 0 or len(keys) < 3:
         return keys
@@ -120,9 +142,15 @@ def main() -> None:
     shape = (H, W)
     diver_k = keyframes(mdir / "diver", shape)
     snork_k = smooth_keys(keyframes(mdir / "snorkel", shape), 0.0)
-    rocks_k = smooth_keys(keyframes(mdir / "rocks", shape), p.temporal_sigma_keyframes)
+    rocks_raw = keyframes(mdir / "rocks", shape)
+    rocks_k = smooth_keys(fill_gaps(rocks_raw, sorted(rocks_raw), 3), p.temporal_sigma_keyframes)
     mount_k = smooth_keys(keyframes(mdir / "mountain", shape), p.temporal_sigma_keyframes)
-    water_k = smooth_keys(keyframes(mdir / "water", shape), p.temporal_sigma_keyframes)
+    water_raw = keyframes(mdir / "water", shape)
+    wk = sorted(water_raw)
+    water_hold = fill_gaps({k: v for k, v in water_raw.items() if k < 190}, [k for k in wk if k < 190],
+                           max_gap=20, hold=True)
+    water_hold.update({k: v for k, v in water_raw.items() if k >= 190})
+    water_k = smooth_keys(water_hold, p.temporal_sigma_keyframes)
     sky_k = smooth_keys(keyframes(mdir / "sky", shape), p.temporal_sigma_keyframes)
     print(f"[masks] keyframes diver={len(diver_k)} snorkel={len(snork_k)} rocks={len(rocks_k)} "
           f"water={len(water_k)} sky={len(sky_k)} mountain={len(mount_k)}", flush=True)
@@ -186,7 +214,7 @@ def main() -> None:
             D = acc / ws
             D = refine_diver(D, luma, p.diver_feather_px, p.diver_guided_r, p.diver_guided_eps)
         S = interp_linear(sky_k, t, shape)
-        R = np.maximum(interp_linear(rocks_k, t, shape), interp_linear(mount_k, t, shape))
+        R = np.maximum(interp_linear(rocks_k, t, shape, fade=12), interp_linear(mount_k, t, shape))
         Wt = interp_linear(water_k, t, shape)
         wcov = float((Wt * (1 - D)).mean() / max((1 - D).mean(), 1e-3))
         wcovs[t] = wcov
@@ -203,10 +231,11 @@ def main() -> None:
     # --- sand/water gate: from water coverage, smoothed in time
     ts = sorted(wcovs)
     wc = np.array([wcovs[t] for t in ts], np.float32)
-    k = np.exp(-0.5 * (np.arange(-9, 10) / 3.0) ** 2)
+    wc_mono = np.maximum.accumulate(wc)          # once the camera sees open water the seabed is gone
+    k = np.exp(-0.5 * (np.arange(-24, 25) / 8.0) ** 2)
     k /= k.sum()
-    wcs = np.convolve(np.pad(wc, 9, mode="edge"), k, mode="valid")
-    s_ = np.clip((wcs - 0.03) / (0.30 - 0.03), 0, 1)
+    wcs = np.convolve(np.pad(wc_mono, 24, mode="edge"), k, mode="valid")
+    s_ = np.clip((wcs - 0.02) / (0.90 - 0.02), 0, 1)
     gate = 1 - s_ * s_ * (3 - 2 * s_)
     gate_json = {int(t): float(g) for t, g in zip(ts, gate)}
     (fin / "gate.json").write_text(json.dumps({"wcov": {int(t): float(w) for t, w in zip(ts, wc)},

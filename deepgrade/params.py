@@ -47,8 +47,9 @@ class Params:
     sand_C_mocha: float = 0.040       # Mocha C .056, restrained
     sand_C_light: float = 0.020
     sand_detail_chroma: float = 0.30
-    sand_mocha_top: float = 0.18      # share of the Mocha palette at the far/top (rest = water haze)
-    sand_mocha_bottom: float = 0.82   # ... at the near/bottom of the frame
+    sand_mocha_top: float = 0.14      # share of the Mocha palette at the far/top (rest = water haze)
+    sand_mocha_bottom: float = 0.90   # ... at the near/bottom of the frame
+    sand_mocha_span: float = 0.90     # frame height at which the haze has fully turned to earth
     rock_mocha: float = 0.90          # cap of the Mocha share on rocks
     rock_mocha_extra: float = 0.32    # rocks are this much earthier than the sand around them
 
@@ -56,13 +57,14 @@ class Params:
     rock_L_delta: float = 0.022       # slightly lighter than sand so texture reads
     rock_local_gain: float = 2.5
     rock_C_boost: float = 1.0 
+    rock_haze_dim: float = 0.045      # L reduction of rocks when the camera looks into open water
 
     # ---------------- sky / above water
-    sky_L_gain: float = 0.74          # compresses the bright pastel sky
-    sky_L_offset: float = -0.02
+    sky_L_anchor: float = 0.60        # L of the median sky pixel (source ~.86)
+    sky_L_slope: float = 1.7          # keeps the top-to-horizon gradient
     sky_chroma_keep: float = 0.70     # keep some of the warm horizon glow
     sky_hue_cool: float = 236.0
-    sky_C_cool: float = 0.026
+    sky_C_cool: float = 0.034
 
     # ---------------- diver
     skin_target_L: float = 0.585      # reference lit skin .57, source .66
