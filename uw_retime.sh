@@ -8,7 +8,8 @@
 #   stretched with setpts first so the interpolator invents ~2.2 frames per
 #   source frame instead of repeating them.
 # * Exactly SECONDS*FPS frames are written (default 12 s * 30 fps = 360).
-# * Output is 1920x1080: the frame is scaled to full 1080 height and centred
+# * FIT=native keeps the source resolution untouched.
+# * Otherwise output is 1920x1080: the frame is scaled to full 1080 height and centred
 #   with black side bars (the source is 1232x1078, nearly square, so cropping
 #   to 16:9 would cut the subject).  Set FIT=crop to fill 16:9 instead.
 # * libx264 High, yuv420p, BT.709, CRF 17, preset slow, no audio.
@@ -23,7 +24,9 @@ E
 )
 echo "[retime] source ${DUR}s -> ${SEC}s (setpts x${K}), ${N} frames @ ${FPS} fps"
 
-if [ "$FIT" = crop ]; then
+if [ "$FIT" = native ]; then
+  FIT_VF="null"                       # keep the source resolution (no bars, no scaling)
+elif [ "$FIT" = crop ]; then
   FIT_VF="scale=1920:1080:force_original_aspect_ratio=increase:flags=lanczos+accurate_rnd,crop=1920:1080"
 else
   FIT_VF="scale=-2:1080:flags=lanczos+accurate_rnd,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black"
