@@ -44,31 +44,34 @@ class Local:
     """Strength of every mask-guided effect. 0 switches an effect off."""
     mix: float = 1.0               # final mix graded <-> original (1 = full grade; for A/B only)
     # --- divers ---------------------------------------------------------------------------
-    diver_floor: float = 0.050     # output luma of the darkest wetsuit pixels (lifted, never flat black)
-    diver_peak: float = 0.19       # output luma of the brightest diver body pixels (rim/top light add on top)
+    diver_floor: float = 0.060     # output luma of the darkest wetsuit pixels (lifted, never flat black)
+    diver_peak: float = 0.20       # output luma of the brightest diver body pixels (rim/top light add on top)
+    diver_min_span: float = 0.09   # source luma span mapped to the full output range (>= this: noise is not stretched)
     diver_gamma: float = 1.1       # >1 darker mids, <1 brighter mids
-    diver_clarity: float = 1.0     # local contrast on gear / straps / fins
+    diver_clarity: float = 2.0     # local contrast on gear / straps / fins
     diver_top_light: float = 0.20  # broad light on upward-facing surfaces
-    diver_rim: float = 0.18        # thin rim light on edges facing the light
+    diver_rim: float = 0.32        # thin rim light on edges facing the light
     diver_chroma: float = 1.0
     diver_own_color: float = 0.2   # 0 = colour purely from the surrounding water, 1 = from the diver's own pixels
     # --- volumetric light + bubbles -------------------------------------------------------
-    beam: float = 0.070            # luma added by the soft light column above/around divers
-    rays: float = 1.0              # gain on the source's own vertical light shafts (upper water)
+    beam: float = 0.060            # luma added by the soft light column above/around divers
+    rays: float = 0.7              # gain on the source's own vertical light shafts (upper water)
     beam_rise: float = 130.0       # px the column is shifted upward from the divers
     beam_w: float = 70.0           # px sigma (horizontal)
     beam_h: float = 230.0          # px sigma (vertical)
     bubble_light: float = 12.0     # gain on the source's own bubble specks inside the column
     bubble_cap: float = 0.30       # max luma a bubble speck may add
     # --- fish -----------------------------------------------------------------------------
-    fish_floor: float = 0.19
-    fish_peak: float = 0.70
+    fish_floor: float = 0.12
+    fish_peak: float = 0.68
+    fish_min_span: float = 0.30    # a pale fish on pale sand: do not turn a faint stripe into a dark band
     fish_gamma: float = 0.95
-    fish_clarity: float = 0.9
+    fish_clarity: float = 1.6
     fish_top_light: float = 0.30
     fish_rim: float = 0.20
-    fish_chroma: float = 0.65      # < 1 keeps the fish silver, not teal
-    fish_own_color: float = 0.5
+    fish_chroma: float = 0.8       # < 1 desaturates (greyer silver)
+    fish_own_color: float = 1.0    # silver fish keep their own colour ratios (lands on the reference silver-blue)
+    inset: float = 0.35            # subject alpha is tightened inward by this much (loose SAM edges, no light ring)
     # --- finishing ------------------------------------------------------------------------
     knee: float = 0.80             # soft highlight roll-off start
     dither: float = 1.0            # TPDF dither amplitude (LSB of the 8 bit output)
@@ -120,9 +123,9 @@ class Grader:
         self.rng = np.random.default_rng(0)
 
     # ------------------------------------------------------------------ helpers
-    def _excl(self, ad, af):
+    def _excl(self, ad, af, radius=7):
         e = np.zeros((self.h, self.w), np.float32)
-        r = max(int(round(7 * self.k)), 1)
+        r = max(int(round(radius * self.k)), 1)
         ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
         for a in (ad, af):
             if a is not None and a.max() > 0.04:
@@ -143,9 +146,11 @@ class Grader:
         return cv2.resize(s, (w, h), interpolation=cv2.INTER_LINEAR)
 
     # ------------------------------------------------------------------ water layer
-    def water(self, f, L, excl, ad):
+    def water(self, f, L, excl, ad, tight):
         k, lk, lc = self.k, self.look, self.loc
-        soft = gblur(excl, 2.0 * k) if excl.any() else excl
+        # wide `excl` fills the tone base / chroma under the subjects; `tight` only removes the subjects'
+        # own detail, so the seabed texture right next to a fish is not smoothed into a halo
+        soft = gblur(tight, 1.0 * k) if tight.any() else tight
         lden = gblur(L, 1.2 * k)
         base = nblur(lden, excl if excl.any() else None, lk.base_sigma * k)
         lf2 = gblur(L, 2.0 * k)
@@ -187,8 +192,8 @@ class Grader:
         a, Lc, fc = alpha[sl], L[sl], f[sl]
         P = {n: getattr(lc, f"{kind}_{n}") for n in ("floor", "peak", "gamma", "clarity", "chroma", "top_light")}
         rim_gain = getattr(lc, f"{kind}_rim")
-        lo, hi = lv
-        span = max(hi - lo, 0.02)
+        lo, hi, mid = lv
+        span = max(hi - lo, getattr(lc, f"{kind}_min_span"))
         # Edge decontamination: partially covered edge pixels still carry background luma/colour
         # (bright water around a dark diver -> white outline). Replace everything outside the solid
         # core by values extrapolated from the core, then grade.
@@ -201,7 +206,9 @@ class Grader:
             fc = np.where(keep[..., None], fc, np.stack([gblur(fc[..., c] * wcore, 3.0 * k) / den for c in range(3)], -1))
         Ls = gblur(Lc, 0.8 * k)
         dd = Ls - gblur(Lc, 3.5 * k)
-        t = np.clip((Ls - lo) / span + P["clarity"] * dd / span, 0, 1) ** P["gamma"]
+        # the subject's median luma sits at the middle of the output range (predictable brightness);
+        # `span` only sets how much of the source's own contrast around it is kept
+        t = np.clip(0.5 + (Ls - mid) / span + P["clarity"] * dd / span, 0, 1) ** P["gamma"]
         Y = P["floor"] + (P["peak"] - P["floor"]) * t
 
         # directional light from above (slightly from the left): Lambert on the mask's own normals
@@ -234,7 +241,7 @@ class Grader:
         lc = self.loc
         L = luma(f)
         excl = self._excl(ad, af)
-        out, ratios = self.water(f, L, excl, ad)
+        out, ratios = self.water(f, L, excl, ad, self._excl(ad, af, radius=3))
         for kind, a, lv in (("fish", af, lv_f), ("diver", ad, lv_d)):
             if a is None or lv is None:
                 continue
@@ -242,7 +249,7 @@ class Grader:
             if res is None:
                 continue
             rgb, sl = res
-            al = a[sl][..., None]
+            al = np.clip((a[sl] - self.loc.inset) / (1 - self.loc.inset), 0, 1)[..., None]
             out[sl] = out[sl] * (1 - al) + rgb * al
         # soft highlight knee (surface glints roll off, nothing clips to white)
         kn = lc.knee
@@ -262,12 +269,12 @@ class Grader:
 def class_levels(alpha, L, lo_p, hi_p):
     """Robust tone range of a subject class, from its solid core only (edge pixels still carry background)."""
     if alpha is None:
-        return [np.nan, np.nan]
+        return [np.nan] * 3
     core = cv2.erode((alpha > 0.9).astype(np.uint8), np.ones((3, 3), np.uint8), iterations=2) > 0
     v = L[core]
     if v.size < 25:
-        return [np.nan, np.nan]
-    return [np.percentile(v, lo_p), np.percentile(v, hi_p)]
+        return [np.nan] * 3
+    return [np.percentile(v, lo_p), np.percentile(v, hi_p), np.median(v)]
 
 
 def target_size(w: int, h: int) -> tuple[int, int]:
@@ -311,7 +318,7 @@ def main() -> int:
     scale_to = (tw, th) if (tw, th) != (sw, sh) else None
 
     # ---- pass 1: per-class tone levels, smoothed over time (no exposure pumping) -------------
-    lev = {"diver": np.full((n, 2), np.nan), "fish": np.full((n, 2), np.nan)}
+    lev = {"diver": np.full((n, 3), np.nan), "fish": np.full((n, 3), np.nan)}
     want = {int(x) for x in a.frames.split(",")} if a.frames else None
     if any(m.ok for m in M.values()):
         t0 = time.time()
