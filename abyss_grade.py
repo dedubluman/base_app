@@ -62,6 +62,11 @@ class Local:
     bubble_light: float = 12.0     # gain on the source's own bubble specks inside the column
     bubble_cap: float = 0.30       # max luma a bubble speck may add
     # --- fish -----------------------------------------------------------------------------
+    fish_mode: str = "natural"     # "natural": same grade as the scene + soft lift (default); "remap": separate fish layer
+    fish_lift: float = 1.5         # natural: brightness gain on the fish (1 + lift * soft mask)
+    fish_desat: float = 0.30       # natural: pull fish colour toward neutral silver (separation from the teal seabed)
+    fish_feather: float = 3.0      # natural: px sigma of the mask feather (no cut-out edge)
+    # (the fish_* fields below only apply to fish_mode="remap")
     fish_floor: float = 0.12
     fish_peak: float = 0.68
     fish_min_span: float = 0.30    # a pale fish on pale sand: do not turn a faint stripe into a dark band
@@ -240,9 +245,11 @@ class Grader:
     def grade(self, f, ad, af, lv_d, lv_f):
         lc = self.loc
         L = luma(f)
-        excl = self._excl(ad, af)
-        out, ratios = self.water(f, L, excl, ad, self._excl(ad, af, radius=3))
-        for kind, a, lv in (("fish", af, lv_f), ("diver", ad, lv_d)):
+        natural = lc.fish_mode == "natural"
+        af_ex = None if natural else af           # natural: fish stay part of the scene (own texture, own edges)
+        excl = self._excl(ad, af_ex)
+        out, ratios = self.water(f, L, excl, ad, self._excl(ad, af_ex, radius=3))
+        for kind, a, lv in (("fish", None if natural else af, lv_f), ("diver", ad, lv_d)):
             if a is None or lv is None:
                 continue
             res = self.subject(f, L, a, lv, ratios, kind)
@@ -251,6 +258,13 @@ class Grader:
             rgb, sl = res
             al = np.clip((a[sl] - self.loc.inset) / (1 - self.loc.inset), 0, 1)[..., None]
             out[sl] = out[sl] * (1 - al) + rgb * al
+        if natural and af is not None and af.max() > 0.04:
+            # colour-only emphasis: feathered, inset mask -> gain + slight neutralisation, hue-preserving
+            a = np.clip((af - lc.inset) / (1 - lc.inset), 0, 1)
+            a = gblur(a, lc.fish_feather * self.k)[..., None]
+            yl = (out @ LUMA)[..., None]
+            out = out * (1 + lc.fish_lift * a)
+            out = out * (1 - lc.fish_desat * a) + (yl * (1 + lc.fish_lift * a)) * (lc.fish_desat * a)
         # soft highlight knee (surface glints roll off, nothing clips to white)
         kn = lc.knee
         out = np.where(out > kn, kn + (1 - kn) * np.tanh((out - kn) / (1 - kn)), out)

@@ -52,7 +52,7 @@ simply stay dim like the rest of the scene.
 | **water / seabed** (whole frame) | Subject-free base luma (divers and fish are *filled in* from their surroundings by a normalised blur, so a dark wetsuit cannot pull a dark halo into the water) -> fitted tone curve `Y = gain * softmax(n - black, 0)^gamma` times an elliptical vignette (darker toward edges, far water and the distant seabed). Chroma comes from the source's own smoothed R/G and B/G ratios through a fitted linear model, so the teal-green seabed and the bluer water keep their natural separation. Mid-frequency detail and marine snow are kept (1.1x / 0.8x); a soft toe and a small floor keep shadows textured, never flat black. |
 | **light shafts + bubbles** | The source's own vertical rays are gently lifted in the upper water. A soft column of light is anchored above every diver; inside that column the *existing* bright bubble specks are lifted (band-pass of the source, gated, capped, faint scatter). No bubble is added, moved or sharpened into existence. |
 | **divers** (SAM mask) | Their median luma is anchored to a fixed, lifted-but-dark output level (silhouettes stay silhouettes), and only a capped span of their own contrast around it is kept (`*_min_span`), so haze and noise are never stretched into texture. Local clarity on straps / fins, light from above (Lambert on the mask's own normals: broad top light + thin rim). Edge pixels are *decontaminated* first (bright water mixed into the mask edge is replaced by values extrapolated from the solid core) and the alpha is inset a little (`inset`) so no white outline, light ring or cut-out edge appears. |
-| **fish** (SAM mask) | Same machinery with a brighter silver level, gentler contrast, the fish's own colour ratios (they land on a silver-blue), and a soft top light. The seabed right next to a fish keeps its texture (detail is only removed under a tight mask). |
+| **fish** (SAM mask) | Default `fish_mode="natural"`: the fish go through the same water grade as the rest of the frame (own texture, own edges, nothing re-mapped), then get a soft colour-only emphasis through a feathered, inset mask: a brightness gain (`fish_lift`) and a slight pull toward neutral silver (`fish_desat`) so they separate from the teal seabed. An earlier separate fish layer (`fish_mode="remap"`: per-class tone mapping, clarity, rim light) looked pasted-on and is kept only as an option. |
 | **finish** | Soft highlight knee, TPDF dither at the 8-bit step (no banding in the dark gradients), x264 `aq-mode=3` (bits go to dark flat areas). |
 
 ### Temporal consistency
@@ -83,7 +83,7 @@ python abyss_grade.py --input inputs/dive.mov --frames 241 --stills output/t \
 | brighter / darker divers | `diver_floor`, `diver_peak` (median sits mid-range), `diver_top_light`, `diver_rim`; `diver_min_span` / `diver_clarity` = how much of their own contrast is kept |
 | softer light columns | `beam`, `beam_w`, `beam_h`, `rays` |
 | bubble glow | `bubble_light`, `bubble_cap` |
-| fish more / less pop | `fish_floor`, `fish_peak`, `fish_clarity`, `fish_min_span`; colour: `fish_chroma`, `fish_own_color` |
+| fish more / less pop | `fish_lift`, `fish_desat`, `fish_feather` (natural mode); `fish_floor`, `fish_peak`, `fish_clarity`, ... only for `fish_mode=remap` |
 | tighter / looser subject edges | `inset` (0.35), `--min-prob` / `--guide-radius` upstream |
 | A/B against the original | `mix` (0 = source, 1 = full grade) |
 
@@ -113,7 +113,6 @@ frame 241, region by region (`abyss_qc.py compare`):
 |---|---|---|
 | whole frame | 0.171 / 19.2, -9.3, -10.5 | 0.168 / 18.9, -9.5, -9.8 |
 | every 20 % row band, edges, centre | within \|dY\| <= 0.018 | |
-| fish (mask) | 0.412 / 45.2, -15.7, -5.6 | 0.415 / 45.3, -13.6, -7.0 |
 | divers (mask) | 0.139 / 15.5, -6.7, -13.5 | 0.170 / 19.4, -7.6, -14.5 |
 
 Temporal (whole clip, from the MP4): mean luma 0.164-0.183, largest frame-to-frame step 0.0014; mean Y inside the
