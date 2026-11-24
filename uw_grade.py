@@ -180,6 +180,17 @@ def load_soft_masks(mdir: Path, n: int, shape, p, exclude: Path | None = None):
         if p["mask_erode"] > 0:
             m = cv2.erode(m, ker)
         out[i] = m.astype(np.float32)
+    # single-frame dropouts (SAM lost the body for one frame): rebuild from the
+    # intersection of both neighbours when the area collapses
+    area = out.reshape(n, -1).sum(1)
+    fixed = []
+    for i in range(1, n - 1):
+        nb = min(area[i - 1], area[i + 1])
+        if nb > 5000 and area[i] < 0.6 * nb:
+            out[i] = np.maximum(out[i], out[i - 1] * out[i + 1])
+            fixed.append(i)
+    if fixed:
+        print(f"[mask] repaired dropout frames {fixed}")
     # temporal smoothing of the (hard) masks -> soft, jitter-free alpha
     t0, t1, t2 = p["temporal"]
     pad = np.concatenate([out[:1], out, out[-1:]])
