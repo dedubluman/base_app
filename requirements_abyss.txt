@@ -1,0 +1,20 @@
+# Deep-abyss grade (abyss_*.py). Tested with Python 3.13, numpy 2.5, torch 2.15 (CPU), OpenCV 5.1.
+#
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu   # or the CUDA wheel
+#   pip install -r requirements_abyss.txt
+#   ./scripts/download_sam3.sh                                                       # SAM 3 code + SAM 3.1 weights (needs HF_TOKEN)
+#
+# ffmpeg / ffprobe (with libx264) must be on PATH.
+numpy
+opencv-python-headless>=4.9
+scipy>=1.11
+psutil>=5.9
+# SAM 3.1 runtime dependencies (the upstream package pins numpy<2 but runs fine with numpy 2 on the CPU port)
+timm>=1.0.17
+einops
+iopath>=0.1.10
+ftfy
+regex
+huggingface_hub
+tqdm
+pycocotools
