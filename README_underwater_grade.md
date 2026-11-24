@@ -26,3 +26,13 @@ python uw_grade.py --input clip.mov --masks masks/merged \
 Grade parameters live in `P` at the top of `uw_grade.py` (water chroma, bloom, skin target a*/b*,
 subject lift/gain, mask feather/erode).  Retime: `minterpolate` (MCI, bidirectional ME, OBMC, VSBMC),
 360 frames @ 30 fps, libx264 High CRF 17 slow, yuv420p BT.709, no audio, 1234x1080 centred on 1920x1080.
+
+## Full-frame, natural-speed export (no bars, no slow motion)
+
+```bash
+python uw_export.py --graded graded.mkv --masks masks/merged --out out.mp4
+```
+
+Crops the nearly-square source to 16:9 with a window that follows the swimmer's head
+(SAM 3.1 mask top, smoothed), scales to 1920x1080 with Lanczos and encodes H.264 at the
+source frame rate (29.97 fps, 5.37 s).  `uw_retime.sh` remains available for slow motion.
