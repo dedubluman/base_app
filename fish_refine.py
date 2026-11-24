@@ -144,6 +144,62 @@ def warp_back(mask_f32, flow):
                      borderMode=cv2.BORDER_REPLICATE)
 
 
+def clean_keyframe(m: np.ndarray, min_frac=0.03):
+    """Morphological clean-up of a fish keyframe mask: fill small holes, cut thin spurs (stems touching the
+    body) and drop tiny detached fragments. Fins are thick, stems / twigs are thin, so an opening whose
+    radius scales with the body keeps the former and removes the latter."""
+    m8 = m.astype(np.uint8)
+    if not m8.any():
+        return m
+    dist = cv2.distanceTransform(m8, cv2.DIST_L2, 5)
+    r = max(3, int(0.045 * dist.max()))
+    opened = cv2.morphologyEx(m8, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
+    keep = m8 & cv2.dilate(opened, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+    # small holes (particles, speckle) are not gaps between head and body: fill the ones under 150 px
+    inv = (1 - keep).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(inv, connectivity=4)
+    H, W = keep.shape
+    for i in range(1, n):
+        x, y, w, h, a = st[i]
+        if a < 150 and not (x == 0 or y == 0 or x + w == W or y + h == H):
+            keep[lab == i] = 1
+    n, lab, st, _ = cv2.connectedComponentsWithStats(keep, connectivity=8)
+    if n > 2:
+        big = st[1:, 4].max()
+        for i in range(1, n):
+            if st[i, 4] < min_frac * big:
+                keep[lab == i] = 0
+    return keep > 0
+
+
+def temporal_median_keys(keys, src, pad=60):
+    """Flow-aligned majority vote over each keyframe and its two neighbouring keyframes: a fin / stem bit that is
+    present or missing in a single keyframe only (intermittent detection) is voted out; anything seen on two
+    consecutive keyframes is kept. Returns the new dict and the number of changed pixels."""
+    kf = sorted(keys)
+    gray = lambda t: cv2.cvtColor(np.ascontiguousarray(src[t]), cv2.COLOR_RGB2GRAY)
+    out = dict(keys)
+    changed = 0
+    H, W = keys[kf[0]].shape
+    for i in range(1, len(kf) - 1):
+        k, p_, n_ = kf[i], kf[i - 1], kf[i + 1]
+        ys, xs = np.nonzero(keys[k] | keys[p_] | keys[n_])
+        if not len(ys):
+            continue
+        y0, y1 = max(ys.min() - pad, 0), min(ys.max() + pad + 1, H)
+        x0, x1 = max(xs.min() - pad, 0), min(xs.max() + pad + 1, W)
+        gk = gray(k)[y0:y1, x0:x1]
+        votes = keys[k][y0:y1, x0:x1].astype(np.float32)
+        for nb in (p_, n_):
+            fl = flow_between(gk, gray(nb)[y0:y1, x0:x1])
+            votes += warp_back(keys[nb][y0:y1, x0:x1].astype(np.float32), fl)
+        new = keys[k].copy()
+        new[y0:y1, x0:x1] = votes >= 1.5
+        changed += int((new != keys[k]).sum())
+        out[k] = new
+    return out, changed
+
+
 class SoftInterp:
     """Soft per-frame masks (float32 0..1) from keyframe masks, computed on demand.
 
@@ -217,34 +273,34 @@ class SoftInterp:
         return m
 
 
-def temporal_fish(S: SoftInterp, t: int, n: int, pad=40):
-    """1-2-1 temporal filter of the soft fish mask with the neighbours warped onto frame t by optical
-    flow (so a moving silhouette is not smeared). Removes the period-3 jitter that comes from SAM
-    keyframes + interpolation."""
+def temporal_fish(S: SoftInterp, t: int, n: int, pad=40, wide=False):
+    """Temporal filter of the soft fish mask with the neighbours warped onto frame t by optical flow (a moving
+    silhouette is not smeared). 1-2-1 normally; 1-4-6-4-1 (+-2 frames) where `wide` (the narrow turning
+    fish, frames ~140-235), which kills popping and drift there at the cost of a little lag."""
     cur = S(t)
-    acc = 0.5 * cur
-    for nb in (t - 1, t + 1):
-        if not 0 <= nb < n:
-            acc += 0.25 * cur
+    taps = {1: 0.25, 2: 0.0} if not wide else {1: 4 / 16, 2: 1 / 16}
+    acc = (0.5 if not wide else 6 / 16) * cur
+    for off, wgt in taps.items():
+        if wgt == 0:
             continue
-        m = S(nb)
-        ys, xs = np.nonzero((cur > 0.05) | (m > 0.05))
-        if not len(ys):
-            continue
-        H, W = cur.shape
-        y0, y1 = max(ys.min() - pad, 0), min(ys.max() + pad + 1, H)
-        x0, x1 = max(xs.min() - pad, 0), min(xs.max() + pad + 1, W)
-        fl = flow_between(S.gray(t)[y0:y1, x0:x1], S.gray(nb)[y0:y1, x0:x1])
-        w = warp_back(m[y0:y1, x0:x1], fl)
-        acc[y0:y1, x0:x1] += 0.25 * w
-        # outside the ROI both masks are zero, nothing to add
-        if (y1 - y0) * (x1 - x0) < H * W:
-            pass
+        for nb in (t - off, t + off):
+            if not 0 <= nb < n:
+                acc += wgt * cur
+                continue
+            m = S(nb)
+            ys, xs = np.nonzero((cur > 0.05) | (m > 0.05))
+            if not len(ys):
+                continue
+            H, W = cur.shape
+            y0, y1 = max(ys.min() - pad, 0), min(ys.max() + pad + 1, H)
+            x0, x1 = max(xs.min() - pad, 0), min(xs.max() + pad + 1, W)
+            fl = flow_between(S.gray(t)[y0:y1, x0:x1], S.gray(nb)[y0:y1, x0:x1])
+            acc[y0:y1, x0:x1] += wgt * warp_back(m[y0:y1, x0:x1], fl)
     return acc
 
 
 # ------------------------------------------------------------ region logic
-def fish_alpha(frame_rgb, soft, feather=0.8, rad=4):
+def fish_alpha(frame_rgb, soft, feather=0.8, rad=4, choke=0.0, edge_shift=0.0):
     """Soft interpolated mask -> edge-aware alpha aligned to the frame."""
     ys, xs = np.nonzero(soft > 0.05)
     if not len(ys):
@@ -255,10 +311,12 @@ def fish_alpha(frame_rgb, soft, feather=0.8, rad=4):
     L = luma(frame_rgb[y0:y1, x0:x1].astype(np.float32) / 255)
     sub = np.clip(soft[y0:y1, x0:x1], 0, 1)
     # sharpen the interpolated soft mask a little before snapping it to edges
-    sub = np.clip((sub - 0.5) * 2.2 + 0.5, 0, 1)
+    sub = np.clip((sub - (0.5 + edge_shift)) * 2.2 + 0.5, 0, 1)
     a = np.clip(guided(L, sub, rad, 1e-4), 0, 1)
-    support = cv2.dilate((soft[y0:y1, x0:x1] > 0.15).astype(np.uint8), np.ones((5, 5), np.uint8))
+    support = cv2.dilate((soft[y0:y1, x0:x1] > 0.15).astype(np.uint8), np.ones((3, 3), np.uint8))
     a = gblur(a * support, feather)
+    if choke > 0:                                  # slight negative choke: no background / stem spill
+        a = np.clip((a - choke) / (1 - choke), 0, 1)
     out = np.zeros_like(soft)
     out[y0:y1, x0:x1] = a
     return out
@@ -301,6 +359,13 @@ def main() -> int:
     ap.add_argument("--feather-sand", type=float, default=7.0)
     ap.add_argument("--min-frames", type=int, default=4)
     ap.add_argument("--touch-px", type=float, default=25.0, help="a part is merged if it comes this close to the fish mask")
+    ap.add_argument("--refit", action="store_true", help="use masks/<stem>__fishrefit (fish_resegment.py)")
+    ap.add_argument("--tmedian", action="store_true", help="flow-aligned temporal majority vote over keyframes")
+    ap.add_argument("--clean", action="store_true", help="spur / hole / fragment clean-up of the fish keyframes")
+    ap.add_argument("--choke", type=float, default=0.0, help="negative choke of the final alpha (0-0.4)")
+    ap.add_argument("--edge-shift", type=float, default=0.0, help="moves the matte edge inward before edge snapping (0-0.3)")
+    ap.add_argument("--wide", type=int, nargs=2, default=[-1, -1], metavar=("A", "B"),
+                    help="frame range that gets the 5-tap temporal window")
     ap.add_argument("--parts", default="", help="comma list of extra SAM parts merged into the fish (e.g. fins)")
     ap.add_argument("--only-fish", action="store_true", help="skip seabed/midground/background + preview")
     ap.add_argument("--limit", type=int, default=None, help="process only the first N frames (development)")
@@ -344,11 +409,42 @@ def main() -> int:
                     added += 1
             keys[f] = cv2.morphologyEx(keys[f].astype(np.uint8), cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8)) > 0
         print(f"[refine] part '{part}': merged {added} instances into the fish keyframes")
+    # targeted SAM 3.1 re-segmentation (fish_resegment.py) used as EVIDENCE, not as a replacement: point-prompted SAM
+    # under-segments the belly on some frames, so only large parts of the keyframe mask that SAM's refit rejects by
+    # more than 10 px (stem / foliage grabs) are removed; edges everywhere else stay as they are
+    rf = REPO / "masks" / f"{stem}__fishrefit"
+    if a.refit and (rf / "meta.json").exists():
+        rmeta = json.loads((rf / "meta.json").read_text())
+        removed = 0
+        for f, v in rmeta.items():
+            f = int(f)
+            if not v["accepted"] or f not in keys:
+                continue
+            new = cv2.imread(str(rf / "obj_1" / f"{f:05d}.png"), 0) > 127
+            near = cv2.dilate(new.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))) > 0
+            spill = keys[f] & ~near
+            n_, lab, st, _ = cv2.connectedComponentsWithStats(spill.astype(np.uint8), connectivity=8)
+            for i in range(1, n_):
+                if 30 < st[i, 4] < 0.10 * keys[f].sum():
+                    keys[f][lab == i] = False
+                    removed += int(st[i, 4])
+        report["refit_spill_px_removed"] = removed
+        print(f"[refine] SAM re-segmentation evidence: {removed} spill px removed over {len(rmeta)} keyframes")
+    if a.clean:
+        before = {f: int(m.sum()) for f, m in keys.items()}
+        for f in list(keys):
+            keys[f] = clean_keyframe(keys[f])
+        report["clean_area_change_pct"] = round(float(np.mean([(int(keys[f].sum()) - before[f]) / max(before[f], 1) for f in keys]) * 100), 2)
+    if a.tmedian:
+        keys, ch = temporal_median_keys(keys, src)
+        keys = {f: clean_keyframe(m) for f, m in keys.items()} if a.clean else keys
+        report["tmedian_changed_px"] = ch
+        print(f"[refine] temporal median over keyframes changed {ch} px")
     report["fish_keyframes"] = len(keys)
     report["fish_repairs"] = repair_outliers(keys)
     S = SoftInterp(keys, src, scale=1.0, roi_pad=60)
     for t in range(n):
-        alpha = fish_alpha(src[t], temporal_fish(S, t, n))
+        alpha = fish_alpha(src[t], temporal_fish(S, t, n, wide=(a.wide[0] <= t <= a.wide[1])), choke=a.choke, edge_shift=a.edge_shift)
         write_png(out_root / "fish" / f"{t:05d}.png", alpha)
         if t % 60 == 0:
             print(f"[refine] fish matte {t}/{n}", flush=True)

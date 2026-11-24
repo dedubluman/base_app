@@ -191,3 +191,21 @@ python run_grade.py --input inputs/fish.mov --refs inputs/reference/gold_a.jpg i
   `pad` centred, `setsar=1`): a 608×1080 picture with black pillars. Encode: libx264 High, yuv420p, CRF 17, BT.709, source AAC copied.
 * Result vs reference (stills): fish L median 0.42–0.44 (ref 0.39–0.45), chroma median 0.053–0.082 (ref 0.056–0.076), hue median 89–94° (ref 94–96°).
   Encoded-file flicker (HF rms): bg luma 0.0008, seabed luma 0.0004, fish luma 0.0021, fish saturation 0.0043 (source 0.0013 / 0.0010 / 0.0010 / 0.0050).
+
+## 6. Matte refinement pass (video_1: spurs, edge margin, intermittent fins)
+
+Findings on the v1 mattes (contour sheets at 100 %, `fish_diag.py`): a 3-8 px loose edge margin on the dorsal/tail boundary
+against dark water, thin spurs under the belly where a stem touches (f90-f150, f255), the pectoral fin dropped around
+frames 231-300, and fins that were merged on some keyframes and not on others (pop). The stems that cross the fish were
+already excluded by SAM. (The yellow "fan" left of the fish at 5.0-6.5 s is a dry grass tuft on the sand, not a fin.)
+
+* `fish_resegment.py`: SAM 3.1 re-segmentation with dense point prompts (9 positives spread over body, stripes and fins,
+  10-24 negatives on stems / spurs / thin gaps and a ring around the fish; SAM 3.1 does not accept points together with a
+  box). 66 keyframes (0-0.6 s, 5.0-7.5 s, 11.5-14 s, plus tests). Point-prompted SAM under-segments the belly by ~15 %
+  on some frames (f0, f9), so it is used only as *evidence*: parts of the keyframe mask that SAM rejects by more than
+  10 px are removed.
+* `fin` text pass on frames 135-260 (`fins2`) added to the 222-333 pass (`fins`); parts within 25 px of the fish are merged.
+* `fish_refine.py --clean --tmedian --wide 140 235 --edge-shift 0.10 --choke 0.10`: spur / hole / fragment clean-up,
+  flow-aligned majority vote over three consecutive keyframes (kills single-keyframe fin dropouts and stem bits),
+  5-tap flow-aligned temporal window on frames 140-235 (3-tap elsewhere), edge pulled in ~1 px before the guided filter.
+* `fish_verify.py`: verification strip and stability table.
