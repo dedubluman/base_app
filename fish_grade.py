@@ -481,7 +481,10 @@ def cmd_render(a):
     cmd += ["-vf", "scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd+full_chroma_int,format=yuv420p",
             "-c:v", "libx264", "-profile:v", "high", "-preset", a.preset, "-crf", str(a.crf),
             "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv",
-            "-movflags", "+faststart", "-shortest", str(a.output)]
+            "-movflags", "+faststart"]
+    if a.limit:     # truncated test render: cut the copied audio to the same length
+        cmd += ["-t", f"{limit * 1001 / 30000:.4f}"]
+    cmd += [str(a.output)]
     a.output.parent.mkdir(parents=True, exist_ok=True)
     enc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     fsz = W * H * 3
@@ -528,7 +531,7 @@ def cmd_qc(a):
     step = 2
 
     def frames(path):
-        p = subprocess.Popen(["ffmpeg", "-v", "error", "-i", str(path), "-fps_mode", "passthrough",
+        p = subprocess.Popen(["ffmpeg", "-v", "quiet", "-i", str(path), "-fps_mode", "passthrough",
                               "-vf", f"select=not(mod(n\\,{step})),scale=270:480:flags=area,format=rgb24",
                               "-f", "rawvideo", "-"], stdout=subprocess.PIPE)
         sz = 270 * 480 * 3
@@ -537,6 +540,7 @@ def cmd_qc(a):
             if len(b) < sz:
                 break
             yield np.frombuffer(b, np.uint8).reshape(480, 270, 3).astype(np.float32) / 255
+        p.kill()
         p.wait()
 
     rows = []
@@ -548,22 +552,28 @@ def cmd_qc(a):
         for nm, im in (("src", s), ("gr", g)):
             L = luma(im)
             mx, mn = im.max(-1), im.min(-1)
-            sat = (mx - mn) / np.maximum(mx, 1e-3)
+            sat = mx - mn                      # chroma: stable in very dark colours (HSV S is not)
             r[nm] = [float(L[bgm].mean()), float(sat[bgm].mean()),
                      float(L[fgm].mean()) if fgm.any() else np.nan,
                      float(sat[fgm].mean()) if fgm.any() else np.nan]
         rows.append(r["src"] + r["gr"])
     R = np.array(rows)
-    names = ["bgL", "bgSat", "fgL", "fgSat"]
+    names = ["bgL", "bgChroma", "fgL", "fgChroma"]
     rep = {}
     for j, nm in enumerate(names):
         s, g = R[:, j], R[:, 4 + j]
         ok = ~np.isnan(s) & ~np.isnan(g)
         ds, dg = np.diff(s[ok]), np.diff(g[ok])
+        # A static grade turns a source fluctuation ds into k*ds (k = the tone
+        # curve's gain). Flicker the grade ADDS is what is left after that fit.
+        k = float((ds @ dg) / max(ds @ ds, 1e-12))
+        resid = dg - k * ds
         rep[nm] = {"src_mean": float(s[ok].mean()), "graded_mean": float(g[ok].mean()),
-                   "src_step_std": float(ds.std()), "graded_step_std": float(dg.std()),
-                   "graded_over_src_step_std": float(dg.std() / max(ds.std(), 1e-9)),
-                   "graded_max_abs_step": float(np.abs(dg).max())}
+                   "step_corr_src_vs_graded": float(np.corrcoef(ds, dg)[0, 1]),
+                   "curve_gain_k": k,
+                   "added_flicker_std": float(resid.std()),
+                   "added_flicker_over_graded_step_std": float(resid.std() / max(dg.std(), 1e-9)),
+                   "graded_max_abs_step": float(np.abs(dg).max()), "n": int(ok.sum())}
     (a.out).write_text(json.dumps(rep, indent=1))
     print(json.dumps(rep, indent=1))
 
