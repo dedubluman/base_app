@@ -49,8 +49,8 @@ P = dict(
     # --- subject (Lab a*, b* targets and strength)
     skin_a=15.0, skin_b=18.0,      # target chroma of sunlit skin
     skin_strength=0.92,
-    skin_l_lift=0.20,              # shadow lift on the subject (0..1)
-    skin_l_gain=1.10,
+    skin_l_lift=0.50,              # shadow lift on the subject (0..1)
+    skin_l_gain=1.28,
     skin_dark_floor=7.0,           # L* below which subject stays neutral
     # --- mask handling
     mask_erode=1,
