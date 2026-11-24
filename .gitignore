@@ -15,3 +15,6 @@ output/
 masks/
 .cache/
 *.log
+
+# underwater grade: regenerable per-frame mask stacks (uw_interp.py)
+masks_uw/**/*_full.npy

@@ -1,0 +1,39 @@
+{
+ "video": "/root/.claude/uploads/4e9245ee-eef5-5f46-8e7c-f1eba56e2edd/783ac889-player_export.mov",
+ "stride": 4,
+ "width": 540,
+ "height": 960,
+ "n_sub": 23,
+ "src_idx": [
+  228,
+  232,
+  236,
+  240,
+  244,
+  248,
+  252,
+  256,
+  260,
+  264,
+  268,
+  272,
+  276,
+  280,
+  284,
+  288,
+  292,
+  296,
+  300,
+  304,
+  308,
+  312,
+  316
+ ],
+ "concepts": [
+  "subject=person"
+ ],
+ "device": "cpu",
+ "seconds": {
+  "subject": 278.5
+ }
+}
