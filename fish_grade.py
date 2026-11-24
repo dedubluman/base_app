@@ -61,14 +61,15 @@ LOOK = {
         "edge_contrast": 0.20,       # micro-contrast falloff toward the perimeter
     },
     "fg": {
-        "exposure": 1.06, "wb": [1.00, 0.97, 1.10],     # neutralise the yellow-green water cast
+        "exposure": 1.10, "wb": [0.97, 0.97, 1.10],     # neutralise the yellow-green water cast
         "slope": [1.30, 1.28, 1.30], "offset": [-0.075, -0.055, -0.040],
         "power": [1.12, 1.12, 1.10],
         "clarity": 0.7, "texture": 0.3,       # edge-aware local contrast
         "vibrance": 0.12, "sat": 1.04,
-        "amber_hue": 44.0, "amber_sat": 0.35, "amber_pull": 0.25,
+        "amber_hue": 46.0, "amber_sat": 0.18, "amber_pull": 0.35,
         "hi_knee": 0.74, "hi_ceiling": 0.95,
         "vig_share": 0.35,
+        "alpha_bias": 0.12, "alpha_gamma": 1.3,   # tighten the matte (>0 / >1) against bright fringes
     },
     "finish": {
         "black": 0.004, "scurve": 0.30, "roll_knee": 0.86,
@@ -410,6 +411,8 @@ class Grader:
             x0, x1 = max(xs.min() - m, 0), min(xs.max() + m + 1, self.W)
             y0, y1 = max(ys.min() - m, 0), min(ys.max() + m + 1, self.H)
             a = alpha_u8[y0:y1, x0:x1].astype(np.float32)[..., None] / 255
+            F = self.L["fg"]
+            a = np.clip((a - F["alpha_bias"]) / (1 - F["alpha_bias"]), 0, 1) ** F["alpha_gamma"]
             vsh = self.v[y0:y1, x0:x1] ** self.L["fg"]["vig_share"]
             fg = fg_look(x[y0:y1, x0:x1], vsh, self.L["fg"], self.fg_luts)
             out[y0:y1, x0:x1] = out[y0:y1, x0:x1] * (1 - a) + fg * a

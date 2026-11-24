@@ -66,6 +66,21 @@ torch, `pip install -e sam3/`, `requirements_three_shades.txt`) plus
 | `fg.amber_*` | strength of the golden tail / fins |
 | `finish.grain` | grain amount |
 
+## Verified on the supplied clip
+
+| Check | Result |
+|---|---|
+| SAM 3.1 keyframes | 323/323 masked in 81 min on 4 CPU cores; chunk-seam IoU 0.97-0.99 |
+| Flow interpolation (held-out keyframes, 2x the real gap) | IoU mean 0.981, min 0.948 |
+| Matte stability | max frame-to-frame area change 2.7%; no jump above 12% |
+| Output | H.264 High, 1080x1920, yuv420p, 29.97 fps, 645 frames, 21.5215 s (= source), BT.709; AAC copied untouched; full decode error-free |
+| Flicker added by the grade | <= 1% of layer mean (0.0006-0.0012 in 0..1); step correlation with the source 0.93 (bg luma) / 0.997 (fish luma) |
+| Reference frame 528 | background mean RGB within ~8%, luminance rings/bands within ~6%; fish luminance p2/p98 0.022/0.75 vs reference 0.024/0.726; fish dE76 median 6.5 |
+| Artifacts | warm/pink background pixels <= 0.09%, clipped highlights <= 0.001%, no visible fringe at the matte edge |
+
+The CRF 17 file is large (about 25 Mb/s, 67 MB) because grain costs bits; use
+`--crf 20` for a smaller file.
+
 ## Limits
 
 * SAM 3.1 runs on **every 2nd frame**; the frames in between use flow-warped
