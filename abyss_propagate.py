@@ -9,6 +9,11 @@ instead of cross-fading. The coarse masks are then smoothed over time (5-tap tri
 and snapped to the real edges with a luma-guided filter (so thin fins / diver straps keep
 partial coverage and no halo of the old background colour is carried into the grade).
 
+Keyframe components that are not clearly darker than the water around them (a far, hazy diver
+that is barely visible in the source) are dropped from the diver job (--min-contrast): grading
+such a patch as a dark silhouette would stretch noise into a fake blob. Without a mask the patch
+is simply graded with the rest of the scene, i.e. it stays exactly as faint as it is in the footage.
+
 Output: masks/<stem>__abyss/<job>_full/<frame:05d>.png   uint8 soft alpha, full source res
 
     python abyss_propagate.py --input inputs/dive.mov [--jobs diver,fish]
@@ -27,10 +32,35 @@ from abyss_common import gblur, guided, luma, probe, read_frames
 
 REPO = Path(__file__).resolve().parent
 FLOW_W, FLOW_H = 540, 960          # flow is estimated at half resolution (px / 2 on the full frame)
+DARK_JOBS = {"diver"}              # subjects that must be darker than their surroundings to count
 
 
 def load_keyframes(d: Path) -> dict[int, np.ndarray]:
     return {int(p.stem[3:]): cv2.imread(str(p), 0) for p in sorted(d.glob("kf_*.png"))}
+
+
+def drop_low_contrast(m: np.ndarray, L: np.ndarray, min_contrast: float, log) -> np.ndarray:
+    """Remove connected components of the full-res keyframe mask ``m`` (uint8 0/255) whose mean luma is not at
+    least ``min_contrast`` below the luma of the ring around them. L is the half-res luma of that frame."""
+    hh, ww = L.shape
+    mh = cv2.resize((m > 127).astype(np.uint8), (ww, hh), interpolation=cv2.INTER_NEAREST)
+    n, lab, st, cen = cv2.connectedComponentsWithStats(mh)
+    keep = np.zeros_like(mh)
+    k3 = np.ones((3, 3), np.uint8)
+    for j in range(1, n):
+        c = (lab == j).astype(np.uint8)
+        core = cv2.erode(c, k3, iterations=2) > 0
+        ring = (cv2.dilate(c, k3, iterations=14) > 0) & ~(cv2.dilate(c, k3, iterations=4) > 0)
+        if st[j, 4] < 40 or core.sum() < 10 or ring.sum() < 10:
+            log(f"    dropped speck at x={cen[j][0] * 2:.0f} (area {st[j, 4] * 4})")
+            continue
+        contrast = float(L[ring].mean() - L[core].mean())
+        if contrast >= min_contrast:
+            keep |= c
+        else:
+            log(f"    dropped low-contrast component at x={cen[j][0] * 2:.0f}, area {st[j, 4] * 4}, contrast {contrast:+.3f}")
+    keep_full = cv2.resize(keep, (m.shape[1], m.shape[0]), interpolation=cv2.INTER_NEAREST)
+    return np.where(keep_full > 0, m, 0).astype(np.uint8)
 
 
 def warp(mask: np.ndarray, flow_full: np.ndarray, grid: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
@@ -47,6 +77,8 @@ def main() -> int:
     ap.add_argument("--smooth", type=int, default=2, help="temporal half-window (frames)")
     ap.add_argument("--guide-radius", type=int, default=4)
     ap.add_argument("--guide-eps", type=float, default=2e-4)
+    ap.add_argument("--min-contrast", type=float, default=0.018,
+                    help="diver components must be this much darker than their surroundings (BT.709 luma, 0..1)")
     a = ap.parse_args()
 
     info = probe(a.input)
@@ -60,9 +92,20 @@ def main() -> int:
               f"{sum(1 for k in ks if kfs[j][k].any())} with a subject", flush=True)
 
     t0 = time.time()
-    gray = np.stack([cv2.cvtColor((f * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
-                     for f in read_frames(a.input, w, h, scale_to=(FLOW_W, FLOW_H))])
+    kf_all = {k for j in jobs for k in kfs[j]}
+    gray, lum = [], {}
+    for i, f in enumerate(read_frames(a.input, w, h, scale_to=(FLOW_W, FLOW_H))):
+        gray.append(cv2.cvtColor((f * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY))
+        if i in kf_all:
+            lum[i] = luma(f)
+    gray = np.stack(gray)
     assert len(gray) == n, (len(gray), n)
+    for j in jobs:
+        if j in DARK_JOBS and a.min_contrast > 0:
+            for k in sorted(kfs[j]):
+                if kfs[j][k].any():
+                    kfs[j][k] = drop_low_contrast(kfs[j][k], lum[k], a.min_contrast,
+                                                  lambda msg, k=k: print(f"  [{j} kf {k}] {msg.strip()}", flush=True))
     dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
     grid = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
     sx, sy = w / FLOW_W, h / FLOW_H
