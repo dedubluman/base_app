@@ -48,7 +48,7 @@ LOOK = {
     "fish_L_tab": [0.10, 0.14, 0.215, 0.285, 0.36, 0.44, 0.52, 0.60, 0.70, 0.85],
     "fish_hue_tab": [38.0, 38.0, 44.0, 48.0, 47.0, 47.0, 54.0, 63.0, 72.0, 76.0],
     "fish_chroma_tab": [0.040, 0.050, 0.051, 0.064, 0.082, 0.107, 0.121, 0.123, 0.117, 0.100],
-    "fish_warm_shift": 12.0, "fish_chroma_bar": 0.036,
+    "fish_warm_shift": 12.0, "fish_chroma_bar": 0.036, "fish_chroma_mul": 0.80, "fish_clarity": 0.0, "fish_toe": 0.0, "fg_ceiling": None, "halation": 0.0, "halation_thr": 0.42,
     "crimson_depth": 0.16, "fish_hue_texture": 6.0,
     "fish_warm_lo": 0.30, "fish_warm_hi": 0.88,            # chroma percentile window -> crimson weight
     "belly_max": 0.72, "belly_hue": 245.0, "belly_chroma": 0.020, "belly_cap": 0.60,
@@ -91,15 +91,38 @@ def ref_regions(path: Path):
     return lab, bg, fg, warm
 
 
-def fish_ref_lab(path: Path):
+def fish_ref_lab(path: Path, hue_max: float = 50.0, gold: bool = False):
+    """OKLab pixels of the reference's fish. Default: saturated reds/oranges (hue < hue_max, top quarter
+    excluded). gold=True: golden/ochre fish (HSV hue 20-70, saturation > 0.40) inside the upper-middle band."""
     im = cv2.imread(str(path))
     rgb = im[..., ::-1].astype(np.float32) / 255
     hsv = cv2.cvtColor(im, cv2.COLOR_BGR2HSV_FULL).astype(np.float32) / 255
     hue = hsv[..., 0] * 360
-    m = (hsv[..., 1] > 0.45) & (hsv[..., 2] > 0.12) & ((hue < 50) | (hue > 340))
-    h, w = m.shape
-    m[: int(0.25 * h)] = False                    # the dry-grass tips at the top are not fish
+    h, w = hue.shape
+    if gold:
+        m = (hsv[..., 1] > 0.40) & (hsv[..., 2] > 0.15) & (hue > 20) & (hue < 70)
+        m[: int(0.12 * h)] = False
+        m[int(0.55 * h):] = False
+    else:
+        m = (hsv[..., 1] > 0.45) & (hsv[..., 2] > 0.12) & ((hue < hue_max) | (hue > 340))
+        m[: int(0.25 * h)] = False                # the dry-grass tips at the top are not fish
     return rgb_to_oklab(rgb), m
+
+
+def fish_tables(fref_lab: np.ndarray):
+    """Hue / chroma by lightness measured on the reference's fish pixels (OKLCH)."""
+    L, C, h = lab_to_lch(fref_lab)
+    edges = np.array([0.10, 0.18, 0.25, 0.32, 0.40, 0.48, 0.56, 0.64, 0.80])
+    xs, hs, cs = [], [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        m = (L >= a) & (L < b)
+        if m.sum() > 300:
+            xs.append(float(np.median(L[m]))); hs.append(float(np.median(h[m]))); cs.append(float(np.median(C[m])))
+    k = np.ones(3) / 3                                          # light smoothing of the measured law
+    sm = lambda v: np.convolve(np.pad(v, 1, mode="edge"), k, "valid")
+    hs, cs = sm(np.array(hs)), sm(np.array(cs))
+    return {"L": [0.05] + xs + [0.95], "hue": [hs[0]] + hs.tolist() + [hs[-1]],
+            "chroma": [cs[0] * 0.8] + cs.tolist() + [cs[-1]]}
 
 
 QS = np.array([0.5, 3, 10, 25, 40, 55, 70, 85, 95, 99.5])
@@ -191,7 +214,7 @@ def calibrate(a):
         lab, bg, fg, warm = ref_regions(Path(p))
         refs["bg"].append(lab[bg][::6])
         refs["fg"].append(lab[fg][::6])
-        flab, fm = fish_ref_lab(Path(p))
+        flab, fm = fish_ref_lab(Path(p), a.fish_hue_max, a.gold)
         fref.append(flab[fm])
     refs = {k: np.concatenate(v) for k, v in refs.items()}
     fref = np.concatenate(fref)
@@ -228,6 +251,9 @@ def calibrate(a):
     body = ~belly
     P["fish"]["tone"] = tone_curve(Lraw[body], fref[:, 0], hi_extra=0.04)
     P["fish"]["belly_frac"] = float(belly.mean())
+    if a.gold:                                           # hue / chroma law measured on the reference
+        P["fish"]["tables"] = fish_tables(fref)
+        print(f"[cal] fish tables: L {np.round(P['fish']['tables']['L'], 2)} hue {np.round(P['fish']['tables']['hue'])} chroma {np.round(P['fish']['tables']['chroma'], 3)}")
     print(f"[cal] fish: raw hue q5/50/95 {np.round(P['fish']['raw_hue_q'])}  chroma window {P['fish']['c_lo']:.3f}-{P['fish']['c_hi']:.3f}; "
           f"L q raw {np.round(P['fish']['raw_L_q'], 2)} ref {np.round(P['fish']['ref_L_q'], 2)}")
     # vignette depth: reference corner/centre vs the raw clip's
@@ -279,7 +305,11 @@ class Grader:
         """Centre-exposure lift for the mid-tones only: it fades out toward the reference's white point,
         so sunlit sand ridges keep the ceiling measured on the reference."""
         lift = LOOK["env_lift"]["bg"] * (1 - fg) + LOOK["env_lift"]["fg"] * fg
-        return Lo * (1 + (lift - 1) * (1 - smoothstep(0.28, 0.52, Lo)))
+        Lo = Lo * (1 + (lift - 1) * (1 - smoothstep(0.28, 0.52, Lo)))
+        c = LOOK.get("fg_ceiling")
+        if c:                                   # soft ceiling on the seabed: sunlit sand must not out-shine the fish
+            Lo = Lo * (1 - fg) + (c - np.log1p(np.exp(22.0 * (c - Lo))) / 22.0) * fg
+        return Lo
 
     def env_colour(self, lab_ab, Lo, fg):
         """Point-wise colour of the environment: chroma scale + tonal-zone offsets measured on the
@@ -326,8 +356,10 @@ class Grader:
         sm = (lambda x, s_: gblur(x.astype(np.float32), s_)) if blur else (lambda x, s_: x)
         Cn = sm(np.clip((C - F["c_lo"]) / (F["c_hi"] - F["c_lo"]), 0, 1), 2.0)
         Lm = apply_lut(np.clip(L, 0, 1), F["tone"])
+        # the reference's fish mask leaves out the black stripes, so the matched curve would lift them: toe
+        Lm = np.maximum(Lm - LOOK["fish_toe"] * (1 - smoothstep(0.14, 0.30, L)), 0.04)
         # a light micro-contrast pass on top of the matched curve keeps scale / fin-ray texture
-        Lm = Lm + (LOOK["fish_detail"] - 1) * (Lm - sm(Lm, 1.4))
+        Lm = Lm + (LOOK["fish_detail"] - 1) * (Lm - sm(Lm, 1.4)) + LOOK["fish_clarity"] * (Lm - sm(Lm, 5.0))
         # silver belly: low chroma and lighter than the bars (the belly is not bright in absolute terms)
         belly = LOOK["belly_max"] * sm(smoothstep(0.26, 0.36, L) * (1 - smoothstep(0.06, 0.30, Cn)), 3.0)
         # warmth: higher raw chroma (tail, fin rays, flank blush) -> crimson, the rest amber / burnt orange
@@ -336,10 +368,11 @@ class Grader:
         det = np.clip((L - sm(L, 3.0)) / 0.05, -1, 1) if blur else np.zeros_like(L)   # local scale pattern
         # hue / chroma follow the reference's own law (measured on its fish pixels): crimson in the
         # darks, burnt orange mid, amber in the lights; chroma grows with lightness
-        h_out = np.interp(Lm, LOOK["fish_L_tab"], LOOK["fish_hue_tab"]) - LOOK["fish_warm_shift"] * w \
-            - LOOK["fish_hue_texture"] * det
+        tb = F.get("tables")
+        Lt, Ht, Ct = (tb["L"], tb["hue"], tb["chroma"]) if tb else (LOOK["fish_L_tab"], LOOK["fish_hue_tab"], LOOK["fish_chroma_tab"])
+        h_out = np.interp(Lm, Lt, Ht) - LOOK["fish_warm_shift"] * w - LOOK["fish_hue_texture"] * det
         h_out = np.maximum(h_out, LOOK["fish_hue_crimson"])
-        C_out = np.interp(Lm, LOOK["fish_L_tab"], LOOK["fish_chroma_tab"]) * (0.80 + 0.45 * Cn) * (1 + 0.10 * det)
+        C_out = np.interp(Lm, Lt, Ct) * (LOOK["fish_chroma_mul"] + 0.45 * Cn) * (1 + 0.10 * det)
         C_out = np.maximum(C_out, LOOK["fish_chroma_bar"] * (1 - smoothstep(0.16, 0.30, Lm)))
         warm = oklab_to_rgb(lch_to_lab(Lm, C_out, h_out))
         silver = oklab_to_rgb(lch_to_lab(np.minimum(Lm + 0.04, LOOK["belly_cap"]),
@@ -371,6 +404,12 @@ class Grader:
             col, (y0, y1, x0, x1) = r
             a = alpha[y0:y1, x0:x1, None]
             out[y0:y1, x0:x1] = out[y0:y1, x0:x1] * (1 - a) + col[y0:y1, x0:x1] * a
+        if LOOK["halation"] > 0:
+            # halation / bloom: bright specular glints (bubbles, sunlit sand grains) bleed a warm glow
+            Lh = luma(out)
+            hl = np.clip(Lh - LOOK["halation_thr"], 0, None)
+            glow = gblur(hl, 9) + 0.7 * gblur(hl, 26)
+            out = out + LOOK["halation"] * glow[..., None] * np.array([1.0, 0.86, 0.62], np.float32)
         if grain:
             rng = np.random.default_rng(1000 + t)
             Lg = luma(out)
@@ -528,11 +567,16 @@ def render(a):
     n, H, W, _ = src.shape
     w, h, nn, fr = (W, H, n, "30000/1001")
     audio = ["-i", str(a.input), "-map", "0:v", "-map", "1:a?", "-c:a", "copy"]
+    canvas_vf = ""
+    if a.canvas:                                           # fit inside WxH, pad with black, square pixels
+        cw, ch = a.canvas.split("x")
+        canvas_vf = (f"scale={cw}:{ch}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos,"
+                     f"pad={cw}:{ch}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,")
     a.output.parent.mkdir(parents=True, exist_ok=True)
     enc = subprocess.Popen(
         ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-framerate", fr,
          "-i", "-", *audio,
-         "-vf", "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
+         "-vf", canvas_vf + "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
          "-c:v", "libx264", "-preset", a.preset, "-crf", str(a.crf), "-profile:v", "high", "-level", "4.2",
          "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv",
          "-movflags", "+faststart", str(a.output)], stdin=subprocess.PIPE)
@@ -548,27 +592,38 @@ def render(a):
 
 def main():
     ap = argparse.ArgumentParser()
+    com = argparse.ArgumentParser(add_help=False)
+    com.add_argument("--params", type=Path, default=None, help="grade parameter file (default grade_params.json)")
+    com.add_argument("--look-json", type=Path, default=None, help="JSON overrides for the LOOK constants")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    c = sub.add_parser("calibrate")
+    c = sub.add_parser("calibrate", parents=[com])
     c.add_argument("--input", type=Path, required=True)
     c.add_argument("--refs", nargs="+", required=True)
     c.add_argument("--step", type=int, default=12)
     c.add_argument("--limit", type=int, default=None)
-    s = sub.add_parser("stills")
+    c.add_argument("--fish-hue-max", type=float, default=50.0)
+    c.add_argument("--gold", action="store_true", help="reference fish is golden/ochre: measure its hue/chroma tables")
+    s = sub.add_parser("stills", parents=[com])
     s.add_argument("--input", type=Path, required=True)
     s.add_argument("--frames", required=True)
     s.add_argument("--out", type=Path, required=True)
     s.add_argument("--limit", type=int, default=None)
-    sub.add_parser("spec")
-    e = sub.add_parser("luts")
+    sub.add_parser("spec", parents=[com])
+    e = sub.add_parser("luts", parents=[com])
     e.add_argument("--out", type=Path, required=True)
-    r = sub.add_parser("render")
+    r = sub.add_parser("render", parents=[com])
     r.add_argument("--input", type=Path, required=True)
     r.add_argument("--output", type=Path, required=True)
     r.add_argument("--crf", type=int, default=15)
     r.add_argument("--preset", default="slow")
     r.add_argument("--workers", type=int, default=3)
+    r.add_argument("--canvas", default=None, help="e.g. 1920x1080: fit the frame inside it and pad with black")
     a = ap.parse_args()
+    global PARAMS
+    if a.params:
+        PARAMS = a.params
+    if a.look_json:
+        LOOK.update(json.loads(a.look_json.read_text()))
     {"calibrate": calibrate, "stills": stills, "render": render, "luts": export_luts, "spec": spec}[a.cmd](a)
 
 

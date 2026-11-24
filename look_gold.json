@@ -1,0 +1,16 @@
+{
+ "fish_warm_shift": 4.0,
+ "crimson_depth": 0.06,
+ "fish_hue_texture": 4.0,
+ "fish_chroma_mul": 0.88,
+ "fish_detail": 1.25,
+ "fish_clarity": 0.35,
+ "fish_toe": 0.16,
+ "halation": 0.22,
+ "belly_max": 0.7,
+ "belly_hue": 235.0,
+ "belly_chroma": 0.014,
+ "belly_cap": 0.7,
+ "vig_strength": 0.7,
+ "fg_ceiling": 0.5
+}

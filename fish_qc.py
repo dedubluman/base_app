@@ -73,10 +73,10 @@ def cmd_stills(a):
             print(f"            fish {json.dumps(fish_stats(rgb_to_oklab(g), al))}")
 
 
-def region_series(video: Path, source: Path, root: Path, every=1):
+def region_series(video: Path, source: Path, root: Path, every=1, pre=""):
     """Per-frame region means from the encoded video, regions from the mattes."""
     w, h = 1080, 1920
-    p = subprocess.Popen(["ffmpeg", "-v", "error", "-i", str(video), "-fps_mode", "passthrough", "-vf", "scale=in_range=tv:out_range=pc,format=rgb24",
+    p = subprocess.Popen(["ffmpeg", "-v", "error", "-i", str(video), "-fps_mode", "passthrough", "-vf", pre + "scale=in_range=tv:out_range=pc,format=rgb24",
                           "-f", "rawvideo", "-"], stdout=subprocess.PIPE)
     out = []
     i = 0
@@ -127,7 +127,8 @@ def cmd_video(a):
         for s in probe(p):
             print("  ", {k: v for k, v in s.items()})
     root = REPO / "masks" / f"{a.source.stem}__mattes"
-    rows = region_series(a.video, a.source, root)
+    pre = f"crop={a.content_crop},scale=1080:1920:flags=lanczos," if a.content_crop else ""
+    rows = region_series(a.video, a.source, root, pre=pre)
     keys = ["bg_L", "sand_L", "fish_L", "bg_S", "sand_S", "fish_S"]
     print("== region means from the encoded video (0..1)")
     for k in keys:
@@ -153,6 +154,7 @@ def main():
     v = sub.add_parser("video")
     v.add_argument("--video", type=Path, required=True)
     v.add_argument("--source", type=Path, required=True)
+    v.add_argument("--content-crop", default=None, help="w:h:x:y of the picture inside a padded canvas, e.g. 608:1080:656:0")
     a = ap.parse_args()
     {"stills": cmd_stills, "video": cmd_video}[a.cmd](a)
 

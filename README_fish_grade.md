@@ -170,3 +170,24 @@ absolute terms); the others less. Largest frame-to-frame step of any region mean
   at CRF 15 (~26 Mbit/s, 47 MB). A lighter copy needs a higher CRF.
 * Output is 1080×1920 (portrait 1080p), same size, frame rate (30000/1001) and duration (14.3143 s, 429 frames)
   as the source; no scaling was applied.
+
+## 5. Golden-amber variant (`look_gold.json`, `grade_params_gold.json`)
+
+Same clip, second look: warm golden-amber hero fish on a dense, dark environment, 1920×1080 output.
+The SAM 3.1 mattes are reused (the second upload decodes to byte-identical video and audio, only the container metadata differs).
+
+```
+python run_grade.py --input inputs/fish.mov --refs inputs/reference/gold_a.jpg inputs/reference/gold_b.jpg \
+    --look look_gold.json --gold --canvas 1920x1080 --output output/fish_gold_1080p.mp4
+```
+
+* `calibrate --gold` measures the reference fish: hue 90–98° (OKLCH), chroma 0.04 → 0.10 rising with lightness, L median 0.39–0.45.
+  The raw fish is already hue ≈ 103°, so this look is richer chroma + brighter scales + a slight shift toward amber, not a recolour.
+* Fish toe 0.16 keeps the black stripes dark (the reference mask leaves them out, so a plain quantile match would lift them);
+  micro-contrast ×1.25 and a σ 5 px clarity term; belly cooled to a silver (hue 235°).
+* Seabed gets a soft ceiling at OKLab L 0.50 so sunlit sand cannot out-shine the fish; vignette strength 0.70.
+* Halation: pixels above luma 0.42 bleed a warm two-radius glow (σ 9 and 26 px, gain 0.22); grain 1.1 %.
+* `--canvas 1920x1080` fits the portrait frame inside 1920×1080 (`scale … force_original_aspect_ratio=decrease:force_divisible_by=2`,
+  `pad` centred, `setsar=1`): a 608×1080 picture with black pillars. Encode: libx264 High, yuv420p, CRF 17, BT.709, source AAC copied.
+* Result vs reference (stills): fish L median 0.42–0.44 (ref 0.39–0.45), chroma median 0.053–0.082 (ref 0.056–0.076), hue median 89–94° (ref 94–96°).
+  Encoded-file flicker (HF rms): bg luma 0.0008, seabed luma 0.0004, fish luma 0.0021, fish saturation 0.0043 (source 0.0013 / 0.0010 / 0.0010 / 0.0050).
