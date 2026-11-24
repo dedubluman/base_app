@@ -47,17 +47,17 @@ P = dict(
     glow_amount=0.85,
     glow_rgb=(1.55, 0.97, 0.66),   # max multiplicative tint at full bloom
     # --- subject (Lab a*, b* targets and strength)
-    skin_a=15.0, skin_b=18.0,      # target chroma of sunlit skin
-    skin_strength=0.92,
-    skin_l_lift=0.50,              # shadow lift on the subject (0..1)
+    skin_a=11.0, skin_b=14.0,      # target chroma of sunlit skin
+    skin_strength=0.85,
+    skin_l_lift=0.60,              # shadow lift on the subject (0..1)
     skin_l_gain=1.28,
     skin_dark_floor=7.0,           # L* below which subject stays neutral
     # --- mask handling
-    mask_erode=1,
-    mask_feather=2.2,
-    guide_radius=6,
-    guide_eps=2e-3,
-    temporal=(0.25, 0.5, 0.25),
+    mask_erode=2,
+    mask_feather=1.6,
+    guide_radius=4,
+    guide_eps=1e-3,
+    temporal=(0.12, 0.76, 0.12),
 )
 
 
@@ -192,10 +192,10 @@ def load_soft_masks(mdir: Path, n: int, shape, p):
     if fixed:
         print(f"[mask] repaired dropout frames {fixed}")
     # temporal smoothing of the (hard) masks -> soft, jitter-free alpha
-    # (union with 85 % of each neighbour keeps motion-blurred limbs that SAM
-    #  drops for a frame from flickering in and out)
+    # light temporal smoothing only: a wider window grows halos on fast limbs
+    t0, t1, t2 = p["temporal"]
     pad = np.concatenate([out[:1], out, out[-1:]])
-    out = np.maximum(pad[1:-1], 0.85 * np.maximum(pad[:-2], pad[2:]))
+    out = t0 * pad[:-2] + t1 * pad[1:-1] + t2 * pad[2:]
     return out
 
 
