@@ -219,12 +219,13 @@ def key_indices(n: int, step: int) -> list[int]:
     return list(range(0, n, step))
 
 
-def run_sam_keyframes(info: VideoInfo, a: argparse.Namespace, cache: Path) -> tuple[Path, list[int]]:
+def run_sam_keyframes(info: VideoInfo, a: argparse.Namespace, cache: Path,
+                      prompt: str | None = None, tag: str = "") -> tuple[Path, list[int]]:
     """Run SAM 3.1 on every ``step``-th frame (re-using the repo's chunked,
     resumable tracker) and return (mask dir, keyframe indices)."""
     keys = key_indices(info.n_frames, a.sam_step)
     stem = f"{info.path.stem}_k{a.sam_step}"
-    mdir = a.masks_dir or (REPO / "masks" / stem)
+    mdir = (a.masks_dir if (a.masks_dir and not tag) else None) or (REPO / "masks" / f"{stem}{tag}")
     meta = mdir / "meta.json"
     if meta.exists() and json.loads(meta.read_text()).get("num_frames") == len(keys):
         log.info("SAM masks cached: %s (%d keyframes)", mdir, len(keys))
@@ -245,7 +246,7 @@ def run_sam_keyframes(info: VideoInfo, a: argparse.Namespace, cache: Path) -> tu
     sys.path.insert(0, str(REPO))
     from shades.config import Masking
     from shades.masking import run_sam31
-    cfg = Masking(text_prompt=a.text_prompt, parts={}, chunk_frames=a.sam_chunk,
+    cfg = Masking(text_prompt=prompt or a.text_prompt, parts={}, chunk_frames=a.sam_chunk,
                   chunk_overlap=4, max_num_objects=4, detector_batch=2)
     log.info("running SAM 3.1 on %d keyframes (CPU port takes ~15 s/frame)", len(keys))
     run_sam31(proxy, mdir, cfg, REPO, cache, log=log.info)
@@ -263,7 +264,8 @@ def load_keyframe_masks(mdir: Path, keys: list[int], sw: int, sh: int) -> dict[i
     return out
 
 
-def dense_masks(gray: np.ndarray, kmasks: dict[int, np.ndarray], a: argparse.Namespace) -> np.ndarray:
+def dense_masks(gray: np.ndarray, kmasks: dict[int, np.ndarray], a: argparse.Namespace,
+                grow: int | None = None) -> np.ndarray:
     """Per-frame soft mask (n, h, w) float32 in [0, 1] at working resolution.
 
     Frames between two valid keyframes: both keyframe masks are warped to the
@@ -302,8 +304,9 @@ def dense_masks(gray: np.ndarray, kmasks: dict[int, np.ndarray], a: argparse.Nam
             out[t] = (1 - wgt) * warp(prev, t) + wgt * warp(nxt, t)
         else:
             out[t] = warp(prev if prev is not None else nxt, t)
-    if a.mask_grow > 0:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * a.mask_grow + 1,) * 2)
+    grow = a.mask_grow if grow is None else grow
+    if grow > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1,) * 2)
         out = np.stack([cv2.dilate(m, k) for m in out])
     if a.mask_smooth > 0:
         out = gaussian_filter1d(out, a.mask_smooth, axis=0, mode="nearest")
@@ -345,6 +348,10 @@ class Look:
     ref_bg_median: np.ndarray            # for the final look-match check
     ref_bg_p: np.ndarray                 # (3, 3) p1/p50/p99 of reference water
     notes: dict = field(default_factory=dict)
+    ref_skin_lab: np.ndarray | None = None   # reference skin pixels (N, 3) Lab
+    skin_curve: np.ndarray | None = None     # (256,) video skin L*2.55 -> output L
+    skin_hue: float = 0.9                    # skin hue angle in the a*-b* plane (rad)
+    skin_knee: float = 60.0                  # lightness where the highlight shoulder starts
 
 
 def _bg_rule(rgb: np.ndarray) -> np.ndarray:
@@ -451,6 +458,8 @@ def learn_look(refs: list[np.ndarray], frames: np.ndarray, masks: np.ndarray,
                            n_ref_bg=int(sum(len(x) for x in ref_bg_px)),
                            n_src_warm=int(sub_sel.sum()),
                            ref_water_p1_50_99=p.round(0).tolist()))
+    rskin = rwarm[r_sat <= thr_r]
+    look.ref_skin_lab = _lab(_subsample(rskin if len(rskin) >= 500 else rwarm, 200_000, rng))
     log.info("look learned: %s", look.notes)
     return look
 
@@ -493,42 +502,176 @@ def _lab_transfer(lab, s: ClassStats, t: ClassStats, tame: float = 1.0):
     return out
 
 
+@dataclass
+class FrameMasks:
+    """Soft masks (float32 in [0, 1]) of one frame, cropped to ``box``
+    = (y0, y1, x0, x1) in output pixels."""
+    box: tuple
+    person: np.ndarray
+    shorts: np.ndarray | None
+    hair: np.ndarray | None
+
+
+def _luma(rgb255: np.ndarray) -> np.ndarray:
+    return 0.2126 * rgb255[..., 0] + 0.7152 * rgb255[..., 1] + 0.0722 * rgb255[..., 2]
+
+
+def shorts_fallback(rgb255: np.ndarray, thr: float) -> np.ndarray:
+    """Colour-based shorts matte, used only when no SAM 'shorts' masks exist."""
+    return (_smoothstep(_sat(rgb255), thr - 0.06, thr + 0.06)
+            * _smoothstep(rgb255[..., 0] - rgb255[..., 2], 8, 28))
+
+
+def skin_alpha(P, Sh, Hr, rgb255, thr):
+    """Split the person matte ``P`` into shorts and skin shares (each in
+    [0, 1], sum <= 1; the remainder - hair, goggles, cap - keeps the water
+    grade). Skin = person - shorts - hair - near-black (goggles/cap)."""
+    Sh = shorts_fallback(rgb255, thr) if Sh is None else Sh
+    Sh = np.minimum(Sh, P)
+    Hr = 0.0 if Hr is None else np.minimum(Hr, P)
+    black = 1 - _smoothstep(_luma(rgb255), 30, 52)
+    return Sh, (1 - Sh) * (1 - Hr) * (1 - black)
+
+
+def learn_skin(look: Look, frames: np.ndarray, masks: dict, a: argparse.Namespace) -> None:
+    """Static skin tone model (no per-frame state -> no flicker).
+
+    The reference skin is pale/neutral, so it is NOT matched pixel for pixel
+    (that would bring the chalky look back). Instead:
+
+    * lightness: a smooth monotone curve maps this video's own skin-lightness
+      percentiles (p1, p25, p50, p75, p99) onto a natural tan range
+      (--skin-l-lo / --skin-l-mid / --skin-l-hi). Blown highlights roll off
+      into a peach shoulder; shadows stay a deep warm brown;
+    * hue: the angle comes from the reference's clearly warm skin pixels
+      (plus --skin-hue-shift towards olive/yellow for underwater realism);
+    * chroma: --skin-chroma, easing off in the highlights (peach, not salmon).
+    """
+    from scipy.interpolate import PchipInterpolator
+    rng = np.random.default_rng(a.seed)
+    P = masks["person"]
+    _, a_sk = skin_alpha(P, masks.get("shorts"), masks.get("hair"),
+                         frames.astype(np.float32), look.sat_thr_src)
+    w = P * a_sk
+    per_frame = []
+    for t in range(len(frames)):          # equal weight per frame (near/far diver)
+        px = frames[t][w[t] > 0.8]
+        if len(px):
+            per_frame.append(_subsample(px, 1500, rng))
+    px = np.concatenate(per_frame) if per_frame else np.zeros((0, 3), np.uint8)
+    if len(px) < 500:
+        raise PipelineError("too few skin pixels found in the SAM masks")
+    L = _lab(px)[:, 0]
+    q = np.percentile(L, [1, 25, 50, 75, 99])
+    lo, mid, hi = a.skin_l_lo, a.skin_l_mid, a.skin_l_hi
+    xs = np.array([0.0, *q, 100.0])
+    ys = np.array([0.0, lo, (lo + mid) / 2, mid, (mid + hi) / 2, hi, hi + 4])
+    xs = np.maximum.accumulate(xs + np.arange(len(xs)) * 1e-3)       # strictly increasing
+    look.skin_curve = PchipInterpolator(xs, ys)(np.arange(256) / 2.55).astype(np.float32)
+    look.skin_knee = float(hi)
+    # hue of the reference's clearly warm skin (chroma > 12, mid lightness)
+    ref = look.ref_skin_lab
+    chroma = np.hypot(ref[:, 1], ref[:, 2])
+    deg = np.rad2deg(np.arctan2(ref[:, 2], ref[:, 1]))
+    sel = (chroma > 12) & (ref[:, 0] > 25) & (ref[:, 0] < 65) & (deg > 30) & (deg < 75)
+    hue = np.deg2rad(np.median(deg[sel])) if sel.sum() > 200 else np.deg2rad(55.0)   # plausible skin hues only
+    look.skin_hue = float(hue + np.deg2rad(a.skin_hue_shift))
+    look.notes.update(skin_src_L_p1_25_50_75_99=q.round(1).tolist(),
+                      skin_target_L=[lo, mid, hi],
+                      skin_hue_deg=round(float(np.rad2deg(look.skin_hue)), 1),
+                      n_skin_px=len(px))
+    log.info("skin model: %s", {k: v for k, v in look.notes.items() if k.startswith("skin")})
+
+
 class Grader:
     def __init__(self, look: Look, a: argparse.Namespace):
         self.look, self.a = look, a
+        self.qc: list[tuple | None] = []     # per-frame output skin stats
 
-    def subject_colour(self, rgb255: np.ndarray) -> np.ndarray:
-        """Warm classes (shorts/skin) -> reference subject colours (Lab)."""
+    # -- shorts ------------------------------------------------------------
+    def shorts_colour(self, rgb255: np.ndarray) -> np.ndarray:
         lk = self.look
-        rgb01 = np.clip(rgb255 / 255, 0, 1).astype(np.float32)
-        lab = cv2.cvtColor(rgb01, cv2.COLOR_RGB2LAB)
-        sat = _sat(rgb01)
-        s = (1 / (1 + np.exp(-(sat - lk.sat_thr_src) / 0.04)))[..., None].astype(np.float32)
-        lab_o = ((1 - s) * _lab_transfer(lab, lk.skin_src, lk.skin_ref, tame=0.7)
-                 + s * _lab_transfer(lab, lk.shorts_src, lk.shorts_ref))
-        return np.clip(cv2.cvtColor(lab_o.astype(np.float32), cv2.COLOR_LAB2RGB), 0, 1) * 255
+        lab = cv2.cvtColor(np.clip(rgb255 / 255, 0, 1).astype(np.float32), cv2.COLOR_RGB2LAB)
+        lab = _lab_transfer(lab, lk.shorts_src, lk.shorts_ref).astype(np.float32)
+        return np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 1) * 255
 
-    def __call__(self, frame: np.ndarray, mask: np.ndarray | None, gain: float,
+    # -- skin --------------------------------------------------------------
+    def skin_colour(self, src: np.ndarray, bg: np.ndarray) -> np.ndarray:
+        """Source skin (any cast) -> warm natural skin of the reference.
+
+        1. bubbles/refraction on skin that are dark *and* bluer than the skin
+           around them are filled from a grey closing (no black dots);
+        2. lightness = static quantile curve on the smooth base (highlights
+           roll off, no chalky white) + the original fine detail (texture);
+        3. chroma comes from the reference skin model for that lightness,
+           removing cyan/green/ashy casts and yellow/dark patches;
+        4. genuine bubble glints (bright and cool) stay clean and neutral.
+        """
+        a, lk = self.a, self.look
+        lab = cv2.cvtColor(np.clip(src / 255, 0, 1).astype(np.float32), cv2.COLOR_RGB2LAB)
+        L, B = lab[..., 0].copy(), lab[..., 2]
+        h, w = L.shape
+        big = min(h, w) >= 64
+        bmed = (cv2.medianBlur(np.clip(B + 128, 0, 255).astype(np.uint8), 31).astype(np.float32)
+                - 128) if big else np.full_like(B, float(np.median(B)))
+        cool = bmed - B                       # > 0: bluer than the surrounding skin
+        r = a.skin_speck_radius
+        if r > 0 and big:
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+            Lc = cv2.morphologyEx(np.clip(L * 2.55, 0, 255).astype(np.uint8),
+                                  cv2.MORPH_CLOSE, k).astype(np.float32) / 2.55
+            dark = Lc - L                  # clearly dark pits fill even when not bluish
+            sp = _smoothstep(dark, 6, 16) * np.maximum(_smoothstep(cool, 2, 10),
+                                                       _smoothstep(dark, 16, 30))
+            sp = cv2.GaussianBlur(cv2.dilate(sp, np.ones((5, 5), np.uint8)), (0, 0), 1.2)
+            L = L * (1 - sp) + Lc * sp
+        base = 100 * guided_filter(L / 100, L / 100, 6, 2e-3)
+        detail = np.clip(L - base, -20, 20) * a.skin_texture
+        Lb = np.interp(base * 2.55, np.arange(256), lk.skin_curve)
+        Lo = Lb + detail
+        k_, hr = lk.skin_knee, 6.0                       # soft highlight shoulder
+        Lo = np.clip(np.where(Lo > k_, k_ + hr * np.tanh((Lo - k_) / hr), Lo), 0, 100)
+        C = a.skin_chroma * (1 - 0.35 * _smoothstep(Lo, 60, 82))   # peach, not salmon, in highlights
+        ao, bo = C * np.cos(lk.skin_hue), C * np.sin(lk.skin_hue)
+        glint = _smoothstep(L - base, 8, 22) * _smoothstep(cool, 6, 14)
+        ao, bo = ao * (1 - glint) - 1.5 * glint, bo * (1 - glint) - 3.0 * glint
+        rgb = np.clip(cv2.cvtColor(np.dstack([Lo, ao, bo]).astype(np.float32),
+                                   cv2.COLOR_LAB2RGB), 0, 1) * 255
+        return rgb * (1 - a.skin_ambient) + bg * a.skin_ambient
+
+    # -- frame -------------------------------------------------------------
+    def __call__(self, frame: np.ndarray, fm: FrameMasks | None, gain: float,
                  rng: np.random.Generator) -> np.ndarray:
         a, lk = self.a, self.look
         src = np.clip(frame.astype(np.float32) * gain, 0, 255)
         out = apply_curve(src, lk.lut)                          # water / seabed
-        if mask is not None and mask.max() > 3e-3:
-            ys, xs = np.where(mask > 0.01)
-            pad = 6
-            y0, y1 = max(ys.min() - pad, 0), min(ys.max() + pad + 1, mask.shape[0])
-            x0, x1 = max(xs.min() - pad, 0), min(xs.max() + pad + 1, mask.shape[1])
-            crop = src[y0:y1, x0:x1]
-            warm = self.subject_colour(crop)
-            ww = _smoothstep(crop[..., 0] - crop[..., 2], -14, 6)[..., None]
-            subj = out[y0:y1, x0:x1] * (1 - ww) + warm * ww      # cool bits (hair, shadow) stay in-water
-            m = mask[y0:y1, x0:x1, None]
-            out[y0:y1, x0:x1] = out[y0:y1, x0:x1] * (1 - m) + subj * m
-        if a.highlight_protect > 0:                              # bubbles / glints
-            lum = (0.2126 * src[..., 0] + 0.7152 * src[..., 1] + 0.0722 * src[..., 2]) / 255
+        P_full = None
+        qc = None
+        if fm is not None and fm.person.max() > 3e-3:
+            y0, y1, x0, x1 = fm.box
+            crop, bgc, P = src[y0:y1, x0:x1], out[y0:y1, x0:x1], fm.person
+            a_sh, a_sk = skin_alpha(P, fm.shorts, fm.hair, crop, lk.sat_thr_src)
+            inner = bgc * (1 - a_sh - a_sk)[..., None]           # hair/goggles: water grade
+            if (P * a_sk).max() > 3e-3:
+                skin = self.skin_colour(crop, bgc)
+                inner = inner + skin * a_sk[..., None]
+                sel = (P * a_sk) > 0.8
+                if sel.sum() > 300:
+                    lab = cv2.cvtColor(np.clip(skin[sel][None] / 255, 0, 1).astype(np.float32),
+                                       cv2.COLOR_RGB2LAB)[0]
+                    qc = (*np.median(lab, 0), float(np.percentile(lab[:, 0], 99)),
+                          float((lab[:, 0] > 82).mean()), int(sel.sum()))
+            if (P * a_sh).max() > 3e-3:
+                inner = inner + self.shorts_colour(crop) * a_sh[..., None]
+            out[y0:y1, x0:x1] = bgc * (1 - P[..., None]) + inner * P[..., None]
+            P_full = (y0, y1, x0, x1, P)
+        self.qc.append(qc)
+        if a.highlight_protect > 0:                              # bubbles / glints in the water
+            lum = _luma(src) / 255
             h = _smoothstep(lum, 0.70, 0.90) * a.highlight_protect
-            if mask is not None:   # sunlit skin is graded, not protected
-                h = h * (1 - mask)
+            if P_full is not None:   # the subject is graded, not protected
+                y0, y1, x0, x1, P = P_full
+                h[y0:y1, x0:x1] *= 1 - P
             h = h[..., None]
             spec = src * np.array([0.93, 0.99, 1.06], np.float32)   # take the green out
             out = out * (1 - h) + spec * h
@@ -550,6 +693,22 @@ def load_references(paths: list[Path]) -> list[np.ndarray]:
     return out
 
 
+def load_part(info, a, gray, sw, sh, prompt: str, tag: str):
+    """Dense soft mask of a SAM 3.1 sub-part (shorts / hair); None -> fallback."""
+    if not prompt:
+        return None
+    mdir = REPO / "masks" / f"{info.path.stem}_k{a.sam_step}{tag}"
+    if a.parts_sam == "off" and not (mdir / "meta.json").exists():
+        log.warning("no cached SAM '%s' masks and --parts-sam off: using the colour fallback", prompt)
+        return None
+    try:
+        mdir, keys = run_sam_keyframes(info, a, a.cache, prompt=prompt, tag=tag)
+        return dense_masks(gray, load_keyframe_masks(mdir, keys, sw, sh), a, grow=0)
+    except PipelineError as e:
+        log.warning("SAM '%s' masks unavailable (%s): using the fallback", prompt, e)
+        return None
+
+
 def stage_analyse(info: VideoInfo, a, work: Path):
     """Pass 1: working-resolution frames, SAM masks, dense masks, stabiliser gains."""
     sh = a.work_height
@@ -563,13 +722,17 @@ def stage_analyse(info: VideoInfo, a, work: Path):
     gray = np.stack([cv2.cvtColor(f, cv2.COLOR_RGB2GRAY) for f in frames])
     mdir, keys = run_sam_keyframes(info, a, a.cache)
     km = load_keyframe_masks(mdir, keys, sw, sh)
-    masks = dense_masks(gray, km, a)
-    cov = masks.mean((1, 2))
+    person = dense_masks(gray, km, a)
+    masks = {"person": person,
+             "shorts": load_part(info, a, gray, sw, sh, a.shorts_prompt, "_shorts"),
+             "hair": load_part(info, a, gray, sw, sh, a.hair_prompt, "_hair")}
+    cov = person.mean((1, 2))
     log.info("subject coverage per frame: min %.3f median %.3f max %.3f",
              cov.min(), np.median(cov), cov.max())
+    log.info("part masks: shorts=%s hair=%s", masks["shorts"] is not None, masks["hair"] is not None)
     # exposure stabiliser: remove only fast flicker of the water's brightness
     lum = gray.astype(np.float32)
-    logm = np.array([np.log(max(np.median(lum[t][masks[t] < 0.02]) if (masks[t] < 0.02).any()
+    logm = np.array([np.log(max(np.median(lum[t][person[t] < 0.02]) if (person[t] < 0.02).any()
                                 else np.median(lum[t]), 1.0)) for t in range(n)])
     gains = np.exp(gaussian_filter1d(logm, a.stab_sigma, mode="nearest") - logm)
     gains = np.clip(gains, 1 - a.stab_clamp, 1 + a.stab_clamp).astype(np.float32)
@@ -577,8 +740,34 @@ def stage_analyse(info: VideoInfo, a, work: Path):
     return frames, masks, gains
 
 
-def stage_render(info, a, look, masks, gains, out: Path, ow: int, oh: int, work: Path) -> None:
-    sh, sw = masks.shape[1:]
+def frame_masks(masks: dict, t: int, fr: np.ndarray, a, ow: int, oh: int) -> FrameMasks | None:
+    """Crop box around the diver + edge-snapped (guided filter) full-res mattes."""
+    P_s = masks["person"][t]
+    if P_s.max() <= 3e-3:
+        return None
+    sh, sw = P_s.shape
+    ys, xs = np.where(P_s > 0.01)
+    pad = 20
+    x0, x1 = max(int(xs.min() * ow / sw) - pad, 0), min(int((xs.max() + 1) * ow / sw) + pad, ow)
+    y0, y1 = max(int(ys.min() * oh / sh) - pad, 0), min(int((ys.max() + 1) * oh / sh) + pad, oh)
+    g = cv2.cvtColor(fr[y0:y1, x0:x1], cv2.COLOR_RGB2GRAY).astype(np.float32) / 255
+
+    def up(m, edge=False):
+        if m is None:
+            return None
+        c = cv2.resize(m[t], (ow, oh), interpolation=cv2.INTER_LINEAR)[y0:y1, x0:x1]
+        if a.guided:
+            c = guided_filter(g, c, a.guided_radius, 2e-4)
+        c = np.clip(c, 0, 1)
+        # Edge pixels mix skin and water; a skin-colour grade on them would
+        # leave a warm halo. Pull the matte's ramp inwards (still soft).
+        return _smoothstep(c, a.edge_lo, a.edge_hi) if edge else c
+
+    return FrameMasks((y0, y1, x0, x1), up(masks["person"], edge=True), up(masks["shorts"]),
+                      up(masks["hair"]))
+
+
+def stage_render(info, a, look, masks, gains, out: Path, ow: int, oh: int, work: Path):
     grader = Grader(look, a)
     rng = np.random.default_rng(a.seed)
     enc = Encoder(info, out, ow, oh, a.crf, a.preset, work / "encode.log")
@@ -592,13 +781,7 @@ def stage_render(info, a, look, masks, gains, out: Path, ow: int, oh: int, work:
         for t, fr in enumerate(read_frames(info.path, ow, oh, "lanczos")):
             if t >= info.n_frames:
                 break
-            m = None
-            if masks[t].max() > 3e-3:
-                m = cv2.resize(masks[t], (ow, oh), interpolation=cv2.INTER_LINEAR)
-                if a.guided:
-                    g = cv2.cvtColor(fr, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255
-                    m = np.clip(guided_filter(g, m, a.guided_radius, 2e-4), 0, 1)
-            res = grader(fr, m, float(gains[t]), rng)
+            res = grader(fr, frame_masks(masks, t, fr, a, ow, oh), float(gains[t]), rng)
             enc.write(res)
             if t in prev_idx:
                 cv2.imwrite(str(prev_dir / f"{t:05d}.jpg"),
@@ -616,6 +799,29 @@ def stage_render(info, a, look, masks, gains, out: Path, ow: int, oh: int, work:
     if n_done != info.n_frames:
         raise PipelineError(f"rendered {n_done} frames, expected {info.n_frames}")
     log.info("encoded %s (%.1f MB)", out, out.stat().st_size / 1e6)
+    return grader.qc
+
+
+def skin_report(qc: list, look: Look) -> tuple[dict, dict]:
+    """Skin QC of the rendered frames (measured on the graded skin pixels)."""
+    rows = np.array([q if q is not None else [np.nan] * 6 for q in qc], float)
+    ok = ~np.isnan(rows[:, 0])
+    if ok.sum() < 5:
+        return {}, {}
+    ref = np.median(look.ref_skin_lab, 0)
+    med = np.nanmedian(rows[:, :3], 0)
+    series = rows[ok, 0]
+    sm = gaussian_filter1d(series, 2.0, mode="nearest")
+    jump = float(np.abs(np.diff(sm)).max())
+    rep = dict(frames_with_skin=int(ok.sum()),
+               skin_median_Lab=med.round(1).tolist(), reference_skin_median_Lab=ref.round(1).tolist(),
+               skin_p99_L_max=float(np.nanmax(rows[:, 3]).round(1)),
+               chalky_fraction_L_gt_82=float(np.nanmean(rows[:, 4]).round(5)),
+               skin_L_max_frame_to_frame_jump=round(jump, 2))
+    chk = {"skin_not_chalky": rep["chalky_fraction_L_gt_82"] < 0.01,
+           "skin_hue_matches_reference": bool(abs(med[1] - ref[1]) < 7 and abs(med[2] - ref[2]) < 9),
+           "skin_temporally_stable": jump < 4.0}
+    return rep, chk
 
 
 # ---------------------------------------------------------------------------
@@ -700,10 +906,31 @@ def parse_args(argv=None) -> argparse.Namespace:
     mk.add_argument("--mask-grow", type=int, default=1, help="dilate masks (working-res px)")
     mk.add_argument("--mask-smooth", type=float, default=1.2, help="temporal sigma (frames)")
     mk.add_argument("--feather", type=float, default=1.5, help="edge feather (working-res px)")
+    mk.add_argument("--edge-lo", type=float, default=0.40,
+                    help="person matte ramp start: pulls the subject edge inwards (no warm halo)")
+    mk.add_argument("--edge-hi", type=float, default=0.80)
     mk.add_argument("--no-guided", dest="guided", action="store_false",
                     help="skip guided-filter edge snapping")
     mk.add_argument("--guided-radius", type=int, default=8)
     gr = p.add_argument_group("grade")
+    sk = p.add_argument_group("skin (SAM 3.1 person - shorts - hair)")
+    sk.add_argument("--shorts-prompt", default="shorts",
+                    help="SAM text prompt for the shorts ('' = colour fallback)")
+    sk.add_argument("--hair-prompt", default="hair", help="SAM text prompt for hair ('' = none)")
+    sk.add_argument("--parts-sam", choices=["auto", "off"], default="auto",
+                    help="auto: run SAM for missing shorts/hair masks (~25 min each on CPU); "
+                         "off: use cached ones or the colour fallback")
+    sk.add_argument("--skin-l-lo", type=float, default=30, help="target skin L* at the video's p1")
+    sk.add_argument("--skin-l-mid", type=float, default=56, help="target skin L* at the median")
+    sk.add_argument("--skin-l-hi", type=float, default=76, help="target skin L* at p99 (highlight cap)")
+    sk.add_argument("--skin-chroma", type=float, default=19, help="skin chroma C* (warmth)")
+    sk.add_argument("--skin-hue-shift", type=float, default=6,
+                    help="degrees from the reference skin hue; + = towards olive/yellow")
+    sk.add_argument("--skin-texture", type=float, default=1.0, help="skin fine-detail gain")
+    sk.add_argument("--skin-speck-radius", type=int, default=9,
+                    help="bubble-speck repair size on skin (px, 0 = off)")
+    sk.add_argument("--skin-ambient", type=float, default=0.06,
+                    help="share of the water grade mixed into skin (sits it in the scene)")
     gr.add_argument("--highlight-protect", type=float, default=0.8,
                     help="0..1 keep specular bubbles/glints out of the grade")
     gr.add_argument("--stab-sigma", type=float, default=5.0, help="exposure stabiliser (frames)")
@@ -751,13 +978,14 @@ def run(a: argparse.Namespace) -> int:
     work.mkdir(parents=True, exist_ok=True)
     refs = load_references(a.reference)
 
-    look = None
+    look, qc = None, None
     if not a.verify_only:
         frames, masks, gains = stage_analyse(info, a, work)
-        look = learn_look(refs, frames, masks, a.seed)
+        look = learn_look(refs, frames, masks["person"], a.seed)
+        learn_skin(look, frames, masks, a)
         (work / "look.json").write_text(json.dumps(look.notes, indent=1))
         del frames
-        stage_render(info, a, look, masks, gains, out, ow, oh, work)
+        qc = stage_render(info, a, look, masks, gains, out, ow, oh, work)
     elif not out.exists():
         raise PipelineError(f"--verify-only but {out} does not exist")
 
@@ -767,6 +995,11 @@ def run(a: argparse.Namespace) -> int:
             rb = np.concatenate([r[_bg_rule(r)] for r in refs])
             look = Look(None, None, None, None, None, 0, np.median(rb, 0), None)
         rep = verify_output(out, info, ow, oh, look)
+        if qc is not None:
+            srep, schk = skin_report(qc, look)
+            rep["skin_qc"] = srep
+            rep["checks"].update(schk)
+            rep["ok"] = all(rep["checks"].values())
         rep["seconds_total"] = round(time.time() - t_start, 1)
         (out.with_suffix(".report.json")).write_text(json.dumps(rep, indent=1))
         for k, v in rep["checks"].items():
