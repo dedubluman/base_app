@@ -29,7 +29,7 @@ else
   FIT_VF="scale=-2:1080:flags=lanczos+accurate_rnd,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black"
 fi
 
-ffmpeg -hide_banner -v error -stats -y -i "$IN" -an \
+ffmpeg -hide_banner -v error -nostats -y -i "$IN" -an \
   -vf "setpts=${K}*PTS,minterpolate=fps=${FPS}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:me=epzs:mb_size=16:search_param=32:vsbmc=1:scd=none,tpad=stop_mode=clone:stop=${FPS},${FIT_VF},format=yuv420p" \
   -frames:v "$N" -r "$FPS" \
   -c:v libx264 -preset slow -crf 17 -profile:v high -level 4.2 -pix_fmt yuv420p \
