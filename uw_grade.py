@@ -14,7 +14,7 @@ mask ``alpha``:
   replaces it with a natural warm tan / peach chroma (Lab a*/b*, lightness kept),
   lifts shadow detail on the backlit body, and keeps near-black gear (mask,
   snorkel, stick) neutral.  Pale low-chroma gear such as shorts is excluded
-  through an optional second SAM mask (``--exclude-masks``).
+  through an optional second SAM mask (``--shorts-masks``, any stride).
 
 The output is a lossless 10-bit FFV1 intermediate at source resolution/fps.
 Every constant lives in ``P`` below.
@@ -144,13 +144,16 @@ def world_pass(rgb, p):
 
 
 # ----------------------------------------------------------------------------- subject
-def subject_pass(rgb, p, cast):
+def subject_pass(rgb, p, cast, shorts=None):
     """rgb = already world-graded frame.  cast = (a, b) median chroma of the
     subject's skin in that space (measured once for the whole clip)."""
     lab = to_lab(rgb)
     L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
     # keep deep blacks (mask, snorkel, stick) neutral
     w = smoothstep(p["skin_dark_floor"], p["skin_dark_floor"] + 14, L) * p["skin_strength"]
+    w = w * (1 - 0.45 * smoothstep(62, 90, L))     # pale highlights stay less tinted
+    if shorts is not None:                         # pale gear: only a hint of warmth
+        w = w * (1 - 0.8 * shorts)
     # remove the water cast, add skin chroma. 0.78 keeps natural chroma variation
     a2 = a + w * ((a - cast[0]) * -0.0 + (p["skin_a"] - cast[0])) * 1.0
     b2 = b + w * (p["skin_b"] - cast[1])
@@ -158,13 +161,15 @@ def subject_pass(rgb, p, cast):
     x = np.clip(L / 100.0, 0, 1)
     lift = p["skin_l_lift"]
     x2 = x + lift * (1 - x) ** 2 * x * 2.2
-    x2 = np.clip(x2 * p["skin_l_gain"], 0, 1)
+    # gain acts on shadows/mids only: bright, sun-lit skin is left alone
+    g = 1 + (p["skin_l_gain"] - 1) * (1 - smoothstep(0.40, 0.72, x))
+    x2 = np.clip(x2 * g, 0, 1)
     L2 = 100.0 * x2
     return from_lab(np.dstack([L2, a2, b2]))
 
 
 # ----------------------------------------------------------------------------- masks
-def load_soft_masks(mdir: Path, n: int, shape, p, exclude: Path | None = None):
+def load_soft_masks(mdir: Path, n: int, shape, p):
     h, w = shape
     out = np.zeros((n, h, w), np.float32)
     k = 2 * p["mask_erode"] + 1
@@ -172,11 +177,6 @@ def load_soft_masks(mdir: Path, n: int, shape, p, exclude: Path | None = None):
     for i in range(n):
         m = cv2.imread(str(mdir / "subject" / f"{i:05d}.png"), cv2.IMREAD_GRAYSCALE)
         m = (m > 127).astype(np.uint8) if m is not None else np.zeros((h, w), np.uint8)
-        if exclude is not None:
-            e = cv2.imread(str(exclude / "subject" / f"{i:05d}.png"), cv2.IMREAD_GRAYSCALE)
-            if e is not None:
-                e = cv2.dilate((e > 127).astype(np.uint8), ker, iterations=2)
-                m = m & (1 - e)
         if p["mask_erode"] > 0:
             m = cv2.erode(m, ker)
         out[i] = m.astype(np.float32)
@@ -192,9 +192,26 @@ def load_soft_masks(mdir: Path, n: int, shape, p, exclude: Path | None = None):
     if fixed:
         print(f"[mask] repaired dropout frames {fixed}")
     # temporal smoothing of the (hard) masks -> soft, jitter-free alpha
-    t0, t1, t2 = p["temporal"]
+    # (union with 85 % of each neighbour keeps motion-blurred limbs that SAM
+    #  drops for a frame from flickering in and out)
     pad = np.concatenate([out[:1], out, out[-1:]])
-    out = t0 * pad[:-2] + t1 * pad[1:-1] + t2 * pad[2:]
+    out = np.maximum(pad[1:-1], 0.85 * np.maximum(pad[:-2], pad[2:]))
+    return out
+
+
+def load_stride_masks(mdir: Path, n: int, shape, stride: int, p):
+    """Masks computed on every `stride`-th frame -> per-frame soft masks."""
+    h, w = shape
+    ks = sorted(int(f.stem) for f in (mdir / "subject").glob("*.png"))
+    base = np.zeros((len(ks), h, w), np.float32)
+    for j, k in enumerate(ks):
+        m = cv2.imread(str(mdir / "subject" / f"{k:05d}.png"), cv2.IMREAD_GRAYSCALE)
+        base[j] = (m > 127).astype(np.float32)
+    out = np.zeros((n, h, w), np.float32)
+    for i in range(n):
+        f = min(i / stride, len(ks) - 1)
+        j0 = int(np.floor(f)); j1 = min(j0 + 1, len(ks) - 1); t = f - j0
+        out[i] = (1 - t) * base[j0] + t * base[j1]
     return out
 
 
@@ -227,11 +244,14 @@ def read_frames(path, w, h):
     pr.wait()
 
 
-def grade_frame(rgb, alpha, p, cast):
+def grade_frame(rgb, alpha, p, cast, shorts=None):
     world = world_pass(rgb, p)
     if alpha is None or alpha.max() <= 0.001:
         return world, world
-    subj = subject_pass(world, p, cast)
+    sh = None
+    if shorts is not None:
+        sh = cv2.GaussianBlur(shorts, (0, 0), 3.0)
+    subj = subject_pass(world, p, cast, sh)
     al = refine_alpha(alpha, rgb, p)[..., None]
     return world * (1 - al) + subj * al, world
 
@@ -253,7 +273,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input", type=Path, required=True)
     ap.add_argument("--masks", type=Path, required=True)
-    ap.add_argument("--exclude-masks", type=Path, default=None)
+    ap.add_argument("--shorts-masks", type=Path, default=None,
+                    help="SAM 'shorts' masks (pale gear gets only a hint of skin warmth)")
+    ap.add_argument("--shorts-stride", type=int, default=1,
+                    help="shorts masks were computed on every Nth frame")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--preview", default="", help="comma frame list -> PNG previews in --out")
     ap.add_argument("--set", action="append", default=[], help="PARAM=VALUE override")
@@ -266,14 +289,17 @@ def main():
     w, h, num, den = probe(a.input)
     frames = list(read_frames(a.input, w, h))
     n = len(frames)
-    masks = load_soft_masks(a.masks, n, (h, w), p, a.exclude_masks)
+    masks = load_soft_masks(a.masks, n, (h, w), p)
+    shorts = None
+    if a.shorts_masks is not None:
+        shorts = load_stride_masks(a.shorts_masks, n, (h, w), a.shorts_stride, p)
     cast = measure_cast(frames[::6], masks[::6], p)
     print(f"[grade] {n} frames {w}x{h}; subject cast a*,b* = {cast[0]:.1f},{cast[1]:.1f}")
 
     if a.preview:
         a.out.mkdir(parents=True, exist_ok=True)
         for i in map(int, a.preview.split(",")):
-            g, wd = grade_frame(frames[i], masks[i], p, cast)
+            g, wd = grade_frame(frames[i], masks[i], p, cast, None if shorts is None else shorts[i])
             al = refine_alpha(masks[i], frames[i], p)
             tile = np.concatenate([frames[i], g, np.repeat(al[..., None], 3, -1)], 1)
             cv2.imwrite(str(a.out / f"prev_{i:04d}.jpg"),
@@ -290,7 +316,7 @@ def main():
         stdin=subprocess.PIPE)
     rng = np.random.default_rng(7)
     for i in range(n):
-        g, _ = grade_frame(frames[i], masks[i], p, cast)
+        g, _ = grade_frame(frames[i], masks[i], p, cast, None if shorts is None else shorts[i])
         g = g * 65535.0 + rng.uniform(-0.5, 0.5, g.shape).astype(np.float32) * 16
         enc.stdin.write(np.clip(g, 0, 65535).astype("<u2").tobytes())
         if i % 20 == 0:
