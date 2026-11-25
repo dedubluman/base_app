@@ -21,7 +21,7 @@ def probe(path):
 
 def reader(path, w, h, start=0, end=None):
     vf = "scale=in_range=tv:out_range=pc:in_color_matrix=bt709:out_color_matrix=bt709"
-    cmd = ["ffmpeg", "-v", "error", "-i", str(path), "-vf", vf, "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
+    cmd = ["ffmpeg", "-v", "error", "-i", str(path), "-vf", vf, "-fps_mode", "passthrough", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=w * h * 3 * 4)
     return p
 
@@ -32,7 +32,7 @@ def main():
     ap.add_argument("--params", type=Path, default=None)
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--frames", type=int, default=None, help="render only the first N frames (tests)")
-    ap.add_argument("--crf", type=int, default=14)
+    ap.add_argument("--crf", type=int, default=17)
     ap.add_argument("--exp-target", type=float, default=0.43)
     ap.add_argument("--exp-strength", type=float, default=0.4)
     ap.add_argument("--exp-sigma", type=float, default=20.0, help="temporal smoothing of the exposure normaliser (frames)")
@@ -48,7 +48,7 @@ def main():
 
     # ---- pass 1: exposure statistics, smoothed in time so the grade never pumps ----
     t0 = time.time()
-    small = subprocess.run(["ffmpeg", "-v", "error", "-i", str(a.input), "-vf",
+    small = subprocess.run(["ffmpeg", "-v", "error", "-i", str(a.input), "-fps_mode", "passthrough", "-vf",
                             "scale=108:192:flags=area:in_range=tv:out_range=pc:in_color_matrix=bt709",
                             "-pix_fmt", "rgb24", "-f", "rawvideo", "-"], capture_output=True, check=True).stdout
     small = np.frombuffer(small, np.uint8).reshape(-1, 192, 108, 3).astype(np.float32) / 255

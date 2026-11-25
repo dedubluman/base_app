@@ -13,7 +13,7 @@ from pathlib import Path
 import cv2, numpy as np
 
 def decode_small(path, w, h):
-    p = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-vf",
+    p = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-fps_mode", "passthrough", "-vf",
                         f"scale={w}:{h}:flags=area:in_range=tv:out_range=pc:in_color_matrix=bt709",
                         "-pix_fmt", "rgb24", "-f", "rawvideo", "-"], capture_output=True, check=True)
     return np.frombuffer(p.stdout, np.uint8).reshape(-1, h, w, 3)

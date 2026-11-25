@@ -64,7 +64,10 @@ def grade(rgb, P=P_DEFAULT, fish=None, lmul=1.0):
         # local S-curve for stripe separation inside the fish only
         sf = Ln * Ln * (3 - 2 * np.clip(Ln, 0, 1))
         Ln = Ln * (1 - fish_w * P["fish_con"]) + sf * fish_w * P["fish_con"]
-    Lo = np.clip(Ln, 0, 1.05)
+    Lo = np.clip(Ln, 0, 1.3)
+    # highlight shoulder: roll off above 0.82 so bright rock never clips
+    k0 = 0.82
+    Lo = np.where(Lo > k0, k0 + (1 - k0) * (1 - np.exp(-(Lo - k0) / (1 - k0))) * 0.97, Lo)
     # --- chroma / hue work ---
     C = np.hypot(a, b); h = np.degrees(np.arctan2(b, a)) % 360
     # warm rocks: hue pull toward amber + chroma lift, weighted by hue proximity and existing chroma
