@@ -16,11 +16,11 @@ from shades.io import probe, iter_frames
 PINHOLE_PX = 60   # largest enclosed hole that is filled (SAM speckle); anything bigger is background and stays out
 
 
-def clean(m, min_frac=0.0015):
+def clean(m, min_px=300):
     n, lab, st, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), 8)
     out = np.zeros_like(m)
     for k in range(1, n):
-        if st[k, cv2.CC_STAT_AREA] >= min_frac * m.size:
+        if st[k, cv2.CC_STAT_AREA] >= min_px:       # specks only; heads, fin blobs and knees are real subject parts
             out |= lab == k
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))   # hairline cracks only: wider closing would web fingers / close-set legs together
     out = cv2.morphologyEx(out.astype(np.uint8), cv2.MORPH_CLOSE, k) > 0
@@ -51,7 +51,8 @@ def main():
     ap.add_argument("--raw", type=Path, required=True)
     ap.add_argument("--input", type=Path, default=Path("inputs/player_export.mov"))
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--feather", type=float, default=1.6)
+    ap.add_argument("--feather", type=float, default=1.2)
+    ap.add_argument("--temporal", type=float, default=0.0, help="weight of each flow-compensated neighbour frame (0 = off). The raw SAM 3.1 masks are already stable and smoothing shifts fast-moving edges.")
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     info = probe(a.input)
@@ -64,7 +65,7 @@ def main():
     raw = [clean(m) if m is not None else np.zeros((h, w), bool) for m in raw]
     area = np.array([m.sum() for m in raw], float)
     med = np.array([np.median(area[max(0, i - 7):i + 8]) for i in range(n)])
-    gray = [cv2.cvtColor((f * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY) for f in iter_frames(a.input, info)]
+    gray = [cv2.cvtColor((f * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY) for f in iter_frames(a.input, info)] if (a.temporal > 0 or True) else None
     bad = (area < 0.55 * med) | (area == 0)
     print("suspect frames (lost/truncated):", np.flatnonzero(bad).tolist())
     fixed = [m.astype(np.float32) for m in raw]
@@ -78,10 +79,12 @@ def main():
     # flow-compensated temporal smoothing
     out = []
     for i in range(n):
-        acc, wsum = fixed[i] * 0.5, 0.5
+        if a.temporal <= 0:
+            out.append(fixed[i]); continue
+        acc, wsum = fixed[i] * (1 - 2 * a.temporal), 1 - 2 * a.temporal
         for j in (i - 1, i + 1):
             if 0 <= j < n:
-                acc = acc + warp(fixed[j], flow(gray[i], gray[j])) * 0.25; wsum += 0.25
+                acc = acc + warp(fixed[j], flow(gray[i], gray[j])) * a.temporal; wsum += a.temporal
         out.append(acc / wsum)
     for i, m in enumerate(out):
         m = cv2.GaussianBlur(m, (0, 0), a.feather)
