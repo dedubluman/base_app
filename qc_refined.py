@@ -17,6 +17,7 @@ import argparse, json
 from pathlib import Path
 import cv2, numpy as np
 import underwater_grade as ug
+from shades.io import probe, iter_frames
 
 L = np.array([.2126, .7152, .0722], np.float32)
 REPO = Path(__file__).resolve().parent
@@ -29,13 +30,15 @@ def main():
     ap.add_argument("--params", default="grade_data/params_refined.json"); ap.add_argument("--out", required=True)
     a = ap.parse_args()
     P = json.loads(Path(a.params).read_text()); env = ug.build_env_lut(33, P["env"])
-    cv_ = cv2.VideoCapture(a.video); cs = cv2.VideoCapture(a.src); rows = []; prev = None
+    # decode BOTH files through ffmpeg with an explicit BT.709 tv->full conversion (cv2.VideoCapture assumes BT.601 and
+    # would add a colour offset to the comparison)
+    gen_o = iter_frames(Path(a.video), probe(Path(a.video))); gen_s = iter_frames(Path(a.src), probe(Path(a.src))); rows = []; prev = None
     k3 = np.ones((3, 3), np.uint8)
     i = 0
     while True:
-        ok1, fo = cv_.read(); ok2, fs = cs.read()
-        if not ok1 or not ok2: break
-        out = cv2.cvtColor(fo, cv2.COLOR_BGR2RGB); src = cv2.cvtColor(fs, cv2.COLOR_BGR2RGB)
+        fo = next(gen_o, None); fs = next(gen_s, None)
+        if fo is None or fs is None: break
+        out = (np.clip(fo, 0, 1) * 255 + .5).astype(np.uint8); src = (np.clip(fs, 0, 1) * 255 + .5).astype(np.uint8)
         ref = (np.clip(ug.apply_lut(src.astype(np.float32) / 255., env), 0, 1) * 255 + .5).astype(np.uint8)
         dv = cv2.imread(f"{a.diver}/{i:05d}.png", 0) > 7
         z = np.load(f"{a.classes}/classes_{i:05d}.npz"); ws = z["skin"].astype(np.float32); wh = z["shorts"].astype(np.float32); core = z["skin_core"]
