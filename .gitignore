@@ -18,3 +18,6 @@ masks/
 
 # Scratch (frames, logs, test renders) for the underwater grade
 work/
+
+# Derived per-frame class weights: regenerate with build_classes.py (see README_underwater_grade.md)
+masks_classes/
