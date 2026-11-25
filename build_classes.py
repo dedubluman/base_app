@@ -43,6 +43,7 @@ def main():
     ap.add_argument("--sigma", type=float, default=1.1)
     ap.add_argument("--shorts-grow", type=int, default=1)
     ap.add_argument("--gear-grow", type=int, default=3, help="px the gear (fin/hair) mask is grown so skin warmth never touches it")
+    ap.add_argument("--edge-band", type=int, default=3); ap.add_argument("--edge-bright", type=float, default=0.28)
     ap.add_argument("--hair-drop", default="255:335,364:391")
     a = ap.parse_args(); a.out.mkdir(parents=True, exist_ok=True)
     info = probe(SRC)
@@ -55,6 +56,14 @@ def main():
         sh = g("shorts") & db
         other = g("fins") | g("fins2") | (g("hair") & db if i not in drop else z)
         other = cv2.dilate(other.astype(np.uint8), kg) > 0
+        # Edge band: a fin/hair/gear pixel within a few px of the mask boundary that is bright is bare leg/arm that the
+        # SAM mask edge slightly over-covers (fins are dark). Treat it as skin so no bright, environment-graded (cyan)
+        # sliver survives along the boundary.
+        yb = cv2.GaussianBlur(f @ np.array([.2126, .7152, .0722], np.float32), (0, 0), 0.8)
+        core = cv2.erode(other.astype(np.uint8), np.ones((2 * a.edge_band + 1,) * 2, np.uint8)) > 0
+        skin_pre = db & ~sh & ~other                       # skin as SAM sees it: only leg/arm pixels next to it may flip
+        near_skin = cv2.dilate(skin_pre.astype(np.uint8), np.ones((2 * a.edge_band + 1,) * 2, np.uint8)) > 0
+        other = core | (other & ~core & ~((yb >= a.edge_bright) & near_skin))
         if a.shorts_grow:
             sh = (cv2.dilate(sh.astype(np.uint8), np.ones((2 * a.shorts_grow + 1,) * 2, np.uint8)) > 0) & db
         sh &= ~other

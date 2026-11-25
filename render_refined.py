@@ -71,6 +71,17 @@ def correct(f, g, p):
     k = ug.smoothstep(y / 0.10)
     x = np.clip(f * (1 + (g - 1) * k), 0, 1)
     x = x ** p["gamma"] * p["exposure"]
+    if p.get("pull"):
+        # Pull each pixel's R/G and B/G toward natural skin ratios (luma preserved). Shaded skin underwater is lit only by
+        # blue-green ambient light and comes out olive-gray (ashy) under one global gain; sunlit spots can overshoot to
+        # orange. The pull warms the former and tames the latter; it fades out only in near-black.
+        yo = (x @ L)[..., None]
+        g = np.maximum(x[..., 1:2], 1e-4)
+        w = p["pull"] * ug.smoothstep(yo / 0.06)
+        r = x[..., 0:1] / g; b = x[..., 2:3] / g
+        r = r + w * (p["rg"] - r); b = b + w * (p["bg"] - b)
+        x = np.concatenate([r * g, g, b * g], -1)
+        x = x * (yo / np.maximum(x @ L, 1e-4)[..., None])
     gray = (x @ L)[..., None]
     return np.clip(gray + (x - gray) * p["sat"], 0, 1).astype(np.float32)
 
