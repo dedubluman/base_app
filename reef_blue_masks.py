@@ -16,18 +16,17 @@ from reef_masks_interp import decode_small
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", type=Path, required=True)
-    ap.add_argument("--masks", type=Path, required=True)
+    ap.add_argument("--masks", type=Path, nargs="+", required=True, help="one or more SAM 3.1 run dirs (united)")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--stride", type=int, default=3)
     ap.add_argument("--grow", type=int, default=9)
     a = ap.parse_args()
     W, H = 540, 960
-    meta = json.loads((a.masks / "meta.json").read_text())
-    nkey = meta["num_frames"]; cy = meta.get("crop_y", 0)
+    nkey = max(json.loads((d / "meta.json").read_text())["num_frames"] for d in a.masks)
     fr = decode_small(a.input, W, H); N = len(fr)
     gray = np.stack([cv2.cvtColor(f, cv2.COLOR_RGB2GRAY) for f in fr])
     key = np.zeros((nkey, H, W), np.float32)
-    for d in sorted(a.masks.glob("obj_*")):
+    for d in [o for r in a.masks for o in sorted(r.glob("obj_*"))]:
         for p in d.glob("*.png"):
             i = int(p.stem)
             if i < nkey:
@@ -49,7 +48,7 @@ def main():
         reg = cv2.dilate((region[n] > 0.15).astype(np.uint8), k).astype(np.float32)
         lab = to_lab(srgb2lin(fr[n].astype(np.float32) / 255))
         C = np.hypot(lab[..., 1], lab[..., 2]); h = np.degrees(np.arctan2(lab[..., 2], lab[..., 1])) % 360
-        blue = sstep(0.07, 0.15, C) * np.exp(-0.5 * (((h - 265 + 180) % 360 - 180) / 30) ** 2)
+        blue = sstep(0.035, 0.085, C) * np.exp(-0.5 * (((h - 255 + 180) % 360 - 180) / 38) ** 2)
         m = np.maximum(blue * reg, 0.6 * region[n].clip(0, 1) * (blue > 0.15))
         out[n] = (np.clip(cv2.GaussianBlur(m, (0, 0), 1.2), 0, 1) * 255).astype(np.uint8)
     out = gaussian_filter1d(out.astype(np.float32), 0.7, axis=0).astype(np.uint8)
