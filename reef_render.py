@@ -36,6 +36,7 @@ def main():
     ap.add_argument("--exp-target", type=float, default=0.43)
     ap.add_argument("--exp-strength", type=float, default=0.4)
     ap.add_argument("--exp-sigma", type=float, default=20.0, help="temporal smoothing of the exposure normaliser (frames)")
+    ap.add_argument("--blue-masks", type=Path, default=None)
     ap.add_argument("--debug-mask-overlay", type=Path, default=None)
     a = ap.parse_args()
 
@@ -45,6 +46,7 @@ def main():
         for k, v in json.loads(a.params.read_text()).items():
             P[k] = tuple(v) if isinstance(v, list) else v
     masks = np.load(a.masks)["masks"] if a.masks else None
+    bmasks = np.load(a.blue_masks)["masks"] if a.blue_masks else None
 
     # ---- pass 1: exposure statistics, smoothed in time so the grade never pumps ----
     t0 = time.time()
@@ -80,7 +82,8 @@ def main():
         fm = None
         if masks is not None:
             fm = cv2.resize(masks[min(n, len(masks) - 1)], (W, H), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255
-        y = grade(x, P, fish=fm, lmul=float(lmul[n]))
+        bm = None if bmasks is None else cv2.resize(bmasks[min(n, len(bmasks) - 1)], (W, H), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255
+        y = grade(x, P, fish=fm, blue=bm, lmul=float(lmul[n]))
         # TPDF dither (1 LSB) so the 8-bit pipe cannot band the smooth teal gradients
         d = (rng.random(y.shape, dtype=np.float32) - rng.random(y.shape, dtype=np.float32))
         o = np.clip(np.rint(y * 255 + d), 0, 255).astype(np.uint8)

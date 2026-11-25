@@ -24,6 +24,7 @@ P_DEFAULT = dict(
     sand_desat=0.65,
     sat=1.08, vib=0.25,
     split_amt=0.5, split_ab=(0.035, 0.050), split_lo=0.35, split_hi=0.80, mid_cool=0.4, mid_ab=(-0.02,-0.018),
+    blue_feather=2.2, blue_gain=1.15, blue_lift=0.22, blue_bloom=0.05, blue_sat=0.35,
     fish_clar=0.35, fish_exp=0.03, fish_con=0.12, fish_feather=1.5,
 )
 
@@ -41,7 +42,7 @@ def sstep(a, b, x):
 def frame_lmed(rgb_small):
     return float(np.median(to_lab(srgb2lin(rgb_small))[..., 0]))
 
-def grade(rgb, P=P_DEFAULT, fish=None, lmul=1.0):
+def grade(rgb, P=P_DEFAULT, fish=None, lmul=1.0, blue=None):
     lin = srgb2lin(rgb) * np.array(P["wb"], np.float32)
     lab = to_lab(np.clip(lin, 0, None))
     L, a, b = lab[..., 0] * lmul, lab[..., 1], lab[..., 2]
@@ -68,6 +69,13 @@ def grade(rgb, P=P_DEFAULT, fish=None, lmul=1.0):
     # highlight shoulder: roll off above 0.82 so bright rock never clips
     k0 = 0.82
     Lo = np.where(Lo > k0, k0 + (1 - k0) * (1 - np.exp(-(Lo - k0) / (1 - k0))) * 0.97, Lo)
+    # --- blue-fish node: soft SAM 3.1 mask -> brighter, richer, gently lifted off the rock ---
+    wb = None
+    if blue is not None:
+        wb = cv2.GaussianBlur(blue.astype(np.float32), (0, 0), P["blue_feather"])
+        wb = np.clip(wb * P["blue_gain"], 0, 1)
+        bloom = cv2.GaussianBlur(wb, (0, 0), P["blue_feather"] * 3.5)
+        Lo = Lo + wb * P["blue_lift"] * (1.05 - Lo) + bloom * P["blue_bloom"]
     # --- chroma / hue work ---
     C = np.hypot(a, b); h = np.degrees(np.arctan2(b, a)) % 360
     # warm rocks: hue pull toward amber + chroma lift, weighted by hue proximity and existing chroma
@@ -80,6 +88,8 @@ def grade(rgb, P=P_DEFAULT, fish=None, lmul=1.0):
     C2 = C2 * (1 - P["sand_desat"] * sg)
     # global saturation with vibrance (protects already saturated colours e.g. blue chromis)
     C2 = C2 * (P["sat"] + P["vib"] * (1 - sstep(0.03, 0.14, C2)))
+    if wb is not None:
+        C2 = C2 * (1 + wb * P["blue_sat"])
     a2 = C2 * np.cos(np.radians(h2)); b2 = C2 * np.sin(np.radians(h2))
     # --- cinematic shadows -> petrol teal / cyan blue ---
     ws = (1 - sstep(P["teal_lo"], P["teal_hi"], Lo)) * P["teal_amt"]
