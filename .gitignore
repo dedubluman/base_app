@@ -15,3 +15,7 @@ output/
 masks/
 .cache/
 *.log
+
+# scratch data from grade fitting
+work/*.npy
+work/*.png
