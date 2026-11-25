@@ -23,6 +23,7 @@ def warp(img, fl):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--part", required=True); ap.add_argument("--spans", action="append", required=True)
+    ap.add_argument("--mode", choices=["both", "fwd", "bwd"], default="both", help="fwd: carry only from the frame before the span; bwd: only from the frame after")
     a = ap.parse_args()
     d = Path(f"masks/player_export__{a.part}/subject"); keep = d.parent / "subject_before_repair"; keep.mkdir(exist_ok=True)
     spans = [tuple(int(x) for x in s.split(":")) for s in a.spans]
@@ -37,18 +38,18 @@ def main():
         for t in range(s, e + 1):
             shutil.copy(d / f"{t:05d}.png", keep / f"{t:05d}.png") if (d / f"{t:05d}.png").exists() else None
         fw = rd(s - 1); fwd = {}
-        for t in range(s, e + 1):                      # carry forward: flow from t to t-1 samples the previous mask
+        for t in (range(s, e + 1) if a.mode != "bwd" else []):                      # carry forward: flow from t to t-1 samples the previous mask
             fl = cv2.calcOpticalFlowFarneback(g[t], g[t - 1], None, 0.5, 4, 25, 4, 7, 1.5, 0); fw = warp(fw, fl); fwd[t] = fw
         bwd = {}
-        if e + 1 <= 436 and (d / f"{e + 1:05d}.png").exists():
+        if a.mode != "fwd" and e + 1 <= 436 and (d / f"{e + 1:05d}.png").exists():
             bw = rd(e + 1)
             for t in range(e, s - 1, -1):
                 fl = cv2.calcOpticalFlowFarneback(g[t], g[t + 1], None, 0.5, 4, 25, 4, 7, 1.5, 0); bw = warp(bw, fl); bwd[t] = bw
         for t in range(s, e + 1):
-            if bwd:
+            if bwd and fwd:
                 w = (t - s + 1) / (e - s + 2); m = (1 - w) * fwd[t] + w * bwd[t]      # nearer the earlier good frame -> more forward carry
             else:
-                m = fwd[t]
+                m = bwd[t] if bwd else fwd[t]
             cv2.imwrite(str(d / f"{t:05d}.png"), ((m > 0.5).astype(np.uint8)) * 255)
             print(a.part, "repaired frame", t, "area", int((m > .5).sum()))
 

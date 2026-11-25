@@ -11,7 +11,7 @@ The weights are blurred class indicators normalised to the diver alpha, so skin/
 SAM 3.1 part sources (masks/player_export__<part>/subject):
   shorts  prompt "shorts"  (diver_parts.py + part_track.py to fill frames the detector missed)
   fins    prompt "flipper" (diver_parts.py: one fin per chunk)  +  fins2 (fins_both.py: every instance, both fins)
-  hair    prompt "hair"    (diver_parts.py + part_track.py). The tracker drifted onto the thigh/knee in the ranges listed in
+  hair    prompt "hair"    (diver_parts.py + part_track.py). The tracker drifted onto the thigh/knee; 364-391 and 322-335 were re-carried with repair_masks.py (flow-chained from the neighbouring good masks); the head is hidden in
           --hair-drop (found in the per-frame audit: area jumps ~100 px -> ~1300 px -> ~4000 px, mask sitting on bare leg);
           those frames carry no hair class, i.e. the head there is graded like any non-skin dark object only if SAM saw it.
 """
@@ -44,7 +44,7 @@ def main():
     ap.add_argument("--shorts-grow", type=int, default=1)
     ap.add_argument("--gear-grow", type=int, default=3, help="px the gear (fin/hair) mask is grown so skin warmth never touches it")
     ap.add_argument("--edge-band", type=int, default=3); ap.add_argument("--edge-bright", type=float, default=0.28)
-    ap.add_argument("--hair-drop", default="255:335,364:391")
+    ap.add_argument("--hair-drop", default="255:321")
     a = ap.parse_args(); a.out.mkdir(parents=True, exist_ok=True)
     info = probe(SRC)
     P = {k: REPO / f"masks/player_export__{k}/subject" for k in ("shorts", "fins", "fins2", "hair")}
