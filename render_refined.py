@@ -75,6 +75,15 @@ def correct(f, g, p):
     return np.clip(gray + (x - gray) * p["sat"], 0, 1).astype(np.float32)
 
 
+def correct_shorts(f, g, p):
+    """White fabric: any chroma is water cast, so keep only a fraction of it (fabric shading survives),
+    then tint neutral-to-cool. A single WB gain would overcorrect the brighter, less-cast folds into pink."""
+    x = correct(f, g, {**p, "sat": 1.0})
+    gray = (x @ L)[..., None]
+    tint = np.array(p["tint"], np.float32)
+    return np.clip(gray * tint + (x - gray) * p["keep_chroma"], 0, 1).astype(np.float32)
+
+
 class Out:
     def __init__(self, src, dst, info, crf, preset):
         cmd = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb48le", "-s", f"{info.width}x{info.height}",
@@ -116,7 +125,7 @@ def main():
     for i, f in enumerate(iter_frames(a.input, info)):
         if want is not None and i not in want: continue
         base = ug.apply_lut(f, env); ws, wh, _ = load_w(a.classes, i)
-        res = base * (1 - ws - wh)[..., None] + correct(f, g_sk[i], P["skin"]) * ws[..., None] + correct(f, g_sh[i], P["shorts"]) * wh[..., None]
+        res = base * (1 - ws - wh)[..., None] + correct(f, g_sk[i], P["skin"]) * ws[..., None] + correct_shorts(f, g_sh[i], P["shorts"]) * wh[..., None]
         if want: cv2.imwrite(str(a.output.with_name(f"{a.output.stem}_{i:05d}.png")), cv2.cvtColor((np.clip(res, 0, 1) * 255 + .5).astype(np.uint8), cv2.COLOR_RGB2BGR))
         else:
             out.write(res)

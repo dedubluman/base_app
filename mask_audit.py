@@ -78,7 +78,7 @@ def sheet(a):
         cw, ch = x1 - x0, y1 - y0; s = max(cw / 4, ch / 3); cw, ch = int(4 * s), int(3 * s)
         cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
         x0 = int(np.clip(cx - cw // 2, 0, max(0, f.shape[1] - cw))); y0 = int(np.clip(cy - ch // 2, 0, max(0, f.shape[0] - ch)))
-        layers = [("main", mb)] + [(Path(p).parent.name.split("__")[-1], (load(p, i) or np.zeros(mb.shape, np.uint8)) > 127) for p in (a.parts or [])]
+        layers = [("main", mb)] + [(Path(p).parent.name.split("__")[-1], ((lambda mm: np.zeros(mb.shape, np.uint8) if mm is None else mm)(load(p, i))) > 127) for p in (a.parts or [])]
         big = cv2.resize(f, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
         for name, lm in layers:
             lm2 = cv2.resize(lm.astype(np.uint8), None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST)
