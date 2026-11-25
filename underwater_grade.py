@@ -68,7 +68,12 @@ def build_diver_lut(n=33, p=None):
     X = grid(n)
     Y = X * np.array(p["gains"])
     Y = np.clip(Y, 0, 1) ** p["gamma"] * p["exposure"]
-    gray = (Y @ LUMA)[:, None]; Y = gray + (Y - gray) * p["sat"]
+    gray = (Y @ LUMA)[:, None]
+    # shadows (black fins, mask, snorkel) go neutral so they stay black, not brown;
+    # near-white (shorts) keeps only a faint tint so it reads neutral/cool white
+    sat = p["sat"] * smoothstep(gray / p.get("neutral_below", 0.0001)) if p.get("neutral_below") else p["sat"]
+    sat = sat * (1 - p.get("white_desat", 0.0) * smoothstep((gray - 0.30) / 0.2))
+    Y = gray + (Y - gray) * sat
     return np.clip(Y, 0, 1).reshape(n, n, n, 3).astype(np.float32)
 
 

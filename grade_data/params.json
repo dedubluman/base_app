@@ -1,2 +1,20 @@
-{"env": {"hi_gain": 1.15, "sat": 1.12, "warm_kill": 0.85, "contrast": 0.08},
- "diver": {"gains": [1.14, 0.94, 1.03], "exposure": 0.78, "gamma": 1.12, "sat": 0.9}}
+{
+ "env": {
+  "hi_gain": 1.15,
+  "sat": 1.12,
+  "warm_kill": 0.85,
+  "contrast": 0.08
+ },
+ "diver": {
+  "gains": [
+   1.11,
+   0.94,
+   1.05
+  ],
+  "exposure": 0.78,
+  "gamma": 1.12,
+  "sat": 0.9,
+  "neutral_below": 0.45,
+  "white_desat": 0.6
+ }
+}
