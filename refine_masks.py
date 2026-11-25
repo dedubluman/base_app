@@ -3,7 +3,7 @@
 
     python refine_masks.py --raw masks/player_export__fwd/subject --out masks_refined/player_export
 
-Steps: (1) drop tiny disconnected specks, (2) fill pin-holes / close hairline gaps,
+Steps: (1) drop tiny disconnected specks, (2) fill pin-holes (<= 60 px; larger enclosed holes are water gaps and stay open) / close hairline gaps,
 (3) repair frames where SAM lost or truncated the diver (area collapses vs. temporal neighbours)
 by flow-warping the nearest good mask, (4) temporal smoothing (flow-compensated 3-tap), (5) a
 small physical feather. Output: 8-bit PNG alpha per frame, source resolution."""
@@ -13,20 +13,24 @@ import cv2, numpy as np
 from shades.io import probe, iter_frames
 
 
+PINHOLE_PX = 60   # largest enclosed hole that is filled (SAM speckle); anything bigger is background and stays out
+
+
 def clean(m, min_frac=0.0015):
     n, lab, st, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), 8)
     out = np.zeros_like(m)
     for k in range(1, n):
         if st[k, cv2.CC_STAT_AREA] >= min_frac * m.size:
             out |= lab == k
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))   # hairline cracks only: wider closing would web fingers / close-set legs together
     out = cv2.morphologyEx(out.astype(np.uint8), cv2.MORPH_CLOSE, k) > 0
     # fill enclosed holes
     inv = (~out).astype(np.uint8)
     n, lab, st, _ = cv2.connectedComponentsWithStats(inv, 4)
     for kk in range(1, n):
         x, y, w, h, a = st[kk]
-        if a < 0.004 * m.size and x > 0 and y > 0 and x + w < m.shape[1] and y + h < m.shape[0]:
+        # pinholes only: an enclosed hole larger than this is real background (water between the legs, under an arm)
+        if a <= PINHOLE_PX and x > 0 and y > 0 and x + w < m.shape[1] and y + h < m.shape[0]:
             out |= lab == kk
     return out
 
