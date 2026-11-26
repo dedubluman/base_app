@@ -11,3 +11,19 @@ neutral_below, white_desat) or swap `grade_data/reference/*` and rerun `fit_refe
 Grade = cubic RGB polynomial fitted to the reference/original pairs + luma curve, baked to a static 33^3 LUT (no flicker);
 the diver gets a separate gentle LUT through the SAM mask. Export: 1920x1080 pillarboxed (source 1232x1078, never stretched),
 H.264 High yuv420p BT.709 CRF 17 slow, faststart, source AAC copied bit-identically.
+
+## Refined version (UNDERWATER_CINEMATIC_FINAL_REFINED.mp4)
+
+The first export was pillarboxed into 1920x1080 (source 1232x1078 -> active picture only cols 343-1577). The refined export keeps the
+source size exactly (1232x1078, no padding/scaling), H.264 High yuv420p BT.709, CRF 17 slow, faststart, source AAC copied bit-identically.
+
+Pipeline (run from the repo root, `.venv` active):
+1. `masks_sam31/` raw SAM 3.1 masks (diver, shorts, fins, fins2, hair); see its README for prompts/tools. Gaps and tracker drift were repaired with
+   `repair_masks.py` (flow-chained carry) and `fins_both.py` re-runs.
+2. `python refine_masks.py --raw masks/player_export__fwd/subject --out masks_refined/player_export` (needs the raw masks copied to `masks/player_export__*`).
+3. `python build_classes.py --diver masks_refined/player_export --out masks_classes/player_export`
+4. `python render_refined.py --input inputs/player_export.mov --classes masks_classes/player_export --output output/UNDERWATER_CINEMATIC_FINAL_REFINED.mp4`
+5. `python qc_refined.py --video output/UNDERWATER_CINEMATIC_FINAL_REFINED.mp4 --out qc/qc_refined.json`, `python check_no_bars.py <video>`, `python compare_sheet.py ...`
+
+Grade settings: `grade_data/params_refined.json` (env = unchanged cinematic look; skin: chroma gains + per-pixel R/G,B/G pull toward natural skin; shorts: neutral/cool;
+fins/hair/gear/snorkel: environment grade only). Per-class colour is measured per frame and smoothed over time (sigma 10 frames).
