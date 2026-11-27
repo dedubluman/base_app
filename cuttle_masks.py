@@ -44,6 +44,7 @@ def main() -> int:
     ap.add_argument("--overlap", type=int, default=6)
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--end", type=int, default=None)
+    ap.add_argument("--prompt-at", choices=["mid", "first"], default="mid")
     ap.add_argument("--max-objects", type=int, default=8)
     ap.add_argument("--crop-y", type=int, default=None,
                     help="feed SAM a square WxW crop starting at this row (no aspect squash, "
@@ -100,11 +101,17 @@ def main() -> int:
         for i in range(cs, ce):
             (cdir / f"{i - cs:05d}.jpg").symlink_to(frames_dir / f"{i:05d}.jpg")
         sid = pred.handle_request({"type": "start_session", "resource_path": str(cdir)})["session_id"]
+        # Prompt at the chunk's middle frame and propagate both ways: the detector often
+        # misses the animals on the very first frame (edge / haze), and SAM never
+        # backfills frames before the first detection when prompted at frame 0.
+        pf = (ce - cs) // 2 if a.prompt_at == "mid" else 0
         pred.handle_request({"type": "add_prompt", "session_id": sid,
-                             "frame_index": 0, "text": a.prompt})
+                             "frame_index": pf, "text": a.prompt})
         local: dict[int, dict[int, np.ndarray]] = {}
         lprob: dict[int, dict[int, float]] = {}
-        for resp in pred.handle_stream_request({"type": "propagate_in_video", "session_id": sid}):
+        for resp in pred.handle_stream_request({"type": "propagate_in_video", "session_id": sid,
+                                                "start_frame_index": pf,
+                                                "propagation_direction": "both"}):
             fi = cs + int(resp["frame_index"])
             o = resp["outputs"]
             pr = list(o.get("out_probs", [])) or [None] * len(o["out_obj_ids"])

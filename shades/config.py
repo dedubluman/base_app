@@ -151,6 +151,7 @@ class Encode:
     preset: str = "slow"
     profile: str = "high"
     dither: bool = True
+    audio: str = "copy"   # "copy" (untouched) | "aac" (re-encode, 192k)
 
 
 @dataclass

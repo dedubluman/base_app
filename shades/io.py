@@ -102,7 +102,7 @@ class Encoder:
                "-i", str(src),
                "-map", "0:v:0"]
         if info.has_audio:
-            cmd += ["-map", "1:a:0", "-c:a", "copy"]
+            cmd += ["-map", "1:a:0"] + (["-c:a", "aac", "-b:a", "192k"] if enc.audio == "aac" else ["-c:a", "copy"])
         cmd += ["-vf", "scale=out_color_matrix=bt709:out_range=tv:"
                        "flags=accurate_rnd+full_chroma_int,format=yuv420p",
                 "-c:v", "libx264", "-profile:v", enc.profile,
