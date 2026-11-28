@@ -82,15 +82,28 @@ def vignette(h, w):
 
 
 # ----------------------------------------------------------------- environment
-def grade_env(rgb, gain):
-    """rgb: source frame; gain: temporal exposure normaliser (scalar)."""
+def grade_env(rgb, gain, fish=None):
+    """rgb: source frame; gain: temporal exposure normaliser (scalar); fish: bool/float
+    full-frame mask of the animals (or None)."""
     h, w = rgb.shape[:2]
     x = np.clip(rgb * gain, 0, 1)
     y = apply_lut(x)
-    # gentle large-radius clarity: deeper separation of rock ledges / seabed relief
+    # Gentle large-radius clarity: deeper separation of rock ledges / seabed relief.
+    # The local mean is a *normalised* blur that ignores the (dilated) fish, and the
+    # boost is faded out over the fish, so a dark animal never makes a bright rim
+    # in the surrounding sand (the classic unsharp-mask halo).
     L = luma(y)
-    base = cv2.GaussianBlur(L, (0, 0), 18)
-    y = y * (1 + 0.55 * (L - base) / np.maximum(base + 0.05, 0.05))[..., None]
+    keep = np.ones((h, w), np.float32)
+    if fish is not None and fish.any():
+        keep = 1.0 - cv2.dilate(fish.astype(np.uint8), cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (41, 41))).astype(np.float32)
+    sm = (h // 4, w // 4)
+    L4 = cv2.resize(L, sm[::-1], interpolation=cv2.INTER_AREA)
+    k4 = cv2.resize(keep, sm[::-1], interpolation=cv2.INTER_AREA)
+    base4 = cv2.GaussianBlur(L4 * k4, (0, 0), 4.5) / np.maximum(cv2.GaussianBlur(k4, (0, 0), 4.5), 1e-3)
+    base = cv2.resize(base4, (w, h), interpolation=cv2.INTER_CUBIC)
+    fade = cv2.GaussianBlur(keep, (0, 0), 6)
+    y = y * (1 + 0.55 * fade * (L - base) / np.maximum(base + 0.05, 0.05))[..., None]
     y = y * vignette(h, w)[..., None]
     return np.clip(y + ENV_FLOOR * (1 - np.clip(y.mean(-1, keepdims=True) * 6, 0, 1)), 0, 1)
 
@@ -292,7 +305,7 @@ def main() -> int:
                 break
             continue
         gain = float(gains[i])
-        out = grade_env(fr, gain)
+        out = grade_env(fr, gain, union.get(i))
         al, bb = refine_alpha(alpha_for(i, union), fr)
         if al is not None:
             y0, y1, x0, x1 = bb

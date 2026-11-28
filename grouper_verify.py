@@ -93,7 +93,7 @@ def main():
                   "max_centroid_jump_px": float(max(cj)) if cj else None,
                   "median_area_px": float(np.median(area[area > 0])) if (area > 0).any() else 0}
 
-    geo, clip, chroma, halo, means = [], [], [], [], []
+    geo, geo_base, clip, chroma, halo, halo_src, means = [], [], [], [], [], [], []
     env_means = []
     for i, (fs, fg) in enumerate(zip(iter_frames(a.source, si), iter_frames(a.graded, gi))):
         m = union.get(i)
@@ -101,10 +101,10 @@ def main():
         means.append(fg[env].mean(0))
         if i % a.step == 0:
             geo.append(edge_corr(fs, fg))
+            geo_base.append(edge_corr(fs, np.clip(gg.apply_lut(fs) * gg.vignette(*fs.shape[:2])[..., None], 0, 1)))
             clip.append(float((fg.max(-1) > 0.98).mean()))
             mx, mn = fg.max(-1), fg.min(-1)
-            sat = (mx - mn) / np.maximum(mx, 1e-3)
-            chroma.append(float(np.percentile(sat[env & (mx > 0.05)], 99.5)))
+            chroma.append(float(np.percentile((mx - mn)[env], 99.9)))   # absolute chroma, 0..1
             env_means.append(fg[env].mean(0))
             if m is not None and m.sum() > 200:
                 k = np.ones((3, 3), np.uint8)
@@ -115,15 +115,19 @@ def main():
                 ri, ro = ring_in.astype(bool), ring_out.astype(bool)
                 if ri.sum() > 20 and ro.sum() > 20:
                     halo.append(float(np.median(L[ri]) / max(np.median(L[ro]), 1e-3)))
+                    Ls = cg.luma(fs)
+                    halo_src.append(float(np.median(Ls[ri]) / max(np.median(Ls[ro]), 1e-3)))
     means = np.array(means)
     d = np.abs(np.diff(means, axis=0))
     R["geometry"] = {"edge_correlation_min": float(min(geo)), "edge_correlation_mean": float(np.mean(geo)),
+                     "baseline_pure_tone_curve_mean": float(np.mean(geo_base)),
                      "samples": len(geo)}
     R["grade"] = {"env_mean_rgb_8bit": (np.mean(env_means, 0) * 255).round(1).tolist(),
                   "clipped_highlight_fraction_max": float(max(clip)),
-                  "chroma_p99.5_max": float(max(chroma))}
+                  "abs_chroma_p99.9_max": float(max(chroma))}
     R["halo"] = {"ring_over_surround_luma_ratio_median": float(np.median(halo)) if halo else None,
                  "ring_over_surround_luma_ratio_max": float(max(halo)) if halo else None,
+                 "source_ring_over_surround_median": float(np.median(halo_src)) if halo_src else None,
                  "samples": len(halo)}
     R["temporal"] = {"env_mean_frame_to_frame_max_change_8bit": float(d.max() * 255),
                      "env_mean_frame_to_frame_p99_8bit": float(np.percentile(d, 99) * 255)}
